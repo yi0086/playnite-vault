@@ -14,5 +14,5 @@ CLI：  python -m vault_unpacker.cli --help
 GUI：  python -m vault_unpacker.gui
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __all__ = ["core", "playnite", "config", "cli", "gui", "icon"]
