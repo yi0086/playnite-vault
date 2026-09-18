@@ -1,0 +1,27 @@
+# ---------------- 构建产物 ----------------
+bin/
+obj/
+dist/
+__pycache__/
+*.py[cod]
+
+# ---------------- 个人配置 ----------------
+# Vault 解包器的配置文件：里面有 NAS 地址、账号、密码，绝不入库。
+# 需要一份就从 tools/config.example.json 复制改名。
+config.json
+*.bak
+*.tmp
+
+# ---------------- 发布/中间物 ----------------
+*.pdb
+*.user
+*.suo
+.vs/
+*.nupkg
+
+# ---------------- 编辑器 / 系统 ----------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

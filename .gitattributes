@@ -1,0 +1,20 @@
+# 换行统一：进仓库一律 LF，检出时由 git 按平台处理。
+# 不加这个的话，Windows 上 autocrlf 开着，跨平台改动会出现「整个文件都变了」的假 diff。
+* text=auto eol=lf
+
+*.cs    text
+*.py    text
+*.json  text
+*.md    text
+*.yaml  text
+*.csproj text
+*.gitignore text
+*.gitattributes text
+
+# 二进制资源：禁止换行转换、禁止文本 diff（否则 diff 里全是乱码）
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.dll   binary
+*.exe   binary
+*.pdb   binary

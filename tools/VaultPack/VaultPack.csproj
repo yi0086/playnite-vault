@@ -1,0 +1,58 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    开发期命令行工具：直接编译插件源码（而不是引用编译好的 DLL），
+    因此它走的永远是当前最新的生产代码路径。
+    用途：脱离 Playnite 做打包上传 / 下载安装 / 远端索引查看 / 库元数据导出。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net462</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>VaultPack</AssemblyName>
+    <RootNamespace>VaultPack</RootNamespace>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Optimize Condition="'$(Configuration)'=='Release'">true</Optimize>
+    <NoWarn>$(NoWarn);CS1591;CS0618;NU1701</NoWarn>
+    <!-- Playnite 安装目录：要引用它自带的 Playnite.SDK.dll / Newtonsoft.Json.dll / LiteDB.dll。
+         装在非默认位置就覆盖这个属性：dotnet build -p:PlayniteDir="D:\Somewhere\Playnite"
+         （也可以设同名环境变量 PlayniteDir。） -->
+    <PlayniteDir Condition="'$(PlayniteDir)'==''">$(ProgramFiles)\Playnite</PlayniteDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\src\VaultDemo\**\*.cs"
+             Exclude="..\..\src\VaultDemo\bin\**\*.cs;..\..\src\VaultDemo\obj\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Playnite.SDK">
+      <HintPath>$(PlayniteDir)\Playnite.SDK.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(PlayniteDir)\Newtonsoft.Json.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="LiteDB">
+      <HintPath>$(PlayniteDir)\LiteDB.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="PresentationFramework" />
+    <Reference Include="PresentationCore" />
+    <Reference Include="WindowsBase" />
+    <Reference Include="System.Xaml" />
+    <Reference Include="System.Net.Http" />
+  </ItemGroup>
+
+</Project>

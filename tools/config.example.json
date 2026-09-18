@@ -1,0 +1,14 @@
+{
+  "_readme": "Vault 解包器配置。可直接编辑，程序启动时读取，改完下次启动生效。密码是明文存储，仅放本机、勿提交到仓库。",
+  "mode": "http",
+  "webdav_url": "",
+  "webdav_user": "",
+  "webdav_password": "",
+  "webdav_insecure_tls": false,
+  "local_dir": "",
+  "output_parent_dir": "",
+  "register_to_playnite": true,
+  "plugin_data_dir": "",
+  "last_app_id": "",
+  "_security": "webdav_password 是明文存储，只放本机、别提交到版本库；不想留明文就清空，每次启动手输。"
+}
