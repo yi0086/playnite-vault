@@ -98,8 +98,15 @@ def main(argv=None):
     ap.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验")
     ap.add_argument("--config", default=None, help="配置文件路径，默认自动定位")
     ap.add_argument("--list", action="store_true", help="只列出仓库里的应用 / 打印清单")
-    ap.add_argument("--keep-parts", action="store_true", help="保留下载下来的分片文件")
-    ap.add_argument("--part-tmp", default=None, help="分片临时目录")
+    ap.add_argument("--keep-parts", action="store_true",
+                    help="保留下载下来的区块/分片临时文件（默认下完即删）")
+    ap.add_argument("--part-tmp", default=None, help="区块临时目录")
+    ap.add_argument("--workers", type=int, default=core.DEFAULT_CHUNK_WORKERS,
+                    help="并发下载区块的路数（默认 %d；不能超过 8）"
+                         % core.DEFAULT_CHUNK_WORKERS)
+    ap.add_argument("--retries", type=int, default=core.DEFAULT_RETRIES,
+                    help="单个区块失败后的重试次数（默认 %d）"
+                         % core.DEFAULT_RETRIES)
     ap.add_argument("--register", action="store_true",
                     help="解包后登记到 Playnite 的 Vault 插件（需能定位插件数据目录）")
     ap.add_argument("--plugin-dir", default=None, help="手动指定插件数据目录")
@@ -121,19 +128,20 @@ def main(argv=None):
         if args.list:
             apps = core.list_apps(src)
             rep.log("")
-            rep.log("%-24s %-36s %10s %6s %6s" % ("Id", "名称", "大小", "文件", "分片"))
-            rep.log("-" * 90)
+            rep.log("%-24s %-36s %10s %6s %8s" % ("Id", "名称", "大小", "文件", "布局"))
+            rep.log("-" * 92)
             for a in apps:
-                rep.log("%-24s %-36s %10s %6d %6d"
+                rep.log("%-24s %-36s %10s %6d %8s"
                         % (a["id"], (a["name"] or "")[:36],
-                           core.human_size(a["total_bytes"]), a["file_count"], a["part_count"]))
+                           core.human_size(a["total_bytes"]), a["file_count"],
+                           core.layout_label(a)))
             if ids:
                 mf = core.fetch_manifest(src, ids[0])
                 rep.log("")
-                rep.log("清单 %s：Packed=%s  PartSize=%.1f MB  Parts=%d  Files=%d"
+                rep.log("清单 %s：Packed=%s  ChunkSize=%.1f MB  Chunks=%d  Files=%d"
                         % (ids[0], mf.get("Packed"),
-                           (mf.get("PartSize") or 0) / 1048576.0,
-                           len(mf.get("Parts") or []), len(mf.get("Files") or [])))
+                           (mf.get("ChunkSize") or 0) / 1048576.0,
+                           len(mf.get("Chunks") or []), len(mf.get("Files") or [])))
             return 0
 
         if not ids:
@@ -154,6 +162,11 @@ def main(argv=None):
         except Exception:
             pass
 
+        # 并发路数可以在 unpack 里被钳位，但这里早一点报错，提示更清楚
+        workers = getattr(args, "workers", core.DEFAULT_CHUNK_WORKERS)
+        if workers < 1 or workers > 8:
+            ap.error("--workers 需要在 1~8 之间")
+
         bad = 0
         for i, app_id in enumerate(ids, 1):
             folder = folder_of.get(app_id) or core.folder_for({"id": app_id})
@@ -163,7 +176,8 @@ def main(argv=None):
                 rep.log("[%d/%d] %s → %s" % (i, len(ids), app_id, out_dir))
 
             result = core.unpack(src, app_id, out_dir, rep, threading.Event(),
-                                 args.keep_parts, args.part_tmp)
+                                 args.keep_parts, args.part_tmp,
+                                 workers, max(1, args.retries))
             if not args.quiet:
                 print("", flush=True)
             rep.log("完成：%d 个文件 / %s → %s"

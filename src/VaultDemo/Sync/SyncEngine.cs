@@ -40,6 +40,49 @@ namespace VaultDemo.Sync
             client.UploadFile(localPartPath, "apps/" + appId + "/" + part.Path, onBytes, cancelToken);
         }
 
+        /// <summary>
+        /// 【v3】上传一个内容寻址区块。带重试，重试次数通过 onRetry 回报给上层统计。
+        /// </summary>
+        public void UploadChunk(string appId, ChunkEntry chunk, string localPath, int maxAttempts,
+            Action<long, long> onBytes, CancellationToken cancelToken, Action<int, Exception> onRetry)
+        {
+            client.EnsureDirectoryRecursive("apps/" + appId + "/chunks");
+            client.UploadFile(localPath, "apps/" + appId + "/" + chunk.Path, onBytes, cancelToken,
+                maxAttempts, onRetry);
+        }
+
+        /// <summary>
+        /// 【v3】远端是否已经有这个区块（内容完全一致）。
+        ///
+        /// 这是 v3 最关键的收益：文件名就是内容的 SHA-1，区块一旦写出就不可变，
+        /// 所以 **HEAD 一下 Content-Length 就够了**，不需要任何额外元数据。
+        /// 失败重传时已完成的区块会全部跳过，不会再从第 0 块重来。
+        /// </summary>
+        public bool ChunkOnRemote(string appId, ChunkEntry chunk)
+        {
+            if (string.IsNullOrEmpty(chunk.Id) || chunk.StoredBytes <= 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                var size = client.GetFileSize("apps/" + appId + "/" + chunk.Path);
+                return size == chunk.StoredBytes;
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Warn("探测远端区块失败（当作不存在）：" + chunk.Path + "，" + ex.Message);
+                return false;
+            }
+        }
+
+        /// <summary>【v3】区块在本地的临时文件名。确定性，便于失败后复用已打好的块。</summary>
+        public static string ChunkLocalPath(string tempDir, ChunkEntry chunk)
+        {
+            return Path.Combine(tempDir, "chunk-" + chunk.Index.ToString("0000") + ".bin");
+        }
+
         /// <summary>远端是否已有完全相同的分片（增量归档时整片跳过）。</summary>
         public static bool PartAlreadyOnRemote(PartEntry part, AppManifest knownRemote)
         {
@@ -334,6 +377,347 @@ namespace VaultDemo.Sync
             return result;
         }
 
+        // ================= 区块下载（v3：内容寻址） =================
+
+        /// <summary>
+        /// 【v3】按区块下载并即时落盘。
+        ///
+        /// 与 v2 的三点区别：
+        ///   1. 区块里的每一段按 FileOffset **随机访问**写进各自文件，
+        ///      所以超大文件也能「取一块 → 写一块 → 删一块」，v2 必须凑出整个文件；
+        ///   2. 峰值临时占用 ≈ 并发数 × ChunkSize，不再是 (并发+2) × PartSize
+        ///      （默认参数下 2 GB → 192 MB）；
+        ///   3. 中途断掉靠区块台账续传 —— 区块内容寻址、不可变，
+        ///      「这块已经解过」是可靠的增量事实。
+        /// </summary>
+        public SyncResult DownloadChunked(string appId, AppManifest manifest, string targetDir,
+            string tempDir, string stateDir, SyncOptions options, Action<SyncProgress> onProgress,
+            CancellationToken cancelToken)
+        {
+            var opt = options ?? new SyncOptions();
+            var watch = Stopwatch.StartNew();
+            var reporter = new ThrottledReporter(onProgress);
+            var result = new SyncResult();
+
+            // 清单自洽性必须先过。片段不连续的清单会写出「长度看着对、内容缺一段」的文件，
+            // 那比直接失败糟糕得多。
+            PackEngine.ValidateChunkManifest(manifest);
+
+            var stamp = ChunkJournal.StampOf(manifest);
+            var journal = ChunkJournal.Load(stateDir, appId, stamp);
+            var resuming = journal != null;
+            if (journal == null)
+            {
+                journal = new ChunkJournal { Stamp = stamp };
+            }
+
+            // 零字节文件不会被任何区块承载，单独建出来
+            foreach (var file in manifest.Files)
+            {
+                if (file.Size != 0)
+                {
+                    continue;
+                }
+                var full = PackEngine.SafeTarget(targetDir, file.Path);
+                var dir = Path.GetDirectoryName(full);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                if (!File.Exists(full))
+                {
+                    File.WriteAllBytes(full, new byte[0]);
+                }
+            }
+
+            var needed = new List<ChunkEntry>();
+            long pendingRaw = 0;
+            HashSet<string> pendingPaths = null;
+
+            if (resuming)
+            {
+                // 上次是中途断的 → 目标文件可能是半成品，长度不可信，
+                // 一律只按台账跳过「已经解完落盘」的区块。
+                foreach (var chunk in manifest.Chunks)
+                {
+                    if (journal.Contains(chunk.Id))
+                    {
+                        continue;
+                    }
+                    needed.Add(chunk);
+                    pendingRaw += chunk.RawBytes;
+                }
+
+                if (journal.Count > 0)
+                {
+                    VaultLog.Info(string.Format("检测到未完成的安装，续传：{0} 已有 {1}/{2} 个区块",
+                        appId, journal.Count, manifest.Chunks.Count));
+                }
+            }
+            else
+            {
+                // 全新状态 → 「文件是否存在且长度正确」是可信的判据
+                pendingPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var file in manifest.Files)
+                {
+                    if (file.Size == 0)
+                    {
+                        continue;
+                    }
+                    if (file.Pieces == null || file.Pieces.Count == 0)
+                    {
+                        throw new InvalidDataException(
+                            "清单损坏：" + file.Path + " 有大小但没有片段");
+                    }
+
+                    var full = PackEngine.SafeTarget(targetDir, file.Path);
+                    if (!IsUpToDate(full, file.Size))
+                    {
+                        pendingPaths.Add(file.Path);
+                    }
+                }
+
+                foreach (var chunk in manifest.Chunks)
+                {
+                    var entries = PackEngine.FilesInChunk(manifest, chunk.Index);
+                    var hit = false;
+                    foreach (var entry in entries)
+                    {
+                        if (pendingPaths.Contains(entry.Path))
+                        {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if (hit)
+                    {
+                        needed.Add(chunk);
+                        pendingRaw += chunk.RawBytes;
+                    }
+                }
+            }
+
+            result.PartsSkipped = manifest.Chunks.Count - needed.Count;
+            result.Skipped = manifest.Files.Count - (pendingPaths == null
+                ? manifest.Files.Count
+                : manifest.Files.Count - pendingPaths.Count);
+
+            var progress = new SyncProgress
+            {
+                Phase = "下载",
+                FilesTotal = manifest.Files.Count,
+                BytesTotal = needed.Sum(c => c.StoredBytes),
+                PartsTotal = needed.Count,
+                SubStageName = "解包",
+                SubStageBytesTotal = pendingRaw
+            };
+
+            if (needed.Count == 0)
+            {
+                VaultLog.Info("本地已是最新，无需下载：" + appId);
+                ChunkJournal.Clear(stateDir, appId);
+                result.Skipped = manifest.Files.Count;
+                result.Elapsed = watch.Elapsed;
+                progress.CurrentFile = "已是最新";
+                progress.FilesDone = manifest.Files.Count;
+                reporter.Report(progress, true);
+                return result;
+            }
+
+            var concurrency = Math.Max(1, Math.Min(opt.Concurrency, needed.Count));
+
+            // 预留空间：要落盘的原始字节 + 在途区块 + 余量
+            var inFlightBytes = (long)(concurrency + 2) * needed.Max(c => c.StoredBytes);
+            var required = opt.RequiredFreeBytes > 0
+                ? opt.RequiredFreeBytes
+                : pendingRaw + inFlightBytes + 64L * 1024 * 1024;
+            EnsureFreeSpace(targetDir, required);
+
+            Directory.CreateDirectory(targetDir);
+            Directory.CreateDirectory(tempDir);
+
+            VaultLog.Info(string.Format(
+                "区块同步开始：{0}，{1}/{2} 个区块待下载，共 {3}，峰值临时占用约 {4}",
+                appId, needed.Count, manifest.Chunks.Count,
+                SyncProgress.FormatSize(progress.BytesTotal),
+                SyncProgress.FormatSize(inFlightBytes)));
+
+            var chunkBytes = new long[needed.Count];
+
+            Exception producerError = null;
+            var errorLock = new object();
+
+            using (var heartbeat = new ProgressHeartbeat(reporter, progress))
+            using (var queue = new BlockingCollection<ChunkEntry>(2))
+            {
+                var cursor = 0;
+                var cursorLock = new object();
+                var alive = concurrency;
+                var inFlight = 0;
+                var workers = new List<Thread>();
+
+                for (var w = 0; w < concurrency; w++)
+                {
+                    var worker = new Thread(() =>
+                    {
+                        try
+                        {
+                            while (true)
+                            {
+                                ChunkEntry chunk;
+                                int idx;
+
+                                lock (cursorLock)
+                                {
+                                    if (cursor >= needed.Count)
+                                    {
+                                        return;
+                                    }
+                                    idx = cursor;
+                                    chunk = needed[cursor];
+                                    cursor++;
+                                }
+
+                                cancelToken.ThrowIfCancellationRequested();
+
+                                var localPath = ChunkLocalPath(tempDir, chunk);
+                                var slot = idx;
+
+                                // CurrentFile 只在开始下载这一块时写一次，
+                                // 放进字节回调会被多条线程轮流覆盖、名字高频抖动。
+                                progress.CurrentFile = chunk.Path;
+                                progress.PartsInFlight = Interlocked.Increment(ref inFlight);
+
+                                try
+                                {
+                                    client.DownloadFile(
+                                        "apps/" + appId + "/" + chunk.Path,
+                                        localPath,
+                                        (written, total) =>
+                                        {
+                                            Interlocked.Exchange(ref chunkBytes[slot], written);
+                                            progress.BytesDone = SumBytes(chunkBytes);
+                                            reporter.Report(progress, false);
+                                        },
+                                        cancelToken,
+                                        opt);
+                                }
+                                finally
+                                {
+                                    progress.PartsInFlight = Interlocked.Decrement(ref inFlight);
+                                }
+
+                                Interlocked.Exchange(ref chunkBytes[slot], chunk.StoredBytes);
+                                progress.BytesDone = SumBytes(chunkBytes);
+                                queue.Add(chunk, cancelToken);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            lock (errorLock)
+                            {
+                                if (producerError == null)
+                                {
+                                    producerError = ex;
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            // 所有下载线程退出后才关闭队列，
+                            // 否则还在下载的线程会 Add 到一个已完成的集合上。
+                            if (Interlocked.Decrement(ref alive) == 0)
+                            {
+                                queue.CompleteAdding();
+                            }
+                        }
+                    })
+                    {
+                        IsBackground = true,
+                        Name = "vault-chunk-downloader-" + w
+                    };
+
+                    workers.Add(worker);
+                    worker.Start();
+                }
+
+                long extractedDone = 0;
+
+                foreach (var chunk in queue.GetConsumingEnumerable(cancelToken))
+                {
+                    try
+                    {
+                        var localPath = ChunkLocalPath(tempDir, chunk);
+
+                        PackEngine.ExtractChunk(manifest, chunk, localPath, targetDir,
+                            p =>
+                            {
+                                progress.SubStageBytesDone = extractedDone + p.BytesDone;
+                                reporter.Report(progress, false);
+                            },
+                            cancelToken,
+                            pendingPaths == null ? null : (Func<FileEntry, bool>)(f => pendingPaths.Contains(f.Path)));
+
+                        extractedDone += chunk.RawBytes;
+                        progress.SubStageBytesDone = extractedDone;
+
+                        result.PartsTransferred++;
+                        progress.PartsDone = result.PartsTransferred;
+
+                        // 台账在解包成功之后立刻记一笔 —— 这是断点续传的全部依据
+                        journal.Mark(chunk.Id);
+                        journal.Save(stateDir, appId);
+
+                        result.Transferred += PackEngine.FilesInChunk(manifest, chunk.Index).Count;
+                        reporter.Report(progress, true);
+
+                        VaultLog.Info(string.Format("区块 {0}/{1} 已落盘并删除（{2}）",
+                            result.PartsTransferred, needed.Count,
+                            SyncProgress.FormatSize(chunk.StoredBytes)));
+                    }
+                    finally
+                    {
+                        TryDelete(ChunkLocalPath(tempDir, chunk));
+                    }
+                }
+
+                foreach (var worker in workers)
+                {
+                    try
+                    {
+                        worker.Join();
+                    }
+                    catch (Exception ex)
+                    {
+                        VaultLog.Error("等待下载线程结束失败", ex);
+                    }
+                }
+            }
+
+            if (producerError != null)
+            {
+                throw producerError;
+            }
+
+            // 全部区块都到位了，台账使命结束
+            ChunkJournal.Clear(stateDir, appId);
+
+            result.BytesTransferred = progress.BytesTotal;
+            result.Elapsed = watch.Elapsed;
+            result.Skipped = manifest.Files.Count - result.Transferred;
+            progress.PartsDone = needed.Count;
+            progress.FilesDone = manifest.Files.Count;
+
+            progress.SubStageName = null;
+            progress.SubStageBytesDone = 0;
+            progress.SubStageBytesTotal = 0;
+            progress.CurrentFile = "完成";
+            reporter.Report(progress, true);
+
+            VaultLog.Info("区块同步结束：" + appId + "，" + result.Describe());
+            return result;
+        }
+
         // ================= 逐文件路径（v1 仓库兼容） =================
 
         public SyncResult Download(string appId, AppManifest manifest, string targetDir, SyncOptions options,
@@ -383,7 +767,7 @@ namespace VaultDemo.Sync
             {
                 cancelToken.ThrowIfCancellationRequested();
 
-                var localPath = Path.Combine(targetDir, ToLocal(file.Path));
+                var localPath = PackEngine.SafeTarget(targetDir, file.Path);
                 progress.CurrentFile = file.Path;
 
                 if (!IsPending(targetDir, file, opt))
@@ -432,7 +816,7 @@ namespace VaultDemo.Sync
             {
                 return true;
             }
-            return !IsUpToDate(Path.Combine(targetDir, ToLocal(entry.Path)), entry);
+            return !IsUpToDate(PackEngine.SafeTarget(targetDir, entry.Path), entry);
         }
 
         public static string PartLocalPath(string tempDir, PartEntry part)
@@ -442,11 +826,17 @@ namespace VaultDemo.Sync
 
         public static bool IsUpToDate(string localPath, FileEntry entry)
         {
+            return IsUpToDate(localPath, entry == null ? 0 : entry.Size);
+        }
+
+        /// <summary>长度一致即认为已就位。v3 用它判断「这个文件还要不要下」。</summary>
+        public static bool IsUpToDate(string localPath, long size)
+        {
             if (!File.Exists(localPath))
             {
                 return false;
             }
-            return new FileInfo(localPath).Length == entry.Size;
+            return new FileInfo(localPath).Length == size;
         }
 
         public static void EnsureFreeSpace(string targetDir, long requiredBytes)

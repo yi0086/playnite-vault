@@ -65,14 +65,76 @@ namespace VaultDemo.UI
             set { editing.LocalRoot = value; OnPropertyChanged("LocalRoot"); }
         }
 
+        /// <summary>建连 / 等响应头的上限（秒）。</summary>
         public int TimeoutSeconds
         {
             get { return editing.TimeoutSeconds; }
             set
             {
-                editing.TimeoutSeconds = value <= 0 ? 60 : value;
+                editing.TimeoutSeconds = value <= 0 ? 15 : value;
                 OnPropertyChanged("TimeoutSeconds");
             }
+        }
+
+        /// <summary>
+        /// 停滞超时（秒）：连续这么久没有字节流动才断开。
+        /// 这是「速度从 20MB/s 掉到 0」的真正判据，不要和建连超时混为一谈。
+        /// </summary>
+        public int StallTimeoutSeconds
+        {
+            get { return editing.StallTimeoutSeconds; }
+            set
+            {
+                editing.StallTimeoutSeconds = value <= 0 ? 30 : (value > 600 ? 600 : value);
+                OnPropertyChanged("StallTimeoutSeconds");
+            }
+        }
+
+        /// <summary>body 发完后等服务端落盘回包的上限（秒）。大区块必须给足。</summary>
+        public int ResponseTimeoutSeconds
+        {
+            get { return editing.ResponseTimeoutSeconds; }
+            set
+            {
+                editing.ResponseTimeoutSeconds = value <= 0 ? 180 : (value > 3600 ? 3600 : value);
+                OnPropertyChanged("ResponseTimeoutSeconds");
+            }
+        }
+
+        /// <summary>区块大小（MB）。32 是实测最优：单块传完快、重试代价低。</summary>
+        public int ChunkSizeMB
+        {
+            get { return editing.ChunkSizeMB; }
+            set
+            {
+                editing.ChunkSizeMB = value < 1 ? 32 : (value > 512 ? 512 : value);
+                OnPropertyChanged("ChunkSizeMB");
+            }
+        }
+
+        /// <summary>上传并发。0 表示沿用下载并发。</summary>
+        public int UploadConcurrency
+        {
+            get { return editing.UploadConcurrency; }
+            set
+            {
+                editing.UploadConcurrency = value < 0 ? 0 : (value > 16 ? 16 : value);
+                OnPropertyChanged("UploadConcurrency");
+            }
+        }
+
+        /// <summary>归档时是否压缩。游戏资源多为已压缩格式，默认关闭。</summary>
+        public bool CompressOnArchive
+        {
+            get { return editing.CompressOnArchive; }
+            set { editing.CompressOnArchive = value; OnPropertyChanged("CompressOnArchive"); }
+        }
+
+        /// <summary>下载时是否边下边解（下载区块与解包并行）。</summary>
+        public bool PipelineExtract
+        {
+            get { return editing.PipelineExtract; }
+            set { editing.PipelineExtract = value; OnPropertyChanged("PipelineExtract"); }
         }
 
         public bool UseSystemProxy
@@ -140,7 +202,27 @@ namespace VaultDemo.UI
 
             if (editing.TimeoutSeconds <= 0)
             {
-                errors.Add("网络超时必须大于 0 秒。");
+                errors.Add("建连超时必须大于 0 秒。");
+            }
+
+            if (editing.StallTimeoutSeconds <= 0)
+            {
+                errors.Add("停滞超时必须大于 0 秒。");
+            }
+
+            if (editing.ResponseTimeoutSeconds <= 0)
+            {
+                errors.Add("应答超时必须大于 0 秒。");
+            }
+
+            if (editing.ChunkSizeMB < 1 || editing.ChunkSizeMB > 512)
+            {
+                errors.Add("区块大小需要在 1~512 MB 之间（推荐 32）。");
+            }
+
+            if (editing.UploadConcurrency < 0 || editing.UploadConcurrency > 16)
+            {
+                errors.Add("上传并发需要在 1~16 之间（填 0 表示沿用下载并发）。");
             }
 
             if (editing.MaxRetries <= 0)
@@ -163,6 +245,12 @@ namespace VaultDemo.UI
             OnPropertyChanged("Password");
             OnPropertyChanged("LocalRoot");
             OnPropertyChanged("TimeoutSeconds");
+            OnPropertyChanged("StallTimeoutSeconds");
+            OnPropertyChanged("ResponseTimeoutSeconds");
+            OnPropertyChanged("ChunkSizeMB");
+            OnPropertyChanged("UploadConcurrency");
+            OnPropertyChanged("CompressOnArchive");
+            OnPropertyChanged("PipelineExtract");
             OnPropertyChanged("UseSystemProxy");
             OnPropertyChanged("MaxRetries");
             OnPropertyChanged("ResumePartial");
@@ -236,9 +324,53 @@ namespace VaultDemo.UI
             rootRow.Children.Add(rootBox);
             panel.Children.Add(Field("本地安装根目录", rootRow));
 
-            var timeoutBox = new TextBox { Width = 100, HorizontalAlignment = HorizontalAlignment.Left };
-            timeoutBox.SetBinding(TextBox.TextProperty, Bind("TimeoutSeconds"));
-            panel.Children.Add(Field("网络超时（秒）", timeoutBox));
+            panel.Children.Add(Section("传输超时"));
+            panel.Children.Add(NumberField("建连超时（秒）", "TimeoutSeconds",
+                "建立连接并等到响应头的上限。内网 15 秒足够。"));
+            panel.Children.Add(NumberField("停滞超时（秒）", "StallTimeoutSeconds",
+                "连续这么久没有任何字节流动才断开重试。**这才是「速度从 20MB/s 掉到 0」对应的判据**；\n"
+                + "它管的是「每次读写等多久」，不是「整个传输总共多久」，所以大文件也能安全通过。"));
+            panel.Children.Add(NumberField("应答超时（秒）", "ResponseTimeoutSeconds",
+                "body 发完之后等服务端合并/落盘回包的上限。NAS 收到大区块还要落盘，这里要给足（默认 180）。"));
+
+            panel.Children.Add(Section("切块与并发"));
+            panel.Children.Add(NumberField("区块大小（MB）", "ChunkSizeMB",
+                "一个文件会被切成若干这样大小的区块，**可以跨块**。\n"
+                + "256MB 时 Dead Cells 的 res.pak（1.93GB）会变成一个巨型分片，单个 PUT 上百秒必然超时；\n"
+                + "32MB 是实测跑满带宽的档位，单块传得快、失败了重传代价也小。"));
+            panel.Children.Add(NumberField("并发下载路数（1~16）", "Concurrency",
+                "单条 HTTPS 连接在 .NET Framework 下解密上限约 27 MB/s，所以千兆内网要开多路才能跑满。\n"
+                + "实测：3 路 72、4 路 93、6 路 96、8 路 86 MB/s —— 建议 6。走明文 HTTP 时 1~2 就够。\n"
+                + "注意峰值临时磁盘占用 ≈（并发数 + 2）× 区块大小。"));
+            panel.Children.Add(NumberField("并发上传路数（0 = 沿用下载）", "UploadConcurrency",
+                "瓶颈通常在 NAS 写入侧：实测下载 88 MB/s 而上传只有 20~40 MB/s，并发越高越容易停顿。\n"
+                + "所以上传默认比下载保守一档（4 路），填 0 表示跟下载并发一致。"));
+
+            panel.Children.Add(Section("行为开关"));
+
+            var resumeBox = new CheckBox
+            {
+                Content = "启用断点续传（中断后重试只补没传完的区块）",
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            resumeBox.SetBinding(CheckBox.IsCheckedProperty, Bind("ResumePartial"));
+            panel.Children.Add(resumeBox);
+
+            var pipelineBox = new CheckBox
+            {
+                Content = "下载时边下边解（区块下完立刻解包并删掉临时文件）",
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            pipelineBox.SetBinding(CheckBox.IsCheckedProperty, Bind("PipelineExtract"));
+            panel.Children.Add(pipelineBox);
+
+            var compressBox = new CheckBox
+            {
+                Content = "归档时压缩内容（游戏资源多为已压缩格式，一般省不下空间）",
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            compressBox.SetBinding(CheckBox.IsCheckedProperty, Bind("CompressOnArchive"));
+            panel.Children.Add(compressBox);
 
             var proxyBox = new CheckBox
             {
@@ -248,39 +380,30 @@ namespace VaultDemo.UI
             proxyBox.SetBinding(CheckBox.IsCheckedProperty, Bind("UseSystemProxy"));
             panel.Children.Add(proxyBox);
 
-            var retryBox = new TextBox { Width = 100, HorizontalAlignment = HorizontalAlignment.Left };
-            retryBox.SetBinding(TextBox.TextProperty, Bind("MaxRetries"));
-            panel.Children.Add(Field("失败重试次数（每个文件）", retryBox));
+            panel.Children.Add(NumberField("失败重试次数（每个区块）", "MaxRetries",
+                "只对可重试的错误生效：超时 / 连接中断 / 429 / 5xx。\n"
+                + "4xx（比如 401 密码错、403 无权限）不重试 —— 重试也不会变对，只会白等。"));
 
-            var resumeBox = new CheckBox
+            panel.Children.Add(Section("仓库管理口令"));
+            var adminHint = new TextBlock
             {
-                Content = "启用断点续传（中断后重试只传剩余部分）",
-                Margin = new Thickness(0, 0, 0, 10)
-            };
-            resumeBox.SetBinding(CheckBox.IsCheckedProperty, Bind("ResumePartial"));
-            panel.Children.Add(resumeBox);
-
-            var connBox = new TextBox { Width = 100, HorizontalAlignment = HorizontalAlignment.Left };
-            connBox.SetBinding(TextBox.TextProperty, Bind("Concurrency"));
-            var connField = Field("并发下载路数（1~16）", connBox);
-            connField.Children.Add(new TextBlock
-            {
-                Text = "单条 HTTPS 连接在 .NET Framework 下解密上限约 27 MB/s，所以千兆内网要开多路才能跑满。\n"
-                     + "实测：3 路 72、4 路 93、6 路 96、8 路 86 MB/s —— 建议 6。走明文 HTTP 时 1~2 就够。\n"
-                     + "注意峰值临时磁盘占用 ≈（并发数 + 2）× 分片大小。",
+                Text = "删除仓库应用前需要输入管理口令。口令单独设置、保存在仓库根的 "
+                     + "vault-admin.json，本机只缓存一份派生值。\n"
+                     + "入口：游戏列表右键 → Vault → 管理仓库应用（删除，需管理口令）。\n"
+                     + "提醒：它是防误触闸门，不是权限系统 —— 真正拦住外人的是 WebDAV 账号。",
                 TextWrapping = TextWrapping.Wrap,
                 Opacity = 0.6,
                 FontSize = 11,
-                Margin = new Thickness(0, 4, 0, 0)
-            });
-            panel.Children.Add(connField);
+                Margin = new Thickness(0, 0, 0, 10)
+            };
+            panel.Children.Add(adminHint);
 
             testButton = new Button
             {
                 Content = "测试连接",
                 Padding = new Thickness(14, 4, 14, 4),
                 HorizontalAlignment = HorizontalAlignment.Left,
-                Margin = new Thickness(0, 8, 0, 0)
+                Margin = new Thickness(0, 4, 0, 0)
             };
             testButton.Click += OnTestConnection;
             panel.Children.Add(testButton);
@@ -293,7 +416,46 @@ namespace VaultDemo.UI
             };
             panel.Children.Add(statusText);
 
-            Content = panel;
+            // 设置项越来越多，宿主窗口未必给滚动条，这里自己兜一层
+            Content = new ScrollViewer
+            {
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                Content = panel
+            };
+        }
+
+        private static TextBlock Section(string text)
+        {
+            return new TextBlock
+            {
+                Text = text,
+                FontWeight = FontWeights.SemiBold,
+                Margin = new Thickness(0, 6, 0, 8),
+                Opacity = 0.9
+            };
+        }
+
+        /// <summary>数字输入 + 灰色说明文字的一体化字段。</summary>
+        private static StackPanel NumberField(string label, string path, string hint)
+        {
+            var box = new TextBox { Width = 100, HorizontalAlignment = HorizontalAlignment.Left };
+            box.SetBinding(TextBox.TextProperty, Bind(path));
+
+            var field = Field(label, box);
+            if (!string.IsNullOrEmpty(hint))
+            {
+                field.Children.Add(new TextBlock
+                {
+                    Text = hint,
+                    TextWrapping = TextWrapping.Wrap,
+                    Opacity = 0.6,
+                    FontSize = 11,
+                    Margin = new Thickness(0, 4, 0, 0)
+                });
+            }
+
+            return field;
         }
 
         private static Binding Bind(string path)
@@ -328,6 +490,8 @@ namespace VaultDemo.UI
             var user = vm.Username;
             var pass = vm.Password;
             var timeout = vm.TimeoutSeconds;
+            var stall = vm.StallTimeoutSeconds;
+            var response = vm.ResponseTimeoutSeconds;
             var useProxy = vm.UseSystemProxy;
 
             System.Threading.Tasks.Task.Run(() =>
@@ -336,7 +500,8 @@ namespace VaultDemo.UI
                 bool ok;
                 try
                 {
-                    var client = new WebDavClient(probe, user, pass, timeout, useProxy);
+                    var client = new WebDavClient(probe, user, pass,
+                        WebDavTimeouts.FromSeconds(timeout, stall, response), useProxy);
                     var count = client.TestConnection();
                     var hasIndex = client.Exists("index.json");
                     ok = true;
@@ -346,7 +511,9 @@ namespace VaultDemo.UI
                 catch (Exception ex)
                 {
                     ok = false;
-                    message = "连接失败：" + ex.Message;
+                    // 401 之类的错误光看状态码分不清「密码错」还是「服务端认证坏了」，
+                    // 这里给出可照做的排查步骤
+                    message = "连接失败：\n\n" + WebDavDiagnostics.Describe(ex, probe, user);
                     VaultLog.Error("测试连接失败", ex);
                 }
 

@@ -21,6 +21,56 @@ namespace VaultDemo.Net
     }
 
     /// <summary>
+    /// 三档超时。**不能再用一个数管全部** —— 这是实测踩出来的：
+    ///
+    /// `HttpWebRequest.Timeout` 语义上是「GetRequestStream() / GetResponse() 等多久」。
+    /// 而 PUT 的 `GetResponse()` 要等服务端把**整个 body 收完、落盘、回包**，
+    /// 所以拿它当「传输超时」时，任何大分片都必然撞上（实测 30 秒超时导致
+    /// 1.93 GB 的分片 100% 失败）。真正对应「速度逐渐到 0」的判据是**停滞**。
+    /// </summary>
+    public class WebDavTimeouts
+    {
+        /// <summary>建连（含等到响应头）的上限。</summary>
+        public int ConnectMs { get; set; } = 15000;
+
+        /// <summary>连续多久没有字节流动就断开。落到 <c>ReadWriteTimeout</c> 上。</summary>
+        public int StallMs { get; set; } = 30000;
+
+        /// <summary>body 发完后等服务端回包的上限（只对 PUT 生效）。</summary>
+        public int ResponseMs { get; set; } = 180000;
+
+        /// <summary>
+        /// 从旧的单值「超时秒数」映射过来。
+        /// 旧的语义最接近停滞超时，所以拿它当 StallMs；
+        /// 应答超时另给一个宽松的下限，否则大区块还是会失败。
+        /// </summary>
+        public static WebDavTimeouts FromSeconds(int seconds)
+        {
+            var ms = Math.Max(5, seconds) * 1000;
+            return new WebDavTimeouts
+            {
+                ConnectMs = Math.Min(ms, 30000),
+                StallMs = ms,
+                ResponseMs = Math.Max(ms, 180000)
+            };
+        }
+
+        /// <summary>
+        /// 三档分开给（秒）。**这是推荐用法** —— 单值映射只是为了兼容老调用点，
+        /// 它把建连/停滞/应答混在一个数上，正是当初 1.93GB 分片必然超时的根源。
+        /// </summary>
+        public static WebDavTimeouts FromSeconds(int connectSeconds, int stallSeconds, int responseSeconds)
+        {
+            return new WebDavTimeouts
+            {
+                ConnectMs = Math.Max(3, connectSeconds) * 1000,
+                StallMs = Math.Max(5, stallSeconds) * 1000,
+                ResponseMs = Math.Max(10, responseSeconds) * 1000
+            };
+        }
+    }
+
+    /// <summary>
     /// 极简 WebDAV 客户端，只依赖 System.Net，避免引入第三方库。
     /// 支持：HEAD 探测 / GET 下载 / PUT 上传 / MKCOL 建目录 / PROPFIND 连通性测试。
     /// </summary>
@@ -30,7 +80,7 @@ namespace VaultDemo.Net
 
         private readonly string baseUrl;
         private readonly string credential;
-        private readonly int timeoutMs;
+        private readonly WebDavTimeouts timeouts;
         private readonly bool useSystemProxy;
 
         static WebDavClient()
@@ -57,7 +107,14 @@ namespace VaultDemo.Net
             }
         }
 
-        public WebDavClient(string baseUrl, string username, string password, int timeoutSeconds, bool useSystemProxy = false)
+        public WebDavClient(string baseUrl, string username, string password, int timeoutSeconds,
+            bool useSystemProxy = false)
+            : this(baseUrl, username, password, WebDavTimeouts.FromSeconds(timeoutSeconds), useSystemProxy)
+        {
+        }
+
+        public WebDavClient(string baseUrl, string username, string password, WebDavTimeouts timeouts,
+            bool useSystemProxy = false)
         {
             if (string.IsNullOrWhiteSpace(baseUrl))
             {
@@ -71,7 +128,7 @@ namespace VaultDemo.Net
             }
 
             this.baseUrl = url;
-            this.timeoutMs = Math.Max(5, timeoutSeconds) * 1000;
+            this.timeouts = timeouts ?? new WebDavTimeouts();
             this.useSystemProxy = useSystemProxy;
 
             if (!string.IsNullOrEmpty(username))
@@ -94,6 +151,11 @@ namespace VaultDemo.Net
         public string BaseUrl
         {
             get { return baseUrl; }
+        }
+
+        public WebDavTimeouts Timeouts
+        {
+            get { return timeouts; }
         }
 
         /// <summary>
@@ -131,11 +193,22 @@ namespace VaultDemo.Net
         {
             var request = (HttpWebRequest)WebRequest.Create(BuildUrl(relative));
             request.Method = method;
-            request.Timeout = timeoutMs;
-            request.ReadWriteTimeout = timeoutMs;
+
+            // 建连 / 等响应头的上限。PUT 在拿到写流之后会被改成应答超时（见 UploadOnce）。
+            request.Timeout = timeouts.ConnectMs;
+
+            // **这条才是「速度逐渐到 0」的判据**：单次 Read/Write 卡住超过这个时长就抛超时，
+            // 于是停滞会被当成一次可重试的失败，而不是让整个归档挂在那里直到总超时。
+            request.ReadWriteTimeout = timeouts.StallMs;
+
             request.AllowAutoRedirect = true;
-            request.KeepAlive = false;
+
+            // 区块变小之后请求数会多一个量级（3GB 的游戏约 95 个块），
+            // 每块都重新做一次 TLS 握手的代价就不能忽略了。
+            request.KeepAlive = true;
+
             request.UserAgent = "PlayniteVaultDemo/0.1";
+            request.ServicePoint.UseNagleAlgorithm = false;
 
             if (!useSystemProxy)
             {
@@ -513,8 +586,63 @@ namespace VaultDemo.Net
             }
         }
 
-        /// <summary>上传本地文件（PUT）。</summary>
-        public void UploadFile(string localPath, string relative, Action<long, long> onProgress, CancellationToken cancelToken)
+        /// <summary>
+        /// 上传本地文件（PUT），**带区块级重试与退避**。
+        ///
+        /// 这里以前一次重试都没有：任一分片失败就取消整条流水线，
+        /// 而清单只在全部传完才写 → 重试从第 0 片重来，然后必然再撞同一堵墙
+        /// （实测死亡细胞连着失败两次、都死在 part-0001）。
+        /// </summary>
+        public void UploadFile(string localPath, string relative, Action<long, long> onProgress,
+            CancellationToken cancelToken, int maxAttempts = 3, Action<int, Exception> onRetry = null)
+        {
+            var attempts = Math.Max(1, maxAttempts);
+            Exception last = null;
+
+            for (var attempt = 1; attempt <= attempts; attempt++)
+            {
+                cancelToken.ThrowIfCancellationRequested();
+
+                try
+                {
+                    UploadOnce(localPath, relative, onProgress, cancelToken);
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    last = ex;
+
+                    // 4xx 这类是确定性问题（权限 / 路径不对），重试只会白等
+                    if (attempt >= attempts || !IsTransient(ex))
+                    {
+                        break;
+                    }
+
+                    if (onRetry != null)
+                    {
+                        onRetry(attempt, ex);
+                    }
+
+                    VaultLog.Warn(string.Format("上传 {0} 第 {1} 次失败（{2}），将重试：{3}",
+                        relative, attempt, attempt >= attempts ? "最后一次" : "退避后重试", ex.Message));
+
+                    var delay = Math.Min(1000 * attempt * attempt, 15000);
+                    if (cancelToken.WaitHandle.WaitOne(delay))
+                    {
+                        cancelToken.ThrowIfCancellationRequested();
+                    }
+                }
+            }
+
+            throw Wrap(last, "上传 " + relative);
+        }
+
+        private void UploadOnce(string localPath, string relative, Action<long, long> onProgress,
+            CancellationToken cancelToken)
         {
             var info = new FileInfo(localPath);
             var request = CreateRequest(relative, "PUT");
@@ -524,26 +652,35 @@ namespace VaultDemo.Net
             try
             {
                 using (cancelToken.Register(request.Abort))
-                using (var remote = request.GetRequestStream())
-                using (var local = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.Read, BufferSize))
                 {
-                    var buffer = new byte[BufferSize];
-                    long done = 0;
-                    int read;
-                    while ((read = local.Read(buffer, 0, buffer.Length)) > 0)
+                    // 这一段用 ConnectMs 兜（建连 + 拿到写流），
+                    // 单次写卡住由 ReadWriteTimeout（= StallMs）兜。
+                    using (var remote = request.GetRequestStream())
+                    using (var local = new FileStream(localPath, FileMode.Open, FileAccess.Read,
+                        FileShare.Read, BufferSize))
                     {
-                        cancelToken.ThrowIfCancellationRequested();
-                        remote.Write(buffer, 0, read);
-                        done += read;
-                        if (onProgress != null)
+                        var buffer = new byte[BufferSize];
+                        long done = 0;
+                        int read;
+                        while ((read = local.Read(buffer, 0, buffer.Length)) > 0)
                         {
-                            onProgress(done, info.Length);
+                            cancelToken.ThrowIfCancellationRequested();
+                            remote.Write(buffer, 0, read);
+                            done += read;
+                            if (onProgress != null)
+                            {
+                                onProgress(done, info.Length);
+                            }
                         }
                     }
-                }
 
-                using ((HttpWebResponse)request.GetResponse())
-                {
+                    // body 已经发完，接下来是服务端收尾（落盘 / 合并临时文件）。
+                    // **这一段必须用宽松的应答超时**：用 30 秒的话，
+                    // 一个 1.93GB 的 body 在服务端那边还没落完就已经被判超时了。
+                    request.Timeout = timeouts.ResponseMs;
+                    using ((HttpWebResponse)request.GetResponse())
+                    {
+                    }
                 }
             }
             catch (Exception ex)
@@ -554,6 +691,50 @@ namespace VaultDemo.Net
                 }
                 throw Wrap(ex, "上传 " + relative);
             }
+        }
+
+        /// <summary>
+        /// 这个失败值不值得重试。
+        /// 超时 / 连接被掐 / 收发失败 / 5xx / 429 都是瞬时的；
+        /// 其余 4xx（401、403、404、405…）是确定性的，重试没有意义。
+        /// </summary>
+        public static bool IsTransient(Exception ex)
+        {
+            for (var e = ex; e != null; e = e.InnerException)
+            {
+                var web = e as WebException;
+                if (web != null)
+                {
+                    var response = web.Response as HttpWebResponse;
+                    if (response != null)
+                    {
+                        var code = (int)response.StatusCode;
+                        return code == 408 || code == 429 || code >= 500;
+                    }
+
+                    switch (web.Status)
+                    {
+                        case WebExceptionStatus.Timeout:
+                        case WebExceptionStatus.ConnectionClosed:
+                        case WebExceptionStatus.ConnectFailure:
+                        case WebExceptionStatus.SendFailure:
+                        case WebExceptionStatus.ReceiveFailure:
+                        case WebExceptionStatus.PipelineFailure:
+                        case WebExceptionStatus.KeepAliveFailure:
+                        case WebExceptionStatus.RequestCanceled:
+                            return true;
+                        case WebExceptionStatus.ProtocolError:
+                            return false;
+                    }
+                    return true;
+                }
+
+                if (e is System.Net.Sockets.SocketException || e is IOException)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         /// <summary>上传文本（PUT）。</summary>
@@ -650,6 +831,130 @@ namespace VaultDemo.Net
     {
         public WebDavException(string message, Exception inner) : base(message, inner)
         {
+        }
+    }
+
+    /// <summary>
+    /// 把 WebDAV 请求异常翻译成「用户能照着动手排查」的中文说明。
+    ///
+    /// 重点是 401：**光看 401 分不清「密码填错」还是「服务端认证后端坏了」**。
+    /// 可靠的区分办法是拿浏览器直接打开仓库地址来对照 ——
+    /// 如果浏览器里用同一个账号也进不去（或被反复弹认证框），那就是服务端的问题，
+    /// 此时改本工具的任何配置都不会有用。
+    /// </summary>
+    public static class WebDavDiagnostics
+    {
+        public static string Describe(Exception ex, string url, string username)
+        {
+            if (ex == null)
+            {
+                return "未知错误。";
+            }
+
+            var inner = ex;
+            while (inner is AggregateException && inner.InnerException != null)
+            {
+                inner = inner.InnerException;
+            }
+
+            var web = inner as System.Net.WebException;
+            if (web != null)
+            {
+                var response = web.Response as System.Net.HttpWebResponse;
+                if (response != null)
+                {
+                    return DescribeStatus(response, url, username);
+                }
+
+                switch (web.Status)
+                {
+                    case System.Net.WebExceptionStatus.NameResolutionFailure:
+                        return "域名解析失败 —— 主机名或 IP 写错了，或 DNS 不通。\n当前地址：" + url;
+
+                    case System.Net.WebExceptionStatus.ConnectFailure:
+                        return "连接被拒绝 —— 地址/端口不对，或 NAS 上的 WebDAV 服务没启动。\n当前地址：" + url;
+
+                    case System.Net.WebExceptionStatus.Timeout:
+                        return "连接超时 —— 网络不通，或者本机代理把请求截走了。\n"
+                             + "访问内网 NAS 时请在本页**取消勾选「走系统代理」**。\n当前地址：" + url;
+
+                    case System.Net.WebExceptionStatus.TrustFailure:
+                        return "TLS 证书校验失败 —— NAS 用的是自签证书，系统不信任它。\n"
+                             + "可以给 NAS 换正式证书，或改用 http 访问。\n当前地址：" + url;
+
+                    default:
+                        return "网络错误（" + web.Status + "）：" + web.Message;
+                }
+            }
+
+            if (inner is TimeoutException)
+            {
+                return "操作超时 —— 服务端迟迟没有响应。\n当前地址：" + url;
+            }
+
+            return inner.Message;
+        }
+
+        private static string DescribeStatus(System.Net.HttpWebResponse response, string url, string username)
+        {
+            var code = (int)response.StatusCode;
+            var server = Header(response, "Server");
+            var suffix = string.IsNullOrEmpty(server) ? string.Empty : "\n（服务器标识：" + server + "）";
+
+            if (code == 401)
+            {
+                var text = "HTTP 401 未授权 —— 服务端拒绝了这次凭据。\n\n"
+                         + "按这个顺序排查：\n"
+                         + "1) 用户名 / 密码是否正确。注意有些 NAS 的 WebDAV 需要「应用密码 / 独立密码」，"
+                         + "并不是你登录管理后台的那个密码。\n"
+                         + "2) **服务端的认证后端是否有问题**。怎么区分：用浏览器直接打开仓库地址，"
+                         + "如果同一个账号在浏览器里也进不去（或反复弹认证框），那就是服务端的问题，"
+                         + "改本工具的任何设置都不会有用。\n"
+                         + "3) 账号是否被禁用，或 WebDAV 服务没对当前用户开放。";
+
+                if (string.IsNullOrWhiteSpace(username))
+                {
+                    text += "\n\n另外：当前用户名是空的，这本身就足以导致 401。";
+                }
+
+                return text + suffix;
+            }
+
+            if (code == 403)
+            {
+                return "HTTP 403 禁止访问 —— 账号密码可能是对的，但这个账号没有该目录的权限。\n"
+                     + "检查 WebDAV 共享目录的读写权限，或换一个有权限的账号。" + suffix;
+            }
+
+            if (code == 404)
+            {
+                return "HTTP 404 找不到 —— 地址写错了，或者这个目录还不存在。\n当前地址：" + url + suffix;
+            }
+
+            if (code == 405)
+            {
+                return "HTTP 405 方法不被允许 —— 服务器不接受 PROPFIND / PUT 这些 WebDAV 方法。\n"
+                     + "确认这个地址确实是 WebDAV 入口（有些 NAS 需要先在设置里开启 WebDAV 服务）。" + suffix;
+            }
+
+            if (code >= 500)
+            {
+                return "HTTP " + code + " 服务端错误 —— NAS 侧的 WebDAV 服务出问题了，先去看 NAS 的日志。" + suffix;
+            }
+
+            return "HTTP " + code + " " + response.StatusDescription + suffix;
+        }
+
+        private static string Header(System.Net.HttpWebResponse response, string name)
+        {
+            try
+            {
+                return response.Headers[name];
+            }
+            catch
+            {
+                return null;
+            }
         }
     }
 }

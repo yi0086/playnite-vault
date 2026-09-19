@@ -660,7 +660,7 @@ class App(tk.Tk):
                         highlightbackground=LINE, highlightcolor=LINE)
         wrap.pack(side="left", fill="both", expand=True)
 
-        cols = ("id", "dir", "name", "size", "files", "parts", "state")
+        cols = ("id", "dir", "name", "size", "files", "layout", "state")
         self.tree = ttk.Treeview(wrap, columns=cols, show="headings",
                                  height=4, style="Vault.Treeview",
                                  selectmode="extended")
@@ -670,7 +670,7 @@ class App(tk.Tk):
             ("name", "名称", 220, "w"),
             ("size", "大小", 90, "e"),
             ("files", "文件", 60, "e"),
-            ("parts", "分片", 60, "e"),
+            ("layout", "布局", 76, "e"),
             ("state", "状态", 80, "center"),
         ):
             self.tree.heading(c, text=t)
@@ -1209,7 +1209,7 @@ class App(tk.Tk):
             self.tree.insert("", "end", values=(
                 a["id"], core.folder_for(a), a["name"],
                 core.human_size(a["total_bytes"]),
-                a["file_count"], a["part_count"], state), tags=tag)
+                a["file_count"], core.layout_label(a), state), tags=tag)
 
         self.src_hint.configure(text="共 %d 个应用" % len(apps))
         self._append_log("[列表] 读取到 %d 个应用" % len(apps))

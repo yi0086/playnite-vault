@@ -173,8 +173,9 @@ namespace VaultPack
   VaultPack backup  [--library <库目录>] [--out <备份目录>]
   VaultPack meta    --game <名称或GUID> [--library <库目录>] [--out <json>]
   VaultPack pack    --src <目录> --id <应用Id> [--name <名称>] [--exe <启动程序>]
-                    [--version <版本>] [--meta <元数据json>] [--part-size <MB>]
-                    [--compress] [--force] [--conn <并发路数>] [--settings <json>] [--data <dir>]
+                    [--version <版本>] [--meta <元数据json>] [--chunk-size <MB>]
+                    [--compress] [--force] [--conn <并发路数>]
+                    [--upload-conn <并发路数>] [--settings <json>] [--data <dir>]
   VaultPack install --id <应用Id> --dir <目标目录> [--force] [--no-verify]
                     [--conn <并发路数>] [--settings <json>] [--data <dir>]
   VaultPack rm      --id <应用Id> [--yes] [--settings <json>] [--data <dir>]
@@ -762,14 +763,32 @@ namespace VaultPack
             var client = service.CreateClient();
             var opt = service.BuildSyncOptions(true); // 强制重传，避免「已存在跳过」影响测量
 
-            var parts = manifest.Parts;
+            // 布局无关：只关心「要下哪几个远端文件、各多大」。
+            // v3 是区块（内容寻址），v2 是分片，都能拿来测纯传输带宽。
+            var blobs = new List<BenchBlob>();
+            if (manifest.Layout == VaultLayout.Chunks)
+            {
+                foreach (var chunk in manifest.Chunks)
+                {
+                    blobs.Add(new BenchBlob { Path = chunk.Path, StoredBytes = chunk.StoredBytes });
+                }
+            }
+            else
+            {
+                foreach (var part in manifest.Parts)
+                {
+                    blobs.Add(new BenchBlob { Path = part.Path, StoredBytes = part.StoredBytes });
+                }
+            }
+
             if (limit > 0)
             {
-                parts = parts.Take(limit).ToList();
+                blobs = blobs.Take(limit).ToList();
             }
-            if (parts.Count == 0)
+
+            if (blobs.Count == 0)
             {
-                Console.Error.WriteLine("该应用没有分片（可能还是 v1 逐文件布局）");
+                Console.Error.WriteLine("该应用没有可测的远端块（可能还是 v1 逐文件布局）。");
                 return 3;
             }
 
@@ -778,8 +797,9 @@ namespace VaultPack
 
             Console.WriteLine("[仓库]     " + service.Settings.WebDavUrl);
             Console.WriteLine("[应用]     " + appId);
-            Console.WriteLine("[分片]     " + parts.Count + " 个，共 " +
-                SyncProgress.FormatSize(parts.Sum(p => p.StoredBytes)));
+            Console.WriteLine("[布局]     " + manifest.Layout);
+            Console.WriteLine("[远端块]   " + blobs.Count + " 个，共 " +
+                SyncProgress.FormatSize(blobs.Sum(b => b.StoredBytes)));
             Console.WriteLine("[临时目录] " + tempDir);
             Console.WriteLine();
 
@@ -800,9 +820,9 @@ namespace VaultPack
 
                     if (threads <= 1)
                     {
-                        foreach (var part in parts)
+                        foreach (var blob in blobs)
                         {
-                            var s = TransferOne(client, appId, part, tempDir, opt);
+                            var s = TransferOne(client, appId, blob, tempDir, opt);
                             if (s > best) best = s;
                         }
                     }
@@ -810,10 +830,10 @@ namespace VaultPack
                     {
                         // HttpWebRequest 的解密/读取是同步阻塞的，多线程才能把
                         // .NET Framework SslStream 的单连接上限摊到多个核上。
-                        var queue = new System.Collections.Concurrent.ConcurrentQueue<PartEntry>();
-                        foreach (var p in parts)
+                        var queue = new System.Collections.Concurrent.ConcurrentQueue<BenchBlob>();
+                        foreach (var b in blobs)
                         {
-                            queue.Enqueue(p);
+                            queue.Enqueue(b);
                         }
 
                         var workers = new List<Thread>();
@@ -821,7 +841,7 @@ namespace VaultPack
                         {
                             var worker = new Thread(() =>
                             {
-                                PartEntry item;
+                                BenchBlob item;
                                 while (queue.TryDequeue(out item))
                                 {
                                     try
@@ -857,7 +877,7 @@ namespace VaultPack
 
                     roundWatch.Stop();
                     var wall = roundWatch.Elapsed.TotalSeconds;
-                    roundBytes = parts.Sum(p => p.StoredBytes);
+                    roundBytes = blobs.Sum(b => b.StoredBytes);
                     roundTime = wall;
 
                     totalBytes += (long)roundBytes;
@@ -881,26 +901,33 @@ namespace VaultPack
             return 0;
         }
 
-        /// <summary>下载一个分片到临时目录并计时，返回 MB/s。测完即删，避免占盘。</summary>
-        private static double TransferOne(WebDavClient client, string appId, PartEntry part,
+        /// <summary>下载一个远端块到临时目录并计时，返回 MB/s。测完即删，避免占盘。</summary>
+        private static double TransferOne(WebDavClient client, string appId, BenchBlob blob,
             string tempDir, SyncOptions opt)
         {
-            var localPart = Path.Combine(tempDir, Path.GetFileName(part.Path));
+            var localPart = Path.Combine(tempDir, Path.GetFileName(blob.Path));
             TryDelete(localPart);
 
             var watch = Stopwatch.StartNew();
-            client.DownloadFile("apps/" + appId + "/" + part.Path, localPart,
+            client.DownloadFile("apps/" + appId + "/" + blob.Path, localPart,
                 null, CancellationToken.None, opt);
             watch.Stop();
 
             var seconds = watch.Elapsed.TotalSeconds;
-            var speed = seconds <= 0 ? 0 : part.StoredBytes / seconds / 1024.0 / 1024.0;
+            var speed = seconds <= 0 ? 0 : blob.StoredBytes / seconds / 1024.0 / 1024.0;
 
             Console.WriteLine(string.Format("  {0}  {1,10}  {2,7:0.00} s  {3,8:0.00} MB/s",
-                Path.GetFileName(part.Path), SyncProgress.FormatSize(part.StoredBytes), seconds, speed));
+                Path.GetFileName(blob.Path), SyncProgress.FormatSize(blob.StoredBytes), seconds, speed));
 
             TryDelete(localPart);
             return speed;
+        }
+
+        /// <summary>测速的最小单位：远端一个文件 + 它的字节数（区块或分片都行）。</summary>
+        private class BenchBlob
+        {
+            public string Path { get; set; }
+            public long StoredBytes { get; set; }
         }
 
         private static void TryDeleteDirectorySafe(string path)
@@ -984,17 +1011,18 @@ namespace VaultPack
                 return 0;
             }
 
-            Console.WriteLine("{0,-28} {1,-34} {2,-8} {3,12} {4,7}  {5}",
-                "Id", "名称", "版本", "字节", "文件数", "启动程序");
-            Console.WriteLine(new string('-', 110));
+            Console.WriteLine("{0,-28} {1,-34} {2,-8} {3,12} {4,7} {5,-12} {6}",
+                "Id", "名称", "版本", "字节", "文件数", "布局", "启动程序");
+            Console.WriteLine(new string('-', 122));
             foreach (var app in index.Apps)
             {
-                Console.WriteLine("{0,-28} {1,-34} {2,-8} {3,12} {4,7}  {5}",
+                Console.WriteLine("{0,-28} {1,-34} {2,-8} {3,12} {4,7} {5,-12} {6}",
                     Truncate(app.Id, 28),
                     Truncate(app.Name, 34),
                     Truncate(app.Version, 8),
                     app.TotalBytes,
                     app.FileCount,
+                    LayoutOf(app),
                     app.LaunchExe);
             }
 
@@ -1002,6 +1030,20 @@ namespace VaultPack
             Console.WriteLine("共 " + index.Apps.Count + " 个条目，合计 " +
                 SyncProgress.FormatSize(index.Apps.Sum(a => a.TotalBytes)));
             return 0;
+        }
+
+        /// <summary>索引里的布局文字描述。旧条目没这两个计数字段，按 v1 显示。</summary>
+        private static string LayoutOf(AppEntry app)
+        {
+            if (app.ChunkCount > 0)
+            {
+                return "v3 区块 " + app.ChunkCount;
+            }
+            if (app.PartCount > 0)
+            {
+                return "v2 分片 " + app.PartCount;
+            }
+            return "v1 直传";
         }
 
         private static int CmdPack(OptionSet options)
@@ -1013,7 +1055,10 @@ namespace VaultPack
             var launchExe = options.Get("exe", GuessLaunchExe(src));
             var force = options.Has("force");
             var compress = options.Has("compress");
-            var partSizeMb = int.Parse(options.Get("part-size", "256"),
+
+            // v3 用区块大小；--part-size 是老叫法，仍接住（一个文件可跨块，语义已经不同）
+            var chunkSizeMb = int.Parse(
+                options.Get("chunk-size", options.Get("part-size", "32")),
                 CultureInfo.InvariantCulture);
 
             if (!Directory.Exists(src))
@@ -1060,14 +1105,26 @@ namespace VaultPack
             Console.WriteLine("[应用Id] " + appId);
             Console.WriteLine("[名称] " + name);
             Console.WriteLine("[启动程序] " + launchExe);
-            Console.WriteLine("[分片大小] " + partSizeMb + " MB");
+            Console.WriteLine("[区块大小] " + chunkSizeMb + " MB");
             Console.WriteLine("[压缩] " + (compress ? "Deflate" : "不压缩"));
-            Console.WriteLine("[模式] " + (force ? "强制全量重传" : "增量（远端已有同样分片则跳过）"));
+            Console.WriteLine("[模式] " + (force ? "强制全量重传" : "增量（远端已有同样区块则跳过）"));
             Console.WriteLine();
 
             var opt = service.BuildSyncOptions(force);
-            opt.PartSize = Math.Max(1, partSizeMb) * 1024L * 1024L;
+            // 必须写 ChunkSize：BuildSyncOptions 已经从设置里填过 32MB，只改 PartSize 不会生效
+            opt.ChunkSize = Math.Max(1, chunkSizeMb) * 1024L * 1024L;
             opt.Compress = compress;
+
+            var uploadConn = options.Get("upload-conn");
+            if (!string.IsNullOrWhiteSpace(uploadConn))
+            {
+                int parsed;
+                if (!int.TryParse(uploadConn, out parsed) || parsed < 1)
+                {
+                    throw new ArgumentException("--upload-conn 需要是 ≥1 的整数，当前值：" + uploadConn);
+                }
+                opt.UploadConcurrency = parsed;
+            }
 
             var result = service.ArchiveApp(
                 appId, name, src, launchExe, version, metadata, opt,
@@ -1076,21 +1133,45 @@ namespace VaultPack
             Console.WriteLine();
             Console.WriteLine("[完成] " + result.Describe());
 
-            // 回读远端清单，确认分片布局
+            // 回读远端清单，确认布局（v3 区块 / v2 分片 / v1 逐文件）
             var manifest = service.FetchManifest(appId);
             Console.WriteLine();
             Console.WriteLine("[清单] Schema=" + manifest.Schema
+                + "  布局=" + manifest.Layout
                 + "  Packed=" + manifest.Packed
                 + "  文件=" + manifest.Files.Count
-                + "  分片=" + manifest.Parts.Count
+                + "  区块=" + manifest.Chunks.Count
                 + "  原始=" + SyncProgress.FormatSize(manifest.TotalBytes)
-                + "  存储=" + SyncProgress.FormatSize(manifest.Parts.Sum(p => p.StoredBytes)));
+                + "  存储=" + SyncProgress.FormatSize(manifest.StoredBytes)
+                + "  区块大小=" + SyncProgress.FormatSize(manifest.ChunkSize));
 
-            foreach (var part in manifest.Parts)
+            if (manifest.Layout == VaultLayout.Chunks)
             {
-                var count = manifest.Files.Count(f => f.Part == part.Index);
-                Console.WriteLine(string.Format("  {0}  {1,12}  原始 {2,12}  {3} 个文件",
-                    part.Path, part.StoredBytes, part.RawBytes, count));
+                foreach (var chunk in manifest.Chunks.Take(10))
+                {
+                    var pieces = manifest.Files.Sum(f =>
+                        f.Pieces == null ? 0 : f.Pieces.Count(p => p.Chunk == chunk.Index));
+                    Console.WriteLine(string.Format("  [{0,4}] {1}  {2,12}  原始 {3,12}  {4} 个片段",
+                        chunk.Index, chunk.Path, chunk.StoredBytes, chunk.RawBytes, pieces));
+                }
+
+                if (manifest.Chunks.Count > 10)
+                {
+                    Console.WriteLine("  ...（其余 " + (manifest.Chunks.Count - 10) + " 个区块略）");
+                }
+
+                var crossChunk = manifest.Files.Count(f => f.Pieces != null && f.Pieces.Count > 1);
+                Console.WriteLine("  跨块文件：" + crossChunk + " 个"
+                    + (crossChunk > 0 ? "（正是 v3 相对 v2 的关键区别）" : string.Empty));
+            }
+            else
+            {
+                foreach (var part in manifest.Parts)
+                {
+                    var count = manifest.Files.Count(f => f.Part == part.Index);
+                    Console.WriteLine(string.Format("  {0}  {1,12}  原始 {2,12}  {3} 个文件",
+                        part.Path, part.StoredBytes, part.RawBytes, count));
+                }
             }
 
             var meta = manifest.Metadata;
@@ -1198,7 +1279,7 @@ namespace VaultPack
                 var manifest = service.FetchManifest(appId);
                 Console.WriteLine("[规模] " + manifest.Files.Count + " 个文件 / "
                     + SyncProgress.FormatSize(manifest.TotalBytes) + "，"
-                    + manifest.Parts.Count + " 个分片");
+                    + manifest.Chunks.Count + " 个区块（" + manifest.Layout + "）");
             }
             catch (Exception ex)
             {

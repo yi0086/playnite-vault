@@ -8,7 +8,7 @@ namespace VaultDemo.Models
     /// </summary>
     public class SyncOptions
     {
-        /// <summary>单个文件 / 分片失败后的最大重试次数。</summary>
+        /// <summary>单个文件 / 区块失败后的最大重试次数。</summary>
         public int MaxRetries { get; set; } = 3;
 
         /// <summary>是否允许从 .part 断点续传。</summary>
@@ -20,13 +20,16 @@ namespace VaultDemo.Models
         /// <summary>安装前要求的最小剩余空间（字节）。0 表示不检查。</summary>
         public long RequiredFreeBytes { get; set; } = 0;
 
-        /// <summary>目标分片大小（字节）。0 表示用默认值。</summary>
+        /// <summary>【v2 兼容】目标分片大小（字节）。新代码请用 ChunkSize。</summary>
         public long PartSize { get; set; } = 0;
+
+        /// <summary>【v3】目标区块大小（字节）。0 表示用默认值。</summary>
+        public long ChunkSize { get; set; } = 0;
 
         /// <summary>打包时是否对文件做 Deflate 压缩。游戏资源多半已压缩，默认关闭。</summary>
         public bool Compress { get; set; } = false;
 
-        /// <summary>下载分片时是否与解包并行（边下边解）。</summary>
+        /// <summary>下载区块时是否与解包并行（边下边解）。</summary>
         public bool PipelineExtract { get; set; } = true;
 
         /// <summary>
@@ -42,12 +45,46 @@ namespace VaultDemo.Models
         /// </summary>
         public int Concurrency { get; set; } = 6;
 
-        public long EffectivePartSize
+        /// <summary>
+        /// 上传并发。0 表示沿用 <see cref="Concurrency"/>。
+        ///
+        /// 单独留一个开关是因为**写入侧通常是 NAS 的瓶颈**：实测下载 88 MB/s 而
+        /// 上传只有 20~40 MB/s，且并发越高 NAS 越容易停顿。上传默认比下载保守。
+        /// </summary>
+        public int UploadConcurrency { get; set; } = 0;
+
+        // ---------- 超时（毫秒）----------
+        // 不能用 HttpWebRequest.Timeout 一把梭：它只管 GetRequestStream()/GetResponse()，
+        // 而 PUT 的 GetResponse() 要等服务端把整个 body 收完落盘才回包，
+        // 大分片必然撞上它 —— 实测 30 秒超时导致 1.93GB 的分片必然失败。
+
+        /// <summary>建连超时（TCP/TLS）。</summary>
+        public int ConnectTimeoutMs { get; set; } = 15000;
+
+        /// <summary>
+        /// **停滞超时**：连续多少毫秒没有任何字节流动就主动断开重试。
+        /// 这才是「速度逐渐到 0」这种真实故障对应的判据。
+        /// </summary>
+        public int StallTimeoutMs { get; set; } = 30000;
+
+        /// <summary>应答超时：body 发完后等服务端回包的上限。大区块要留足。</summary>
+        public int ResponseTimeoutMs { get; set; } = 180000;
+
+        public long EffectiveChunkSize
         {
-            get { return PartSize > 0 ? PartSize : DefaultPartSize; }
+            // PartSize 是对旧调用方（VaultPack CLI 的 --part-size）的兼容回退
+            get { return ChunkSize > 0 ? ChunkSize : (PartSize > 0 ? PartSize : DefaultChunkSize); }
+        }
+
+        public int EffectiveUploadConcurrency
+        {
+            get { return UploadConcurrency > 0 ? UploadConcurrency : Concurrency; }
         }
 
         public const long DefaultPartSize = 256L * 1024 * 1024;
+
+        /// <summary>默认区块大小 32 MB。实测这一档（而不是 256MB）才能让 NAS 稳定收下。</summary>
+        public const long DefaultChunkSize = 32L * 1024 * 1024;
     }
 
     /// <summary>
@@ -177,13 +214,13 @@ namespace VaultDemo.Models
                 FormatSpeed(BytesPerSecond),
                 FormatRemaining(Remaining)));
 
-            // 3) 分片 / 文件计数（有分片时优先展示分片）
+            // 3) 区块 / 文件计数（有区块时优先展示区块）
             if (PartsTotal > 1)
             {
-                var text = string.Format("分片 {0}/{1} 完成", PartsDone, PartsTotal);
+                var text = string.Format("区块 {0}/{1} 完成", PartsDone, PartsTotal);
                 if (PartsInFlight > 0)
                 {
-                    text += string.Format(" · {0} 片进行中", PartsInFlight);
+                    text += string.Format(" · {0} 块进行中", PartsInFlight);
                 }
                 lines.Add(text);
             }
@@ -277,7 +314,15 @@ namespace VaultDemo.Models
         public int Skipped { get; set; }
         public int Failed { get; set; }
         public long BytesTransferred { get; set; }
+
+        /// <summary>实际传输过的区块数（v2 时是分片数）。</summary>
         public int PartsTransferred { get; set; }
+
+        /// <summary>因为远端已有（v3 按内容寻址判断）而跳过的区块数。</summary>
+        public int PartsSkipped { get; set; }
+
+        /// <summary>传输过程中发生的重试次数（含停滞重连）。</summary>
+        public int Retries { get; set; }
 
         /// <summary>随包上传的图片张数（封面 / 背景 / 图标）。</summary>
         public int ImagesUploaded { get; set; }
@@ -286,10 +331,14 @@ namespace VaultDemo.Models
 
         public string Describe()
         {
-            var parts = PartsTransferred > 0 ? string.Format("，{0} 个分片", PartsTransferred) : string.Empty;
+            var chunks = PartsTransferred > 0 || PartsSkipped > 0
+                ? string.Format("，区块 {0} 个（跳过 {1}）", PartsTransferred, PartsSkipped)
+                : string.Empty;
             var images = ImagesUploaded > 0 ? string.Format("，随包图片 {0} 张", ImagesUploaded) : string.Empty;
-            return string.Format("传输 {0} 个文件（{1}）{2}{3}，跳过 {4} 个，用时 {5:0.0} 秒",
-                Transferred, SyncProgress.FormatSize(BytesTransferred), parts, images, Skipped, Elapsed.TotalSeconds);
+            var retries = Retries > 0 ? string.Format("，重试 {0} 次", Retries) : string.Empty;
+            return string.Format("传输 {0} 个文件（{1}）{2}{3}{4}，跳过 {5} 个，用时 {6:0.0} 秒",
+                Transferred, SyncProgress.FormatSize(BytesTransferred), chunks, images, retries,
+                Skipped, Elapsed.TotalSeconds);
         }
     }
 }

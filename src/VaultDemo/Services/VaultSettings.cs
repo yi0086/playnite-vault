@@ -17,7 +17,24 @@ namespace VaultDemo.Services
         /// <summary>本地应用安装根目录。</summary>
         public string LocalRoot { get; set; } = string.Empty;
 
-        public int TimeoutSeconds { get; set; } = 60;
+        /// <summary>
+        /// 建连 / 等响应头的上限（秒）。
+        /// </summary>
+        public int TimeoutSeconds { get; set; } = 15;
+
+        /// <summary>
+        /// **停滞超时（秒）**：连续这么久没有任何字节流动就断开重试。
+        ///
+        /// 这才是「速度从 20MB/s 逐渐掉到 0」对应的判据。
+        /// 旧版本把单一超时当成「传输总超时」用，30 秒会把任何大分片判死。
+        /// </summary>
+        public int StallTimeoutSeconds { get; set; } = 30;
+
+        /// <summary>
+        /// 应答超时（秒）：body 发完之后等服务端落盘回包的上限。
+        /// NAS 收完一个区块还要合并/落盘，大区块要留足。
+        /// </summary>
+        public int ResponseTimeoutSeconds { get; set; } = 180;
 
         /// <summary>
         /// 是否对归档内容做压缩。默认关闭：游戏资源（贴图/音频/视频）本身多为
@@ -26,12 +43,21 @@ namespace VaultDemo.Services
         public bool CompressOnArchive { get; set; } = false;
 
         /// <summary>
-        /// 分片大小（MB）。归档会把应用切成这个大小的分片逐个上传 / 下载，
-        /// 下载时逐片解包（边下边解），因此单次临时占用不会超过这个值。
+        /// 【v2 遗留】分片大小（MB）。v3 请用 ChunkSizeMB；这里只为兼容旧 settings.json。
         /// </summary>
-        public int PartSizeMB { get; set; } = 256;
+        public int PartSizeMB { get; set; } = 0;
 
-        /// <summary>下载时是否边下边解（下载分片与解包并行）。</summary>
+        /// <summary>
+        /// 【v3】区块大小（MB）。一个文件会被切成若干这样大小的区块，**可以跨块**。
+        ///
+        /// 为什么从 256MB 降到 32MB（实测结论）：
+        ///   · 256MB 时「单个大文件独占一片」，Dead Cells 的 res.pak（1.93GB）
+        ///     变成一个 1.93GB 的分片，单个 PUT 在 NAS 上要 100 秒 → 必然超时；
+        ///   · 32MB 正好是之前测速时跑出 96MB/s 的那一档，单块完成快、重试代价低。
+        /// </summary>
+        public int ChunkSizeMB { get; set; } = 32;
+
+        /// <summary>下载时是否边下边解（下载区块与解包并行）。</summary>
         public bool PipelineExtract { get; set; } = true;
 
         private int concurrency = 6;
@@ -48,8 +74,7 @@ namespace VaultDemo.Services
         /// 4 路是拐点，6 路到顶（≈770 Mbps）且最稳，再多只会互相抢带宽。
         /// 走明文 HTTP 时单路就能跑满千兆，此时设 1~2 即可。
         ///
-        /// 注意：分片是并发传输的（上传下载都是），
-        /// 峰值临时磁盘占用 ≈ (并发数 + 2) × 分片大小。
+        /// 注意：峰值临时磁盘占用 ≈ (并发数 + 2) × 区块大小。
         /// </summary>
         public int Concurrency
         {
@@ -57,6 +82,24 @@ namespace VaultDemo.Services
             // 钳位放在 setter 上：settings.json 里手改的越界值也会在反序列化时被纠正
             set { concurrency = value < 1 ? 1 : (value > 16 ? 16 : value); }
         }
+
+        private int uploadConcurrency;
+
+        /// <summary>
+        /// 上传并发。0 表示沿用 <see cref="Concurrency"/>。
+        ///
+        /// 单独留一个开关，是因为**瓶颈通常在 NAS 的写入侧**：
+        /// 实测下载 88 MB/s 而上传只有 20~40 MB/s，且并发越高越容易停顿。
+        /// 所以上传默认比下载保守（4 路），下载仍用 6 路。
+        /// </summary>
+        public int UploadConcurrency
+        {
+            get { return uploadConcurrency > 0 ? uploadConcurrency : DefaultUploadConcurrency; }
+            set { uploadConcurrency = value < 0 ? 0 : (value > 16 ? 16 : value); }
+        }
+
+        /// <summary>上传默认并发：实测 4 路是拐点，比下载的 6 路保守一档。</summary>
+        public const int DefaultUploadConcurrency = 4;
 
         /// <summary>
         /// 是否让 WebDAV 请求走系统代理。访问内网 NAS 时必须关闭，
@@ -70,6 +113,17 @@ namespace VaultDemo.Services
         /// <summary>是否启用断点续传（保留 .part 并从中断处继续）。</summary>
         public bool ResumePartial { get; set; } = true;
 
+        /// <summary>
+        /// 仓库管理口令的哈希（只存派生值，不存明文）。
+        /// 空表示还没设置过 —— 此时任何写操作都应先提示去设置，而不是直接执行。
+        /// 真正的校验在 VaultAdmin 里做，这里只是本地缓存避免每次都去 NAS 取。
+        /// </summary>
+        public string AdminHash { get; set; } = string.Empty;
+
+        public string AdminSalt { get; set; } = string.Empty;
+
+        public int AdminIterations { get; set; } = 0;
+
         public VaultSettings Clone()
         {
             return new VaultSettings
@@ -79,13 +133,20 @@ namespace VaultDemo.Services
                 Password = this.Password,
                 LocalRoot = this.LocalRoot,
                 TimeoutSeconds = this.TimeoutSeconds,
+                StallTimeoutSeconds = this.StallTimeoutSeconds,
+                ResponseTimeoutSeconds = this.ResponseTimeoutSeconds,
                 CompressOnArchive = this.CompressOnArchive,
                 PartSizeMB = this.PartSizeMB,
+                ChunkSizeMB = this.ChunkSizeMB,
                 PipelineExtract = this.PipelineExtract,
                 Concurrency = this.Concurrency,
+                UploadConcurrency = this.UploadConcurrency,
                 UseSystemProxy = this.UseSystemProxy,
                 MaxRetries = this.MaxRetries,
-                ResumePartial = this.ResumePartial
+                ResumePartial = this.ResumePartial,
+                AdminHash = this.AdminHash,
+                AdminSalt = this.AdminSalt,
+                AdminIterations = this.AdminIterations
             };
         }
 

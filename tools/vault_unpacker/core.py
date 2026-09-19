@@ -2,31 +2,47 @@
 """
 Vault 解包核心 —— 不依赖 Playnite 插件，只用 Python 标准库。
 
-从远端仓库（WebDAV）或本地已下载的 apps/{id}/ 目录，把分片归档还原成原始文件。
+从远端仓库（WebDAV）或本地已下载的 apps/{id}/ 目录，把归档还原成原始文件。
 
-格式（见 Playnite-插件关键方法文档.md 第 26 节）：
-    apps/{id}/manifest.json        清单，Schema=2 时 Packed=true 走分片布局
-    apps/{id}/parts/part-0000.bin  裸字节流，没有索引头
-    apps/{id}/meta/*               随包图片
+三种布局（**用字段推断，不要看 Schema 数值** —— 旧清单里根本没有这个字段）：
 
-解一条记录：
-    blob = parts/part-{Part:0000}.bin[Offset .. Offset+StoredSize]
-    Compression == "store"   → blob 就是文件内容
-    Compression == "deflate" → 裸 deflate（RFC 1951，无 zlib 头）解压
+v1  Files=false：
+    apps/{id}/files/<原路径>        逐个文件直传
+
+v2  Parts 非空：
+    apps/{id}/parts/part-0000.bin   裸字节流，一个文件不跨片
+    blob = part[Offset .. Offset+StoredSize]
+
+v3  Chunks 非空（内容寻址，当前版本）：
+    apps/{id}/chunks/<sha1>.bin     文件名就是内容哈希，**一个文件可跨多个区块**
+    每个 FileEntry 带 Pieces[]：{Chunk, Offset, Length, Size, FileOffset, Compression}
+    块内偏移 Offset 决定从哪儿读，FileOffset 决定写到文件的哪个位置
+
+Compression：
+    null / "store"   → blob 就是文件内容
+    "deflate"        → 裸 deflate（RFC 1951，无 zlib 头）解压
 """
 
 import base64
+import hashlib
 import json
 import os
 import shutil
 import ssl
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 CHUNK = 1 << 20
 SCHEMA_V1_FILES = "files"
+
+# 区块下载的默认并发与重试。
+# 并发不要开太大：瓶颈通常在 NAS 的写入侧，而且峰值临时磁盘占用 ≈ 并发 × 区块大小。
+DEFAULT_CHUNK_WORKERS = 4
+DEFAULT_RETRIES = 3
 
 
 class UnpackError(Exception):
@@ -317,6 +333,21 @@ def folder_for(app):
     return sanitize_folder_name(app.get("id")) or str(app.get("id") or "")
 
 
+def layout_label(app):
+    """列表里「布局」那一列该显示什么。
+
+    v3 / v2 / v1 三种归档混在一个仓库里是常态（旧归档不必重打），
+    所以列表必须一眼看出哪条是哪种格式。
+    """
+    chunks = int(app.get("chunk_count") or 0)
+    if chunks:
+        return "区块 %d" % chunks
+    parts = int(app.get("part_count") or 0)
+    if parts:
+        return "分片 %d" % parts
+    return "直传"
+
+
 # --------------------------------------------------------------------------
 # 仓库浏览
 # --------------------------------------------------------------------------
@@ -325,7 +356,7 @@ def list_apps(source):
     """
     读仓库总索引 index.json。拿不到时就退化成扫描目录（对本地来源很有用）。
     返回 [ {id, name, version, total_bytes, file_count, launch_exe,
-            part_count, packed, install_dir_name} ]
+            part_count, chunk_count, packed, install_dir_name} ]
     """
     # 读不到 index.json 不算致命 —— 本地来源可以退化成扫目录。
     # 注意 here 不能 `except UnpackError: raise`：read_json 在「文件不存在」时
@@ -347,6 +378,7 @@ def list_apps(source):
                 "file_count": int(a.get("FileCount") or 0),
                 "launch_exe": a.get("LaunchExe") or "",
                 "part_count": int(a.get("PartCount") or 0),
+                "chunk_count": int(a.get("ChunkCount") or 0),
                 "packed": bool(a.get("Packed")),
                 "install_dir_name": _meta_value(a.get("Metadata"),
                                                 "InstallDirName"),
@@ -370,6 +402,7 @@ def list_apps(source):
                 "file_count": len(mf.get("Files") or []),
                 "launch_exe": mf.get("LaunchExe") or "",
                 "part_count": len(mf.get("Parts") or []),
+                "chunk_count": len(mf.get("Chunks") or []),
                 "packed": bool(mf.get("Packed")),
                 "install_dir_name": _meta_value(mf.get("Metadata"),
                                                 "InstallDirName"),
@@ -432,10 +465,14 @@ def _write_file(target, blob):
 
 
 def unpack(source, app_id, out_dir, reporter=None, cancel=None,
-           keep_parts=False, part_tmp=None):
+           keep_parts=False, part_tmp=None,
+           chunk_workers=None, retries=DEFAULT_RETRIES):
     """
     把 apps/{app_id} 还原到 out_dir。
-    返回 {files, bytes, parts, manifest, out_dir, mode}
+    返回 {files, bytes, parts, chunks, manifest, out_dir, mode}
+
+    布局由清单字段推断：Chunks 非空 → v3；Packed + Parts → v2；否则 v1。
+    **不要看 Schema 数值**：v1/v2 的清单里没有这个字段。
     """
     rep = reporter or NullReporter()
     manifest = fetch_manifest(source, app_id)
@@ -443,6 +480,7 @@ def unpack(source, app_id, out_dir, reporter=None, cancel=None,
     packed = bool(manifest.get("Packed"))
     files = manifest.get("Files") or []
     parts = manifest.get("Parts") or []
+    chunks = manifest.get("Chunks") or []
 
     rep.log("应用      : %s (%s)" % (manifest.get("Name"), app_id))
     rep.log("Schema    : %s   Packed=%s" % (manifest.get("Schema"), packed))
@@ -454,10 +492,299 @@ def unpack(source, app_id, out_dir, reporter=None, cancel=None,
 
     os.makedirs(out_dir, exist_ok=True)
 
+    if chunks:
+        return _unpack_chunks(source, app_id, manifest, files, chunks, out_dir,
+                              rep, cancel, keep_parts, part_tmp,
+                              chunk_workers or DEFAULT_CHUNK_WORKERS, retries)
+
     if packed:
         return _unpack_packed(source, app_id, manifest, files, parts, out_dir,
                               rep, cancel, keep_parts, part_tmp)
     return _unpack_plain(source, app_id, manifest, files, out_dir, rep, cancel)
+
+
+# --------------------------------------------------------------------------
+# v3：内容寻址区块
+# --------------------------------------------------------------------------
+
+def _piece_is_stored(piece):
+    comp = piece.get("Compression")
+    return comp is None or comp == "" or comp == "store"
+
+
+def _manifest_stamp(manifest):
+    """清单指纹。区块表本身变了才算「换了一份归档」，此时旧进度作废。"""
+    ids = [str(c.get("Id") or "") for c in (manifest.get("Chunks") or [])]
+    raw = "|".join(ids) + "|" + str(manifest.get("TotalBytes") or 0)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _journal_path(part_tmp, app_id):
+    safe = "".join(ch for ch in str(app_id) if ch.isalnum() or ch in "-_")
+    return os.path.join(part_tmp, (safe or "app") + ".chunks.json")
+
+
+def _load_journal(path, stamp):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return set()
+    if not isinstance(data, dict) or data.get("stamp") != stamp:
+        return set()
+    return set(str(x) for x in (data.get("done") or []))
+
+
+def _save_journal(path, stamp, done_ids):
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"stamp": stamp, "done": sorted(done_ids)}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _unpack_chunks(source, app_id, manifest, files, chunks, out_dir, rep, cancel,
+                   keep_chunks, part_tmp, workers, retries):
+    """v3 内容寻址区块布局。
+
+    和 v2 的两处关键区别：
+
+    1. **一个文件可以跨多个区块**，所以还原不是「按分片顺序喂文件」，而是
+       「按区块把它里面的片段各写一段」，落点由 Piece.FileOffset 决定。
+       正因为如此，落盘必须用 seek 随机写：并发下载时区块是乱序完成的，
+       同一个文件的后半段完全可能比前半段先到。
+    2. **区块下载完就立刻解包并删掉临时文件**。峰值临时占用只有
+       「并发数 × 区块大小」（默认 4 × 32MB ≈ 128MB），而不是整个应用的大小。
+
+    断点续传靠 part_tmp 下的一份小日志（记「哪些区块已经解完」）：
+    区块文件本身不保留，所以「续传」是「跳过已完成区块」而不是「续传半个区块」。
+    """
+    if not chunks:
+        raise UnpackError("清单里没有区块表，无法按 v3 布局解包。")
+
+    part_tmp = part_tmp or _default_part_tmp()
+    os.makedirs(part_tmp, exist_ok=True)
+
+    # 区块下标 → 落在里面的 (文件, 片段)
+    pieces_by_chunk = {}
+    for f in files:
+        for piece in (f.get("Pieces") or []):
+            pieces_by_chunk.setdefault(int(piece.get("Chunk") or 0), []).append((f, piece))
+
+    # 空文件：v3 里它不会产生任何片段，得先把空壳建出来，
+    # 否则最后自检会报「缺失」，文件数也会少数一个。
+    zero_targets = set()
+    for f in files:
+        if int(f.get("Size") or 0) == 0:
+            target = _safe_target(out_dir, f.get("Path") or "")
+            os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+            if not os.path.exists(target):
+                open(target, "wb").close()
+            zero_targets.add(target)
+
+    ordered = sorted(chunks, key=lambda c: int(c.get("Index") or 0))
+    total = sum(int(c.get("StoredBytes") or 0) for c in ordered) or 1
+
+    stamp = _manifest_stamp(manifest)
+    journal = _journal_path(part_tmp, app_id)
+    done_ids = _load_journal(journal, stamp) if not keep_chunks else set()
+
+    done_ids = set(cid for cid in done_ids
+                   if any(str(c.get("Id")) == cid for c in ordered))
+    if done_ids:
+        rep.log("")
+        rep.log("续传：已完成的 %d 个区块（%.1f MB）会跳过。"
+                % (len(done_ids), sum(int(c.get("StoredBytes") or 0) for c in ordered
+                                      if str(c.get("Id")) in done_ids) / 1048576.0))
+
+    pending = [c for c in ordered if str(c.get("Id")) not in done_ids]
+
+    rep.stage("下载并解包")
+
+    # 每个区块对总进度贡献多少字节。**用单调递增的方式记账**：
+    # 并发下载时区块是乱序完成的，若按「已完成累计 + 在传部分」现算，
+    # 某个区块下载完的那一刻它会从「在传」挪到「已完成」，
+    # 总数就会往回掉一截 —— 进度条会肉眼可见地倒退。
+    lock = threading.Lock()
+    progress_map = {}
+    finished = {"n": 0}
+    written_files = set()
+
+    # 跳过的区块直接记满格，这样进度一开始反映的是真实位置
+    for c in ordered:
+        cid = str(c.get("Id"))
+        if cid in done_ids:
+            progress_map[cid] = int(c.get("StoredBytes") or 0)
+            finished["n"] += 1
+
+    def report(text):
+        with lock:
+            cur = sum(progress_map.values())
+            n = finished["n"]
+        rep.progress(min(cur, total), total, text)
+
+    report("准备中")
+
+    def handle(chunk):
+        _check_cancel(cancel)
+
+        idx = int(chunk.get("Index") or 0)
+        cid = str(chunk.get("Id") or "")
+        stored = int(chunk.get("StoredBytes") or 0)
+        rel = chunk.get("Path") or ("chunks/%s.bin" % cid)
+        local = os.path.join(part_tmp, "%s.bin" % cid)
+
+        def on_bytes(d, _t, _cid=cid, _idx=idx):
+            # 用 max 收紧：重试时已经传过的字节不该让进度条往回缩
+            with lock:
+                progress_map[_cid] = max(progress_map.get(_cid, 0),
+                                         min(int(d), stored))
+            report("区块 %d/%d 下载中" % (_idx + 1, len(ordered)))
+
+        last_error = None
+        for attempt in range(1, max(1, retries) + 1):
+            _check_cancel(cancel)
+            try:
+                source.download("apps/%s/%s" % (app_id, rel), local, on_bytes, cancel)
+                break
+            except Cancelled:
+                _quiet_remove(local)
+                raise
+            except Exception as ex:          # noqa: BLE001 —— 网络层什么都可能抛
+                last_error = ex
+                _quiet_remove(local)
+                if attempt >= max(1, retries):
+                    raise UnpackError("区块 %s 下载失败（重试 %d 次）：%s"
+                                      % (cid[:12], attempt, ex))
+                rep.log("  区块 %s 第 %d 次失败，重试：%s" % (cid[:12], attempt, ex))
+
+        if last_error is not None and not os.path.isfile(local):
+            raise UnpackError("区块 %s 下载失败：%s" % (cid[:12], last_error))
+
+        actual = os.path.getsize(local)
+        if stored and actual != stored:
+            _quiet_remove(local)
+            raise UnpackError("区块大小不符：%s 期望 %d 实际 %d" % (cid[:12], stored, actual))
+
+        # 内容寻址的额外好处：可以顺手校验哈希。文件名叫什么，内容就该是什么。
+        if cid:
+            digest = _hash_file(local)
+            if digest != cid:
+                _quiet_remove(local)
+                raise UnpackError("区块哈希不符：%s 实际 %s（传输损坏或服务端改过文件）"
+                                  % (cid[:12], digest[:12]))
+
+        # 立刻解包：把这一块里的所有片段写到各自文件的目标偏移上
+        try:
+            with open(local, "rb") as cf:
+                for f, piece in sorted(pieces_by_chunk.get(idx, []),
+                                       key=lambda t: int(t[1].get("Offset") or 0)):
+                    blob, expect = _read_piece(cf, piece, cid, f.get("Path"))
+                    target = _safe_target(out_dir, f.get("Path") or "")
+                    _write_piece(target, piece, blob)
+
+                    # 记的是**文件个数**，不是片段个数：一个文件跨多个区块时
+                    # 每个区块里都有一段，按片段数就会多算好几倍。
+                    written_files.add(target)
+
+                    if len(written_files) % 20 == 0:
+                        report("解包 %s" % os.path.basename(f.get("Path") or ""))
+        finally:
+            if not keep_chunks:
+                _quiet_remove(local)
+
+        with lock:
+            progress_map[cid] = stored
+            finished["n"] += 1
+            if not keep_chunks:
+                done_ids.add(cid)
+                _save_journal(journal, stamp, done_ids)
+        report("已完成 %d/%d 个区块" % (finished["n"], len(ordered)))
+
+    if pending:
+        workers = max(1, min(int(workers), 8))
+        if workers == 1:
+            for chunk in pending:
+                handle(chunk)
+        else:
+            # 用线程池而不是 asyncio：Source.download 是同步阻塞的 urllib，
+            # 多线程最省事，而且 GIL 在等 IO 时会释放，并发是真实有效的。
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(handle, c) for c in pending]
+                for fut in futures:
+                    fut.result()   # 第一个异常在这里抛出，其余任务随 with 退出被收走
+
+    rep.stage("完成")
+    rep.progress(total, total, "完成")
+
+    if not keep_chunks:
+        _quiet_remove(journal)
+
+    written_all = set(written_files) | zero_targets
+    total_bytes_written = 0
+    for path in written_all:
+        try:
+            total_bytes_written += os.path.getsize(path)
+        except OSError:
+            pass
+
+    return {
+        "files": len(written_all),
+        "bytes": total_bytes_written,
+        "parts": 0,
+        "chunks": len(ordered),
+        "manifest": manifest,
+        "out_dir": out_dir,
+        "mode": "chunks",
+    }
+
+
+def _hash_file(path):
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        while True:
+            buf = fh.read(CHUNK)
+            if not buf:
+                break
+            h.update(buf)
+    return h.hexdigest()
+
+
+def _read_piece(chunk_file, piece, cid, rel):
+    """从区块文件里读出一个片段，必要时解压，并核对还原后的大小。"""
+    offset = int(piece.get("Offset") or 0)
+    length = int(piece.get("Length") or 0)
+
+    chunk_file.seek(offset)
+    blob = chunk_file.read(length)
+    if len(blob) != length:
+        raise UnpackError("从区块 %s 读取越界（文件 %s）" % (cid[:12], rel))
+
+    if not _piece_is_stored(piece):
+        blob = _inflate_raw(blob)
+
+    expect = int(piece.get("Size") or 0)
+    if len(blob) != expect:
+        raise UnpackError("解出大小不符：%s 期望 %d 实际 %d" % (rel, expect, len(blob)))
+
+    return blob, expect
+
+
+def _write_piece(target, piece, blob):
+    """把片段写到文件的目标偏移。
+
+    **不能用 append**：并发下载会让同一个文件的后半段先到，
+    append 会把顺序搞反。必须用 r+b + seek 随机写。
+    """
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    if not os.path.exists(target):
+        open(target, "wb").close()
+
+    with open(target, "r+b") as out:
+        out.seek(int(piece.get("FileOffset") or 0))
+        out.write(blob)
 
 
 def _unpack_packed(source, app_id, manifest, files, parts, out_dir, rep, cancel,

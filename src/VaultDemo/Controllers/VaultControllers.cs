@@ -25,6 +25,10 @@ namespace VaultDemo.Controllers
         public override void Install(InstallActionArgs args)
         {
             var api = VaultPlugin.Instance.PlayniteApi;
+
+            // 落盘目录名不是 Id、也不是 Playnite 里的显示名：
+            // 它来自随包元数据的 InstallDirName（上传前原始安装目录的最后一段）。
+            // GetInstallDir(appId) 内部就是「缓存索引 → 远端清单」找这个字段，取不到才退回 Id。
             var targetDir = service.GetInstallDir(Game.GameId);
 
             api.Dialogs.ActivateGlobalProgress(progress =>

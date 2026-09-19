@@ -10,6 +10,7 @@ using Playnite.SDK.Models;
 using Playnite.SDK.Plugins;
 using VaultDemo.Controllers;
 using VaultDemo.Models;
+using VaultDemo.Net;
 using VaultDemo.Services;
 using VaultDemo.UI;
 
@@ -107,7 +108,12 @@ namespace VaultDemo
         {
             var entry = local.Find(app.Id);
             var installed = entry != null && Directory.Exists(entry.InstallDir);
-            var installDir = installed ? entry.InstallDir : service.GetInstallDir(app.Id);
+
+            // 落盘目录名来自随包元数据的 InstallDirName（上传前原始安装目录的最后一段），
+            // 不用 Id、更不用 Playnite 里的中文显示名 —— 中文目录装不了某些游戏。
+            var installDir = installed
+                ? entry.InstallDir
+                : service.GetInstallDir(app.Id, app.Metadata == null ? null : app.Metadata.InstallDirName);
             var launchExe = string.IsNullOrWhiteSpace(app.LaunchExe) ? "app.exe" : app.LaunchExe;
 
             var metadata = new GameMetadata
@@ -514,6 +520,13 @@ namespace VaultDemo
             items.Add(new GameMenuItem
             {
                 MenuSection = "Vault",
+                Description = "管理仓库应用（删除，需管理口令）",
+                Action = a => ManageRepository()
+            });
+
+            items.Add(new GameMenuItem
+            {
+                MenuSection = "Vault",
                 Description = "打开插件数据目录",
                 Action = a => OpenPath(service.DataPath)
             });
@@ -526,6 +539,145 @@ namespace VaultDemo
             });
 
             return items;
+        }
+
+        /// <summary>
+        /// 打开仓库管理窗口（删除应用）。进门先过管理口令这一关：
+        ///  · 仓库还没设置过口令 → 明确提示，并允许当场设置；
+        ///  · 设置过 → 输一次，最多 3 次机会。
+        ///
+        /// 口令只是**防误触闸门**：派生值明文存在仓库根的 vault-admin.json，
+        /// 真正拦住外人的是 WebDAV 账号。别把它当权限系统用。
+        /// </summary>
+        private void ManageRepository()
+        {
+            if (!service.Settings.IsConfigured)
+            {
+                PlayniteApi.Dialogs.ShowMessage("还没有配置 WebDAV 地址，请先到插件设置里填写。", "Vault Demo");
+                return;
+            }
+
+            VaultAdmin admin;
+            try
+            {
+                admin = service.FetchAdmin();
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Error("读取仓库管理口令失败", ex);
+                PlayniteApi.Dialogs.ShowErrorMessage("连接仓库失败：" + ex.Message, "Vault Demo");
+                return;
+            }
+
+            if (admin == null || !admin.IsSet)
+            {
+                if (!EnsureAdminPassword())
+                {
+                    return;
+                }
+            }
+            else if (!PromptAdminPassword())
+            {
+                return;
+            }
+
+            new VaultAdminWindow(service).ShowDialog();
+        }
+
+        /// <summary>「还没设置口令」时的引导：解释清楚它是什么，再当场设置。</summary>
+        private bool EnsureAdminPassword()
+        {
+            var answer = PlayniteApi.Dialogs.ShowMessage(
+                "这个仓库还没有设置管理口令。\n\n"
+                + "管理口令用来保护「删除仓库应用」这类破坏性操作。\n"
+                + "请注意它是防误触闸门、不是账号体系：口令的派生值保存在仓库根的 "
+                + VaultAdmin.FileName + "，任何能读写这个仓库的人都能拿到它。\n"
+                + "真正拦住外人的是 WebDAV 账号本身。\n\n"
+                + "现在设置吗？",
+                "Vault 仓库管理",
+                System.Windows.MessageBoxButton.YesNo,
+                System.Windows.MessageBoxImage.Question);
+
+            if (answer != System.Windows.MessageBoxResult.Yes)
+            {
+                return false;
+            }
+
+            var fresh = PasswordPrompt.Ask(null, "设置管理口令", "给这个仓库设置管理口令（至少 4 位）：", true);
+            if (fresh == null)
+            {
+                return false;
+            }
+
+            if (fresh.Length < 4)
+            {
+                PlayniteApi.Dialogs.ShowMessage("口令至少 4 位，已取消。", "Vault 仓库管理");
+                return false;
+            }
+
+            try
+            {
+                service.SetAdminPassword(fresh);
+                PlayniteApi.Dialogs.ShowMessage(
+                    "管理口令已保存在仓库根的 " + VaultAdmin.FileName + "。\n"
+                    + "换机器用同一个仓库时会自动读到它，不需要重新设置。",
+                    "Vault 仓库管理");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Error("设置管理口令失败", ex);
+                PlayniteApi.Dialogs.ShowErrorMessage("设置失败：" + ex.Message, "Vault 仓库管理");
+                return false;
+            }
+        }
+
+        /// <summary>已设置口令时的校验循环。返回 true 表示通过。</summary>
+        private bool PromptAdminPassword()
+        {
+            const int maxAttempts = 3;
+
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                var tip = attempt == 1
+                    ? "请输入仓库管理口令："
+                    : string.Format("口令不正确，再试一次（第 {0}/{1} 次）：", attempt, maxAttempts);
+
+                var password = PasswordPrompt.Ask(null, "仓库管理口令", tip, false);
+                if (password == null)
+                {
+                    return false;
+                }
+
+                bool isSet;
+                bool ok;
+                try
+                {
+                    ok = service.VerifyAdminPassword(password, out isSet);
+                }
+                catch (Exception ex)
+                {
+                    VaultLog.Error("校验管理口令失败", ex);
+                    PlayniteApi.Dialogs.ShowErrorMessage("校验失败：" + ex.Message, "Vault 仓库管理");
+                    return false;
+                }
+
+                if (!isSet)
+                {
+                    // 远端 vault-admin.json 在本次会话期间被删掉了：让用户重新走一遍引导
+                    PlayniteApi.Dialogs.ShowMessage(
+                        "仓库的管理口令似乎已被移除，请重新打开本功能。", "Vault 仓库管理");
+                    return false;
+                }
+
+                if (ok)
+                {
+                    return true;
+                }
+            }
+
+            PlayniteApi.Dialogs.ShowMessage("口令连续输错 3 次，已取消。", "Vault 仓库管理");
+            return false;
         }
 
         private void OpenPath(string path)
@@ -659,7 +811,9 @@ namespace VaultDemo
         {
             var entry = local.Find(app.Id);
             var installed = entry != null && Directory.Exists(entry.InstallDir);
-            var installDir = installed ? entry.InstallDir : service.GetInstallDir(app.Id);
+            var installDir = installed
+                ? entry.InstallDir
+                : service.GetInstallDir(app.Id, app.Metadata == null ? null : app.Metadata.InstallDirName);
             var launchExe = string.IsNullOrWhiteSpace(app.LaunchExe) ? "app.exe" : app.LaunchExe;
 
             game.Name = app.Name;
@@ -705,7 +859,10 @@ namespace VaultDemo
             catch (Exception ex)
             {
                 VaultLog.Error("测试连接失败", ex);
-                PlayniteApi.Dialogs.ShowErrorMessage("连接失败：" + ex.Message, "Vault Demo");
+                PlayniteApi.Dialogs.ShowErrorMessage(
+                    "连接失败：\n\n" + WebDavDiagnostics.Describe(ex,
+                        service.Settings.WebDavUrl, service.Settings.Username),
+                    "Vault Demo");
             }
         }
 
@@ -759,7 +916,12 @@ namespace VaultDemo
                         break;
                     }
 
-                    var appId = game.PluginId == Id ? game.GameId : VaultService.MakeSlug(game.Name);
+                    // Id 取「上传前安装目录的最后一段」压出来的 ASCII slug。
+                    // 已是本插件条目时**一律沿用原 Id**：改 Id 会让库条目与已装目录失联，
+                    // 而落盘目录名现在由元数据 InstallDirName 决定，跟 Id 已经解耦了。
+                    var appId = game.PluginId == Id
+                        ? game.GameId
+                        : VaultService.MakeAppId(InstallDirNameOf(game), game.Name);
                     var launchExe = GuessLaunchExe(game);
 
                     try
@@ -837,7 +999,11 @@ namespace VaultDemo
 
                     try
                     {
-                        var dir = service.GetInstallDir(game.GameId);
+                        // 修复目标就是库条目当前的安装目录（它已经按元数据 InstallDirName 算好了）；
+                        // 只有拿不到才回退到「按 Id 从索引里找」，那会多一次网络请求。
+                        var dir = string.IsNullOrWhiteSpace(game.InstallDirectory)
+                            ? service.GetInstallDir(game.GameId)
+                            : game.InstallDirectory;
                         var sink = new ProgressSink(progress, "正在修复 " + game.Name);
 
                         var result = service.InstallApp(game.GameId, dir, options, sink.Apply,

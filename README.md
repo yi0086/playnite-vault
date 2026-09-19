@@ -9,6 +9,23 @@ upload it, and install it back on any machine with metadata included.
 
 ---
 
+## v1.4.0 改了什么
+
+这一版的核心是一次存储格式升级（v3：**内容寻址区块**）+ 一个管理口令，动了三处根上的东西：
+
+| 问题 | 原因 | 现在怎么做 |
+|---|---|---|
+| 大游戏传不上去（速度从 20 MB/s 掉到 0 然后超时），例如 死亡细胞 / 米塔 | 旧格式**整文件独占一个分片**，`res.pak` 1.93 GB 就变成一个 1.93 GB 的 PUT；而超时用的是建连超时，任何大 PUT 必然撞死 | 区块固定 32 MB，**一个文件可跨多块**；超时拆成建连 / 停滞 / 应答三档，其中「停滞」才是「速度到 0」的正确判据；单块失败自动重试 |
+| 装回去的目录名是 Playnite 里的中文显示名，有些游戏在中文目录下起不来 | 目录名直接用了 `appId`，而 slug 生成用了 `char.IsLetterOrDigit` —— 它对 CJK 返回 true，中文名原样变成了 id | `Id` 与**文件夹名彻底分离**：文件夹名取「上传前安装目录的最后一段」（`D:\Game\Lib\Plants Vs Zombies RH` → `Plants Vs Zombies RH`），存在随包元数据里；id 另用纯 ASCII slug |
+| 想删掉 NAS 上的某个归档只能手动连 NAS | 没有仓库管理入口 | 游戏列表右键 → Vault → **管理仓库应用**；删除前要输管理口令（口令单独设置、存在仓库根的 `vault-admin.json`，没设置会先引导设置） |
+
+顺带三处体验修正：切片变小变多后**下载区块并发 4 路**、**区块下完立刻解包并删掉临时文件**（峰值临时占用只有「并发数 × 区块大小」而不是整个游戏大小）、以及 **401 的精确诊断**（区分「密码填错」和「服务端认证后端坏了」——两者的 401 响应完全一样，光看状态码分不出来）。
+
+旧归档（Schema 1/2）读取端**仍然完全支持**，不需要重新打包也能装；
+但如果想让旧归档也拿到新的 32 MB 切块与正确的目录名，重新归档一遍即可。
+
+---
+
 ## 它解决什么问题
 
 Playnite 本身没有「从自己的存储装游戏」的路径：库里要么是各平台客户端（Steam/Epic…），
@@ -23,6 +40,10 @@ Vault 的做法是把 NAS 当成一个**自建的软件仓库**：
   元数据直接从包里读，不需要再刮削一次
 - **便携解包**：不想开 Playnite 也行 —— 配套一个单文件 exe / 命令行，指向 NAS 就能解包
 
+装好之后怎么用：[`docs/plugin-usage.md`](docs/plugin-usage.md)（含首次配置、归档/安装、
+重新归档的完整顺序，以及 401 的排查方法）。
+仓库格式规范：[`docs/repo-format.md`](docs/repo-format.md)。
+
 ---
 
 ## 组成
@@ -33,6 +54,7 @@ Vault 的做法是把 NAS 当成一个**自建的软件仓库**：
 | `tools/VaultPack/` | 命令行工具：打包上传 / 下载安装 / 远端目录浏览 / 测速 / 备份 Playnite 库 / 导出库元数据 | C# / .NET Framework 4.6.2 |
 | `tools/`（Python 部分） | 独立解包器：tkinter 图形界面 + 命令行，可打包成免 Python 环境的单文件 exe；解完可选登记回 Playnite | Python 3（标准库 + tkinter） |
 | `tools/webdav_mock.py` | 极简本地 WebDAV 服务，用来离线跑端到端验证 | Python 3 |
+| `tools/e2e-v3-test.py` | v3 端到端验证：造测试目录 → 打包上传 → 查仓库结构 → 解包还原 → 逐字节比对 → 中断续传 | Python 3 |
 | `tools/speedtest.py` | WebDAV 吞吐排查：把「链路 / 服务端 / 客户端」三层分开量 | Python 3 |
 
 ---
@@ -43,21 +65,30 @@ Vault 的做法是把 NAS 当成一个**自建的软件仓库**：
     本地已安装的目录                      NAS（WebDAV）                        另一台机器
 ┌──────────────────────┐          ┌────────────────────────┐          ┌──────────────────────┐
 │ D:\Games\Brotato     │          │ index.json             │          │ Playnite 库          │
-│   ├─ Brotato.exe     │  打包     │ apps/Brotato/          │  解包     │   └─ 未安装条目       │
+│   ├─ Brotato.exe     │  打包     │ apps/plants-vs-zombies │  解包     │   └─ 未安装条目       │
 │   └─ …               │ ───────► │   ├─ manifest.json     │ ───────► │        ↓ 点「安装」   │
-│                      │  上传     │   ├─ parts/part-0000…  │  下载     │ D:\Games\Brotato     │
+│                      │  上传     │   ├─ chunks/<sha1>.bin │  下载     │ D:\Games\Brotato     │
 │ + Playnite 元数据     │          │   └─ meta/cover.png    │          │   （目录名保持一致）  │
 └──────────────────────┘          └────────────────────────┘          └──────────────────────┘
+                                    ▲
+                                    └─ vault-admin.json（管理口令，保护删除操作）
 ```
 
-三条设计上的取舍，决定了它为什么这么简单：
+四条设计上的取舍，决定了它为什么这么简单：
 
 1. **默认不压缩**。现代游戏的体积大头是已压缩的 pak / 视频 / 音频，再压只能省个位数百分比，
    却要吃满 CPU 跑几个小时。所以默认 `store`（裸字节），只对个别条目按需 deflate。
-2. **分片是「裸字节流」**。`part-0000.bin` 就是若干文件字节的顺次拼接，文件头里没有任何索引；
-   每个文件的位置由 `manifest.json` 的 `Part / Offset / StoredSize` 描述。
-   于是任何能「从偏移量读 N 字节」的程序都能解包 —— 这是独立解包器能只有几百行的原因。
-3. **元数据随包走**。归档时把 Playnite 库里的元数据写进 `manifest.json`，
+2. **区块是「内容寻址」的**：`chunks/<sha1>.bin`，**文件名就是内容的哈希**。
+   这带来三个白拿的好处 —— 「远端是不是已经有这一块」只需一个 HEAD 就能判断（天然可续传）、
+   下载完能顺手校验哈希、以及同样内容的文件只存一份。
+   代价是区块一旦写出就不可变，所以更新归档时留下的是新块而不是覆盖旧块
+   （区块放在 `apps/{id}/` 里面，删应用时一起清掉，不会攒孤儿）。
+3. **一个文件可以跨多个区块**（这是 v3 相对 v2 最关键的区别）。
+   切块固定 32 MB，`res.pak` 会被切成几十块，于是单个 PUT 永远不会超过 32 MB
+   —— 这正是「1.93 GB 的大文件必然超时」那个问题的根治法。
+   代价是还原时要按 `PieceEntry.FileOffset` 随机写，不能顺序追加
+   （并发下载时同一个文件的后半段完全可能先到）。
+4. **元数据随包走**。归档时把 Playnite 库里的元数据写进 `manifest.json`，
    装机端直接读，省掉一次网络刮削。
 
 详细的仓库格式规范见 [`docs/repo-format.md`](docs/repo-format.md)。
@@ -174,6 +205,30 @@ python tools\webdav_mock.py --root %TEMP%\vaultmock --port 8099 --user demo --pa
 tools\dist\VaultUnpacker.exe --selftest
 ```
 
+### 一条命令跑完整的 v3 端到端验证
+
+`tools/e2e-v3-test.py` 自己起本地假 WebDAV，然后把整条链路跑一遍：
+造测试目录 → 打包上传 → 查仓库落盘结构 → 解包还原 → **逐字节比对** → 中断后续传。
+不需要 NAS，也不会碰真实仓库。
+
+```bat
+:: 先编译命令行工具（需要 Playnite 目录提供 SDK DLL）
+dotnet build -c Release -p:PlayniteDir="D:\Game\Playnite" tools\VaultPack\VaultPack.csproj
+
+:: 常规用例：约 223 MB，含一个 200 MB 的跨块文件
+python tools\e2e-v3-test.py
+
+:: 加上一个 1.93 GB 的单文件 —— 复现「大游戏传不上去」当时的规模
+python tools\e2e-v3-test.py --big
+
+:: 顺带验证 deflate 分支
+python tools\e2e-v3-test.py --compress
+```
+
+它会断言这几件容易写错的事：区块文件名确实是 40 位 sha1、仓库路径里没有非 ASCII 字符、
+片段首尾相接且合计等于文件大小、**至少有一个文件真的跨了多个区块**、
+空文件被建了出来、中文文件名能还原、临时区块文件下完即删、以及中断后靠日志跳过已完成区块。
+
 ---
 
 ## 目录结构
@@ -191,7 +246,8 @@ playnite-vault/
 ├── tools/
 │   ├── VaultPack/              命令行工具（C#，直接编译插件源码，永远走最新生产代码）
 │   ├── vault_unpacker/         独立解包器（Python 包）
-│   │   ├── core.py             来源抽象 + 清单解析 + 分片解包 + 自检
+│   ├── core.py             来源抽象 + 清单解析 + v1/v2/v3 三种布局解包 + 自检
+│   │                       （v3 = 内容寻址区块：并发下载、按偏移随机写、下完即删、断点日志）
 │   │   ├── playnite.py         定位插件数据目录、读写 local-index.json
 │   │   ├── config.py           外部配置（不进代码）
 │   │   ├── cli.py / gui.py     两个入口
@@ -202,6 +258,7 @@ playnite-vault/
 │   ├── make-app-icon.py        生成图标（ico + 内嵌 png）
 │   ├── make-test-fixture.py    造离线测试归档
 │   ├── webdav_mock.py          本地假 WebDAV（端到端验证用）
+│   ├── e2e-v3-test.py          v3 端到端验证（含跨块与续传）
 │   ├── speedtest.py            吞吐排查
 │   └── config.example.json     配置模板（复制成 config.json 用）
 └── docs/repo-format.md         仓库格式规范
