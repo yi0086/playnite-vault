@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """生成 VaultUnpacker 的图标。
 
-需要 Pillow（本机只有系统 Python 带 PIL）：
+需要 Pillow（用哪个 Python 跑就用哪个装，例如）：
 
-    D:/Software/Dev/Env/Python/python.exe tools/make-app-icon.py
+    <你的 python> -m pip install pillow
+    <你的 python> tools/make-app-icon.py
 
 产出三样东西：
 

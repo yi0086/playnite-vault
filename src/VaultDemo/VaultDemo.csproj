@@ -41,6 +41,9 @@
     <Reference Include="WindowsBase" />
     <Reference Include="System.Xaml" />
     <Reference Include="System.Net.Http" />
+    <!-- 插件自更新要解压 release 里的 zip（VaultUpdater.Stage） -->
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
   </ItemGroup>
 
   <ItemGroup>

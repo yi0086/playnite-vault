@@ -35,6 +35,7 @@ namespace VaultDemo.Services
         private readonly IPlayniteAPI api;
         private readonly string dataPath;
         private VaultSettings settings;
+        private VaultRuntimeState state;
 
         public VaultService(IPlayniteAPI api, string dataPath)
         {
@@ -42,6 +43,7 @@ namespace VaultDemo.Services
             this.dataPath = dataPath;
             Directory.CreateDirectory(dataPath);
             LoadSettings();
+            state = VaultStateStore.Load(dataPath);
         }
 
         public string DataPath
@@ -52,6 +54,22 @@ namespace VaultDemo.Services
         public VaultSettings Settings
         {
             get { return settings; }
+        }
+
+        /// <summary>
+        /// 运行时状态（已应用的索引指纹、上次检查时间、镜像记录…）。
+        /// 刻意与 settings 分开存：设置页是「克隆 → 改 → 整份落盘」的模型，
+        /// 后台线程往里写状态会被用户点一次「保存」覆盖掉。
+        /// </summary>
+        public VaultRuntimeState State
+        {
+            get { return state; }
+        }
+
+        /// <summary>把 <see cref="State"/> 落到 state.json。</summary>
+        public void SaveState()
+        {
+            VaultStateStore.Save(dataPath, state);
         }
 
         private string SettingsFile { get { return Path.Combine(dataPath, "settings.json"); } }

@@ -170,6 +170,75 @@ namespace VaultDemo.UI
             }
         }
 
+        // ---------- 自动更新 ----------
+
+        /// <summary>启动时自动检查插件更新（GitHub / Gitee）。</summary>
+        public bool AutoUpdateEnabled
+        {
+            get { return editing.AutoUpdateEnabled; }
+            set { editing.AutoUpdateEnabled = value; OnPropertyChanged("AutoUpdateEnabled"); }
+        }
+
+        /// <summary>更新前先问一声。关掉 = 下载完直接重启应用。</summary>
+        public bool AutoUpdatePrompt
+        {
+            get { return editing.AutoUpdatePrompt; }
+            set { editing.AutoUpdatePrompt = value; OnPropertyChanged("AutoUpdatePrompt"); }
+        }
+
+        /// <summary>0=自动，1=仅 GitHub，2=仅 Gitee。ComboBox 用下标绑。</summary>
+        public int UpdateMirrorIndex
+        {
+            get
+            {
+                if (string.Equals(editing.UpdateMirror, "github", StringComparison.OrdinalIgnoreCase)) return 1;
+                if (string.Equals(editing.UpdateMirror, "gitee", StringComparison.OrdinalIgnoreCase)) return 2;
+                return 0;
+            }
+            set
+            {
+                editing.UpdateMirror = value == 1 ? "github" : (value == 2 ? "gitee" : "auto");
+                OnPropertyChanged("UpdateMirrorIndex");
+            }
+        }
+
+        /// <summary>被「跳过」的版本号，只读展示。</summary>
+        public string SkippedVersion
+        {
+            get { return editing.SkippedVersion ?? string.Empty; }
+            set { editing.SkippedVersion = value ?? string.Empty; OnPropertyChanged("SkippedVersion"); }
+        }
+
+        // ---------- 自动刷新远端库 ----------
+
+        /// <summary>定时把远端索引同步进 Playnite 库。</summary>
+        public bool AutoRefreshEnabled
+        {
+            get { return editing.AutoRefreshEnabled; }
+            set { editing.AutoRefreshEnabled = value; OnPropertyChanged("AutoRefreshEnabled"); }
+        }
+
+        /// <summary>自动刷新间隔（分钟），5 ~ 1440。</summary>
+        public int AutoRefreshMinutes
+        {
+            get { return editing.AutoRefreshMinutes; }
+            set
+            {
+                editing.AutoRefreshMinutes = LibraryAutoRefresh.Clamp(value);
+                OnPropertyChanged("AutoRefreshMinutes");
+            }
+        }
+
+        /// <summary>启动后先刷新一次。</summary>
+        public bool AutoRefreshOnStartup
+        {
+            get { return editing.AutoRefreshOnStartup; }
+            set { editing.AutoRefreshOnStartup = value; OnPropertyChanged("AutoRefreshOnStartup"); }
+        }
+
+        /// <summary>设置落盘之后触发，插件据此重新定时 / 重新校验。</summary>
+        public event Action SettingsSaved;
+
         public void BeginEdit()
         {
             editing = service.Settings.Clone();
@@ -180,6 +249,12 @@ namespace VaultDemo.UI
         public void EndEdit()
         {
             service.SaveSettings(editing);
+
+            var handler = SettingsSaved;
+            if (handler != null)
+            {
+                handler();
+            }
         }
 
         public void CancelEdit()
@@ -235,6 +310,14 @@ namespace VaultDemo.UI
                 errors.Add("并发路数需要在 1~16 之间（HTTPS 建议 6）。");
             }
 
+            if (editing.AutoRefreshEnabled
+                && (editing.AutoRefreshMinutes < LibraryAutoRefresh.MinMinutes
+                    || editing.AutoRefreshMinutes > LibraryAutoRefresh.MaxMinutes))
+            {
+                errors.Add("自动刷新间隔需要在 " + LibraryAutoRefresh.MinMinutes + "~"
+                           + LibraryAutoRefresh.MaxMinutes + " 分钟之间。");
+            }
+
             return errors.Count == 0;
         }
 
@@ -255,6 +338,13 @@ namespace VaultDemo.UI
             OnPropertyChanged("MaxRetries");
             OnPropertyChanged("ResumePartial");
             OnPropertyChanged("Concurrency");
+            OnPropertyChanged("AutoUpdateEnabled");
+            OnPropertyChanged("AutoUpdatePrompt");
+            OnPropertyChanged("UpdateMirrorIndex");
+            OnPropertyChanged("SkippedVersion");
+            OnPropertyChanged("AutoRefreshEnabled");
+            OnPropertyChanged("AutoRefreshMinutes");
+            OnPropertyChanged("AutoRefreshOnStartup");
         }
     }
 
@@ -268,12 +358,198 @@ namespace VaultDemo.UI
         private PasswordBox passBox;
         private TextBlock statusText;
         private Button testButton;
+        private TextBlock updateStatusText;
+        private TextBlock refreshStatusText;
+        private TextBlock skippedText;
 
         public VaultSettingsView(VaultSettingsViewModel vm, VaultService service)
         {
             this.vm = vm;
             this.service = service;
             Build();
+
+            // 状态区在打开设置页时才读一次（没必要挂计时器）
+            Loaded += (s, e) => RefreshStatusLines();
+        }
+
+        /// <summary>把两个状态区重新读一遍。</summary>
+        private void RefreshStatusLines()
+        {
+            var plugin = VaultPlugin.Instance;
+
+            if (updateStatusText != null && plugin != null)
+            {
+                updateStatusText.Text = plugin.DescribeUpdateStatus();
+            }
+
+            if (refreshStatusText != null && plugin != null)
+            {
+                refreshStatusText.Text = plugin.DescribeAutoRefreshStatus();
+            }
+
+            if (skippedText != null)
+            {
+                var version = service.Settings.SkippedVersion;
+                skippedText.Text = string.IsNullOrWhiteSpace(version)
+                    ? "当前没有跳过任何版本。"
+                    : "已跳过：" + version + "（改成新版本后会自动重新提示）";
+            }
+        }
+
+        // ---------- 自动更新 ----------
+
+        private void BuildUpdateSection(StackPanel panel)
+        {
+            panel.Children.Add(Section("插件自动更新"));
+
+            var enableBox = new CheckBox
+            {
+                Content = "启动 Playnite 时检查 GitHub / Gitee 上的新版本",
+                Margin = new Thickness(0, 0, 0, 4)
+            };
+            enableBox.SetBinding(CheckBox.IsCheckedProperty, Bind("AutoUpdateEnabled"));
+            panel.Children.Add(enableBox);
+
+            var promptBox = new CheckBox
+            {
+                Content = "更新前先询问（不勾选＝下载完自动替换并重启 Playnite）",
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+            promptBox.SetBinding(CheckBox.IsCheckedProperty, Bind("AutoUpdatePrompt"));
+            panel.Children.Add(promptBox);
+
+            var mirrorBox = new ComboBox
+            {
+                Width = 220,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                ItemsSource = new[]
+                {
+                    "自动（探测两个源，谁快用谁）",
+                    "只用 GitHub",
+                    "只用 Gitee"
+                }
+            };
+            mirrorBox.SetBinding(ComboBox.SelectedIndexProperty, Bind("UpdateMirrorIndex"));
+            panel.Children.Add(Field("下载镜像", mirrorBox));
+            panel.Children.Add(new TextBlock
+            {
+                Text = "「自动」会并发探测两个源，响应快的当主源；下载过程中实测速度低于 "
+                     + VaultUpdater.SpeedFloorKb + " KB/s 会换另一个源重来"
+                     + "（如果两个源都低于这条线，最后会拿主源不限速再跑一次，不会因为慢就装不上）。",
+                TextWrapping = TextWrapping.Wrap,
+                Opacity = 0.6,
+                FontSize = 11,
+                Margin = new Thickness(0, -6, 0, 10)
+            });
+
+            skippedText = new TextBlock
+            {
+                TextWrapping = TextWrapping.Wrap,
+                Opacity = 0.7,
+                FontSize = 11,
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+            panel.Children.Add(skippedText);
+
+            var row = new StackPanel { Orientation = Orientation.Horizontal };
+            var checkButton = new Button
+            {
+                Content = "立即检查更新",
+                Padding = new Thickness(14, 4, 14, 4),
+                Margin = new Thickness(0, 0, 8, 0)
+            };
+            checkButton.Click += (s, e) =>
+            {
+                var plugin = VaultPlugin.Instance;
+                if (plugin != null)
+                {
+                    plugin.RunUpdateCheck(true);
+                }
+                RefreshStatusLines();
+            };
+            row.Children.Add(checkButton);
+
+            var clearButton = new Button
+            {
+                Content = "清除「跳过版本」",
+                Padding = new Thickness(14, 4, 14, 4)
+            };
+            clearButton.Click += (s, e) =>
+            {
+                vm.SkippedVersion = string.Empty;
+                var plugin = VaultPlugin.Instance;
+                if (plugin != null)
+                {
+                    plugin.SaveSettingsImmediately(vm);
+                }
+                RefreshStatusLines();
+            };
+            row.Children.Add(clearButton);
+            panel.Children.Add(row);
+
+            updateStatusText = new TextBlock
+            {
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 8, 0, 0),
+                Opacity = 0.75,
+                FontSize = 11
+            };
+            panel.Children.Add(updateStatusText);
+        }
+
+        // ---------- 自动刷新 ----------
+
+        private void BuildAutoRefreshSection(StackPanel panel)
+        {
+            panel.Children.Add(Section("自动刷新远端库"));
+
+            var enableBox = new CheckBox
+            {
+                Content = "按下面的间隔自动把 NAS 上的索引同步进 Playnite 库",
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            enableBox.SetBinding(CheckBox.IsCheckedProperty, Bind("AutoRefreshEnabled"));
+            panel.Children.Add(enableBox);
+
+            panel.Children.Add(NumberField("刷新间隔（分钟）", "AutoRefreshMinutes",
+                "最少 " + LibraryAutoRefresh.MinMinutes + " 分钟。每次只拉一次 index.json（几十 KB），"
+                + "**索引没有变化时完全不碰本地库**，所以放着也不会拖慢 Playnite。\n"
+                + "正在运行游戏时会自动暂停；NAS 连续不可达时间隔会逐级放宽（最多 8 倍），"
+                + "不会一直白白去敲。"));
+
+            var startupBox = new CheckBox
+            {
+                Content = "启动 Playnite 后先刷新一次",
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+            startupBox.SetBinding(CheckBox.IsCheckedProperty, Bind("AutoRefreshOnStartup"));
+            panel.Children.Add(startupBox);
+
+            var button = new Button
+            {
+                Content = "立即刷新远端库",
+                Padding = new Thickness(14, 4, 14, 4),
+                HorizontalAlignment = HorizontalAlignment.Left
+            };
+            button.Click += (s, e) =>
+            {
+                var plugin = VaultPlugin.Instance;
+                if (plugin != null)
+                {
+                    plugin.RefreshLibraryEntries(true);
+                }
+                RefreshStatusLines();
+            };
+            panel.Children.Add(button);
+
+            refreshStatusText = new TextBlock
+            {
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 8, 0, 0),
+                Opacity = 0.75,
+                FontSize = 11
+            };
+            panel.Children.Add(refreshStatusText);
         }
 
         private void Build()
@@ -383,6 +659,9 @@ namespace VaultDemo.UI
             panel.Children.Add(NumberField("失败重试次数（每个区块）", "MaxRetries",
                 "只对可重试的错误生效：超时 / 连接中断 / 429 / 5xx。\n"
                 + "4xx（比如 401 密码错、403 无权限）不重试 —— 重试也不会变对，只会白等。"));
+
+            BuildUpdateSection(panel);
+            BuildAutoRefreshSection(panel);
 
             panel.Children.Add(Section("仓库管理口令"));
             var adminHint = new TextBlock

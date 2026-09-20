@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using Playnite.SDK;
 using Playnite.SDK.Events;
@@ -28,6 +29,14 @@ namespace VaultDemo
 
         private readonly VaultService service;
         private readonly VaultSettingsViewModel settingsVm;
+        private readonly VaultUpdater updater;
+        private readonly LibraryAutoRefresh autoRefresh;
+
+        /// <summary>正在进行的传输数（安装 / 归档 / 修复）。自动刷新要避开它们。</summary>
+        private int transferCount;
+
+        /// <summary>更新检查正在跑（避免启动检查和手动检查撞车）。</summary>
+        private int updateCheckBusy;
 
         public override Guid Id { get; } = PluginGuid;
 
@@ -39,6 +48,11 @@ namespace VaultDemo
         public VaultService Service
         {
             get { return service; }
+        }
+
+        public VaultUpdater Updater
+        {
+            get { return updater; }
         }
 
         public VaultPlugin(IPlayniteAPI api) : base(api)
@@ -53,18 +67,112 @@ namespace VaultDemo
             service = new VaultService(api, GetPluginUserDataPath());
             VaultLog.Init(service.DataPath);
             settingsVm = new VaultSettingsViewModel(service);
+            updater = new VaultUpdater(service.DataPath, service.Settings);
 
-            VaultLog.Info("VaultPlugin 已构造，数据目录=" + service.DataPath);
+            // 设置落盘后要让后台的定时器跟着变（改间隔 / 开关自动刷新）
+            settingsVm.SettingsSaved += OnSettingsSaved;
+
+            autoRefresh = new LibraryAutoRefresh(service, ApplyRemoteIndex, DispatchToUi);
+            autoRefresh.Completed += OnAutoRefreshCompleted;
+
+            VaultLog.Info("VaultPlugin 已构造，数据目录=" + service.DataPath
+                + "，版本=" + VaultUpdater.CurrentVersion());
+        }
+
+        private void OnSettingsSaved()
+        {
+            try
+            {
+                autoRefresh.Rearm();
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Error("重设定时器失败", ex);
+            }
         }
 
         public override void OnApplicationStarted(OnApplicationStartedEventArgs args)
         {
             VaultLog.Info("OnApplicationStarted，WebDAV=" + service.Settings.WebDavUrl);
+
+            StartAutoRefresh();
+            ScheduleUpdateCheck();
         }
 
         public override void OnApplicationStopped(OnApplicationStoppedEventArgs args)
         {
             VaultLog.Info("OnApplicationStopped");
+            try
+            {
+                autoRefresh.Dispose();
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Warn("关闭自动刷新失败：" + ex.Message);
+            }
+        }
+
+        // ---------- 运行游戏时暂停自动刷新 ----------
+
+        public override void OnGameStarted(OnGameStartedEventArgs args)
+        {
+            VaultLog.Info("游戏已启动" + (args == null || args.Game == null ? "" : "：" + args.Game.Name)
+                          + "，自动刷新暂停");
+            autoRefresh.SetGameRunning(true);
+        }
+
+        public override void OnGameStopped(OnGameStoppedEventArgs args)
+        {
+            VaultLog.Info("游戏已结束，自动刷新恢复");
+            autoRefresh.SetGameRunning(false);
+        }
+
+        // ---------- 传输占用 ----------
+
+        /// <summary>
+        /// 传输期间禁止自动刷新去抢 NAS 带宽。
+        /// 用法：<c>using (BeginTransfer("归档")) { ... }</c>
+        /// </summary>
+        public IDisposable BeginTransfer(string what)
+        {
+            System.Threading.Interlocked.Increment(ref transferCount);
+            autoRefresh.SetTransferBusy(true);
+            VaultLog.Info("开始传输（" + what + "），自动刷新暂时让路");
+            return new TransferScope(this, what);
+        }
+
+        public bool IsTransfering
+        {
+            get { return System.Threading.Volatile.Read(ref transferCount) > 0; }
+        }
+
+        private class TransferScope : IDisposable
+        {
+            private readonly VaultPlugin owner;
+            private readonly string what;
+            private bool done;
+
+            public TransferScope(VaultPlugin owner, string what)
+            {
+                this.owner = owner;
+                this.what = what;
+            }
+
+            public void Dispose()
+            {
+                if (done)
+                {
+                    return;
+                }
+                done = true;
+
+                var left = System.Threading.Interlocked.Decrement(ref owner.transferCount);
+                owner.autoRefresh.SetTransferBusy(left > 0);
+                if (left <= 0)
+                {
+                    VaultLog.Info("传输结束（" + what + "）");
+                }
+            }
         }
 
         // ---------- 库导入 ----------
@@ -493,7 +601,7 @@ namespace VaultDemo
             {
                 MenuSection = "Vault",
                 Description = "从 NAS 刷新库条目（立即生效）",
-                Action = a => RefreshLibraryEntries()
+                Action = a => RefreshLibraryEntries(true)
             });
 
             items.Add(new GameMenuItem
@@ -708,7 +816,7 @@ namespace VaultDemo
         }
 
         /// <summary>
-        /// 立即把远端索引同步成一等公民的库条目，不依赖 Playnite 的「更新游戏库」。
+        /// 把远端索引同步成一等公民的库条目，不依赖 Playnite 的「更新游戏库」。
         ///
         /// 背景：Playnite 的库更新由设置项 CheckForLibraryUpdates 控制，默认是「从不」，
         /// 于是 GetGames 根本不会被调用，新上传的应用永远不出现在库里
@@ -716,11 +824,17 @@ namespace VaultDemo
         /// 这里直接走 IGameDatabase.ImportGame，一次性把差异补齐：
         /// 远端已删除的条目移除、缺失的新增、已有的更新名称与安装状态。
         /// </summary>
-        private void RefreshLibraryEntries()
+        /// <param name="interactive">
+        /// true = 用户点的（有弹窗）；false = 后台自动刷新（只写日志，不打断用户）。
+        /// </param>
+        public void RefreshLibraryEntries(bool interactive)
         {
             if (!service.Settings.IsConfigured)
             {
-                PlayniteApi.Dialogs.ShowMessage("还没有配置 WebDAV 地址。\n请到 设置 → 扩展 → Vault Demo 里填写。", "Vault Demo");
+                if (interactive)
+                {
+                    PlayniteApi.Dialogs.ShowMessage("还没有配置 WebDAV 地址。\n请到 设置 → 扩展 → Vault Demo 里填写。", "Vault Demo");
+                }
                 return;
             }
 
@@ -732,78 +846,161 @@ namespace VaultDemo
 
                 if (index == null || index.Apps == null || index.Apps.Count == 0)
                 {
-                    PlayniteApi.Dialogs.ShowErrorMessage(
-                        "没有从仓库拿到任何条目。\n\n" + (error ?? "远端索引为空"), "Vault Demo");
+                    var message = "没有从仓库拿到任何条目。\n\n" + (error ?? "远端索引为空");
+                    if (interactive)
+                    {
+                        PlayniteApi.Dialogs.ShowErrorMessage(message, "Vault Demo");
+                    }
+                    else
+                    {
+                        VaultLog.Warn(message);
+                    }
                     return;
                 }
 
-                var remoteIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var app in index.Apps)
-                {
-                    remoteIds.Add(app.Id);
-                }
+                var outcome = WriteLibraryFromIndex(index);
 
-                var local = service.GetLocalIndex();
-                var added = 0;
-                var updated = 0;
-                var removed = 0;
-
-                PlayniteApi.Database.BeginBufferUpdate();
-                try
-                {
-                    // 1) 远端已经没有的旧条目（含早期 mock 服务留下的 demo-game 等）就地清掉
-                    var managed = PlayniteApi.Database.Games.Where(g => g.PluginId == Id).ToList();
-                    foreach (var game in managed)
-                    {
-                        if (string.IsNullOrWhiteSpace(game.GameId) || !remoteIds.Contains(game.GameId))
-                        {
-                            PlayniteApi.Database.Games.Remove(game.Id);
-                            removed++;
-                            VaultLog.Info("刷新：移除已下架条目 " + game.Name + "（" + game.GameId + "）");
-                        }
-                    }
-
-                    // 2) 远端条目逐个对齐（重新取一次，前面的删除已经生效）
-                    var current = PlayniteApi.Database.Games.Where(g => g.PluginId == Id).ToList();
-                    foreach (var app in index.Apps)
-                    {
-                        var match = current.FirstOrDefault(g =>
-                            string.Equals(g.GameId, app.Id, StringComparison.OrdinalIgnoreCase));
-
-                        if (match == null)
-                        {
-                            PlayniteApi.Database.ImportGame(BuildGameMetadata(app, local), this);
-                            added++;
-                            VaultLog.Info("刷新：新增条目 " + app.Name + "（" + app.Id + "）");
-                        }
-                        else
-                        {
-                            UpdateEntry(match, app, local);
-                            PlayniteApi.Database.Games.Update(match);
-                            updated++;
-                        }
-                    }
-                }
-                finally
-                {
-                    PlayniteApi.Database.EndBufferUpdate();
-                }
+                // 手动刷新也要更新指纹：否则紧接着的一次自动刷新会把它当成「有新变化」再写一遍
+                RememberAppliedIndex(index, source);
 
                 VaultLog.Info(string.Format("刷新完成：来源={0}，新增 {1}，更新 {2}，移除 {3}",
-                    source, added, updated, removed));
+                    source, outcome.Added, outcome.Updated, outcome.Removed));
 
-                PlayniteApi.Dialogs.ShowMessage(
-                    string.Format(
-                        "库条目已刷新。\n\n来源：{0}\n远端条目：{1}\n\n新增：{2}\n更新：{3}\n移除：{4}\n\n" +
-                        "如果左侧列表里还看不到，请检查过滤器面板是否只勾选了某个库来源（把「库」过滤器全部取消勾选即可）。",
-                        source, index.Apps.Count, added, updated, removed),
-                    "Vault Demo");
+                if (interactive)
+                {
+                    PlayniteApi.Dialogs.ShowMessage(
+                        string.Format(
+                            "库条目已刷新。\n\n来源：{0}\n远端条目：{1}\n\n新增：{2}\n更新：{3}\n移除：{4}\n\n" +
+                            "如果左侧列表里还看不到，请检查过滤器面板是否只勾选了某个库来源（把「库」过滤器全部取消勾选即可）。",
+                            DescribeSource(source), index.Apps.Count,
+                            outcome.Added, outcome.Updated, outcome.Removed),
+                        "Vault Demo");
+                }
             }
             catch (Exception ex)
             {
                 VaultLog.Error("刷新库条目失败", ex);
-                PlayniteApi.Dialogs.ShowErrorMessage("刷新失败：" + ex.Message, "Vault Demo");
+                if (interactive)
+                {
+                    PlayniteApi.Dialogs.ShowErrorMessage("刷新失败：" + ex.Message, "Vault Demo");
+                }
             }
+        }
+
+        /// <summary>
+        /// 真正动数据库的那一段。**必须在 UI 线程上调用** ——
+        /// Playnite 的库写入会驱动界面重排，从后台线程直接写会偶发 UI 异常。
+        /// </summary>
+        private AutoRefreshOutcome WriteLibraryFromIndex(RepositoryIndex index)
+        {
+            var outcome = new AutoRefreshOutcome();
+
+            var remoteIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var app in index.Apps)
+            {
+                remoteIds.Add(app.Id);
+            }
+
+            var local = service.GetLocalIndex();
+
+            PlayniteApi.Database.BeginBufferUpdate();
+            try
+            {
+                // 1) 远端已经没有的旧条目（含早期 mock 服务留下的 demo-game 等）就地清掉
+                var managed = PlayniteApi.Database.Games.Where(g => g.PluginId == Id).ToList();
+                foreach (var game in managed)
+                {
+                    if (string.IsNullOrWhiteSpace(game.GameId) || !remoteIds.Contains(game.GameId))
+                    {
+                        PlayniteApi.Database.Games.Remove(game.Id);
+                        outcome.Removed++;
+                        VaultLog.Info("刷新：移除已下架条目 " + game.Name + "（" + game.GameId + "）");
+                    }
+                }
+
+                // 2) 远端条目逐个对齐（重新取一次，前面的删除已经生效）
+                var current = PlayniteApi.Database.Games.Where(g => g.PluginId == Id).ToList();
+                foreach (var app in index.Apps)
+                {
+                    var match = current.FirstOrDefault(g =>
+                        string.Equals(g.GameId, app.Id, StringComparison.OrdinalIgnoreCase));
+
+                    if (match == null)
+                    {
+                        PlayniteApi.Database.ImportGame(BuildGameMetadata(app, local), this);
+                        outcome.Added++;
+                        VaultLog.Info("刷新：新增条目 " + app.Name + "（" + app.Id + "）");
+                    }
+                    else
+                    {
+                        UpdateEntry(match, app, local);
+                        PlayniteApi.Database.Games.Update(match);
+                        outcome.Updated++;
+                    }
+                }
+            }
+            finally
+            {
+                PlayniteApi.Database.EndBufferUpdate();
+            }
+
+            outcome.Ran = true;
+            outcome.Changed = true;
+            outcome.WroteLibrary = true;
+            return outcome;
+        }
+
+        /// <summary>
+        /// 记下「这份索引已经应用过了」。
+        /// 只有远端来源才记 —— 缓存索引的指纹和已应用的不同，记下来会把判据带偏。
+        /// </summary>
+        private void RememberAppliedIndex(RepositoryIndex index, string source)
+        {
+            if (!string.Equals(source, "remote", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            service.State.AppliedIndexHash = LibraryAutoRefresh.Fingerprint(index);
+            service.State.LastIndexCheckUtc = DateTime.UtcNow;
+            service.State.LastLibraryWriteUtc = DateTime.UtcNow;
+            service.State.ConsecutiveRefreshFailures = 0;
+            service.SaveState();
+        }
+
+        /// <summary>LibraryAutoRefresh 的写库回调 —— 它已经判断过「该不该刷」，这里只管写。</summary>
+        private AutoRefreshOutcome ApplyRemoteIndex(RepositoryIndex index, string source)
+        {
+            var outcome = WriteLibraryFromIndex(index);
+            outcome.Source = source;
+            outcome.Total = index.Apps == null ? 0 : index.Apps.Count;
+            return outcome;
+        }
+
+        /// <summary>索引来源 → 给人看的说法。</summary>
+        private static string DescribeSource(string source)
+        {
+            if (string.Equals(source, "remote", StringComparison.OrdinalIgnoreCase))
+            {
+                return "NAS 远端索引";
+            }
+            if (string.Equals(source, "cache", StringComparison.OrdinalIgnoreCase))
+            {
+                return "本地缓存索引（NAS 不可达）";
+            }
+            return "本地安装记录（NAS 不可达）";
+        }
+
+        /// <summary>把动作丢回 UI 线程。数据库写入必须在 UI 线程上做。</summary>
+        private static void DispatchToUi(Action action)
+        {
+            var app = System.Windows.Application.Current;
+            if (app == null || app.Dispatcher.CheckAccess())
+            {
+                action();
+                return;
+            }
+            app.Dispatcher.Invoke(action);
         }
 
         /// <summary>把远端条目的可变字段同步到已有库条目的身上（不动元数据，避免覆盖用户手改内容）。</summary>
@@ -909,6 +1106,8 @@ namespace VaultDemo
 
             PlayniteApi.Dialogs.ActivateGlobalProgress(progress =>
             {
+                using (BeginTransfer("归档"))
+                {
                 foreach (var game in targets)
                 {
                     if (progress.CancelToken.IsCancellationRequested)
@@ -952,6 +1151,7 @@ namespace VaultDemo
                         return;
                     }
                 }
+                }
             },
             new GlobalProgressOptions("归档到 NAS")
             {
@@ -990,6 +1190,8 @@ namespace VaultDemo
             {
                 var options = service.BuildSyncOptions();
 
+                using (BeginTransfer("修复"))
+                {
                 foreach (var game in targets)
                 {
                     if (progress.CancelToken.IsCancellationRequested)
@@ -1021,6 +1223,7 @@ namespace VaultDemo
                         PlayniteApi.Dialogs.ShowErrorMessage("修复「" + game.Name + "」失败：" + ex.Message, "Vault Demo");
                         return;
                     }
+                }
                 }
             },
             new GlobalProgressOptions("修复安装")
@@ -1065,6 +1268,546 @@ namespace VaultDemo
             }
 
             return "app.exe";
+        }
+
+        // ---------- 自动刷新 ----------
+
+        private System.Threading.Timer startupRefreshTimer;
+
+        private void StartAutoRefresh()
+        {
+            autoRefresh.Rearm();
+
+            if (!service.Settings.AutoRefreshEnabled || !service.Settings.AutoRefreshOnStartup)
+            {
+                return;
+            }
+
+            // 延迟 25 秒：启动瞬间 Playnite 自己还在导入库/读缓存，挤在一起只会互相拖慢
+            startupRefreshTimer = new System.Threading.Timer(_ =>
+            {
+                var timer = startupRefreshTimer;
+                startupRefreshTimer = null;
+                if (timer != null)
+                {
+                    try { timer.Dispose(); } catch { }
+                }
+
+                VaultLog.Info("自动刷新：启动后的首次检查");
+                autoRefresh.TriggerNow(false);
+            }, null, 25000, System.Threading.Timeout.Infinite);
+        }
+
+        /// <summary>自动刷新跑完后的通知。只在「真的改了库」或「出错了」时提示，无变化时闭嘴。</summary>
+        private void OnAutoRefreshCompleted(AutoRefreshOutcome outcome, bool automatic)
+        {
+            if (outcome == null || !automatic)
+            {
+                return;
+            }
+
+            try
+            {
+                if (outcome.WroteLibrary)
+                {
+                    Notify("vault-lib-refresh",
+                        string.Format("Vault：远端库有更新，已同步（新增 {0}、更新 {1}、移除 {2}）",
+                            outcome.Added, outcome.Updated, outcome.Removed),
+                        NotificationType.Info);
+                }
+                else if (outcome.Error != null)
+                {
+                    Notify("vault-lib-refresh",
+                        "Vault：自动刷新远端库失败 —— " + outcome.Error, NotificationType.Error);
+                }
+                // 索引无变化 / 游戏运行中 / NAS 不可达 → 不打扰用户
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Warn("发送通知失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>设置页上的「立即刷新远端库」走这里。</summary>
+        public void TriggerAutoRefreshNow()
+        {
+            autoRefresh.TriggerNow(false);
+        }
+
+        // ---------- 插件自动更新 ----------
+
+        private System.Threading.Timer updateCheckTimer;
+
+        private void ScheduleUpdateCheck()
+        {
+            if (!service.Settings.AutoUpdateEnabled)
+            {
+                VaultLog.Info("自动更新：未启用");
+                return;
+            }
+
+            // 延迟 12 秒再联网：给 Playnite 的启动让路，也避免界面还没出来就弹窗
+            updateCheckTimer = new System.Threading.Timer(_ =>
+            {
+                var timer = updateCheckTimer;
+                updateCheckTimer = null;
+                if (timer != null)
+                {
+                    try { timer.Dispose(); } catch { }
+                }
+
+                RunUpdateCheck(false);
+            }, null, 12000, System.Threading.Timeout.Infinite);
+        }
+
+        /// <summary>
+        /// 检查并（按设置）自动更新到最新版。
+        /// <paramref name="interactive"/> = true 时所有结果都用弹窗回答（用户手动点的）。
+        /// </summary>
+        public void RunUpdateCheck(bool interactive)
+        {
+            if (System.Threading.Interlocked.CompareExchange(ref updateCheckBusy, 1, 0) != 0)
+            {
+                if (interactive)
+                {
+                    PlayniteApi.Dialogs.ShowMessage("更新检查正在进行中，请稍候。", "Vault 更新");
+                }
+                return;
+            }
+
+            try
+            {
+                if (autoRefresh.IsGameRunning)
+                {
+                    VaultLog.Info("正在运行游戏，本次更新检查跳过");
+                    if (interactive)
+                    {
+                        PlayniteApi.Dialogs.ShowMessage(
+                            "正在运行游戏，暂不检查更新。\n游戏结束后下次启动会自动再检查。", "Vault 更新");
+                    }
+                    return;
+                }
+
+                var check = updater.Check();
+
+                service.State.LastUpdateCheckUtc = DateTime.UtcNow;
+                if (!string.IsNullOrEmpty(check.LatestVersion))
+                {
+                    service.State.LastSeenVersion = check.LatestVersion;
+                }
+                if (check.Candidates.Count > 0)
+                {
+                    service.State.LastMirror = check.Candidates[0].Mirror;
+                    service.State.LastMirrorLatencyMs = check.Candidates[0].LatencyMs;
+                }
+                service.SaveState();
+
+                if (!check.HasUpdate)
+                {
+                    ReportNoUpdate(check, interactive);
+                    return;
+                }
+
+                var release = check.Best;
+
+                // 先问再做（只在开了「更新前先询问」时）
+                if (service.Settings.AutoUpdatePrompt && !ConfirmUpdate(release))
+                {
+                    service.Settings.SkippedVersion = release.Version;
+                    service.SaveSettings(service.Settings);
+                    VaultLog.Info("用户选择跳过版本 " + release.Version);
+                    PlayniteApi.Dialogs.ShowMessage(
+                        "已跳过 " + release.Version + "。\n\n"
+                        + "之后想装的话，到 设置 → 扩展 → Vault Demo 点「清除『跳过版本』」即可。",
+                        "Vault 更新");
+                    return;
+                }
+
+                var staged = DownloadUpdate(check);
+                if (staged == null)
+                {
+                    return;   // 失败或用户取消，原因已经报过了
+                }
+
+                ApplyAndRestart(staged, interactive);
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Error("更新检查失败", ex);
+                if (interactive)
+                {
+                    PlayniteApi.Dialogs.ShowErrorMessage("检查更新失败：" + ex.Message, "Vault 更新");
+                }
+            }
+            finally
+            {
+                System.Threading.Interlocked.Exchange(ref updateCheckBusy, 0);
+            }
+        }
+
+        private void ReportNoUpdate(UpdateCheckResult check, bool interactive)
+        {
+            if (check.SkippedByUser)
+            {
+                VaultLog.Info("更新检查：" + check.Error);
+                if (interactive)
+                {
+                    PlayniteApi.Dialogs.ShowMessage(
+                        "远端最新版是 " + check.LatestVersion + "，已被你设为「跳过」。\n\n"
+                        + "想安装的话，到 设置 → 扩展 → Vault Demo 点「清除『跳过版本』」。",
+                        "Vault 更新");
+                }
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(check.Error))
+            {
+                VaultLog.Warn("更新检查未拿到结果：" + check.Error);
+                if (interactive)
+                {
+                    PlayniteApi.Dialogs.ShowErrorMessage(
+                        "没能连上更新源。\n\n"
+                        + string.Join("\n", check.Attempts.ToArray())
+                        + "\n\n系统代理：" + HttpFetch.DescribeSystemProxy()
+                        + "\n\n提示：到 设置 → 扩展 → Vault Demo 把「下载镜像」显式设成 GitHub 或 Gitee 再试。",
+                        "Vault 更新");
+                }
+                return;
+            }
+
+            VaultLog.Info("更新检查：已是最新版本 " + check.CurrentVersion);
+            if (interactive)
+            {
+                PlayniteApi.Dialogs.ShowMessage(
+                    "已是最新版本 " + check.CurrentVersion + "。", "Vault 更新");
+            }
+        }
+
+        /// <summary>「更新前先询问」的对话框。返回 true = 现在更新。</summary>
+        private bool ConfirmUpdate(ReleaseInfo release)
+        {
+            var notes = release.Notes ?? "(这个 release 没有写说明)";
+            if (notes.Length > 900)
+            {
+                notes = notes.Substring(0, 900) + "…";
+            }
+
+            var answer = PlayniteApi.Dialogs.ShowMessage(
+                string.Format(
+                    "发现新版本 {0}（当前 {1}）。\n\n"
+                    + "———— 更新说明 ————\n{2}\n\n"
+                    + "点「是」= 现在下载，下载完成后自动重启 Playnite 应用更新\n"
+                    + "点「否」= 跳过这个版本（设置里可以清除）",
+                    release.Version, VaultUpdater.CurrentVersion(), notes),
+                "Vault 更新",
+                System.Windows.MessageBoxButton.YesNo,
+                System.Windows.MessageBoxImage.Question);
+
+            return answer == System.Windows.MessageBoxResult.Yes;
+        }
+
+        /// <summary>带进度窗下载 + 校验。返回 null 表示没成功（原因已提示）。</summary>
+        private StagedUpdate DownloadUpdate(UpdateCheckResult check)
+        {
+            StagedUpdate staged = null;
+            string failure = null;
+            var cancelled = false;
+
+            PlayniteApi.Dialogs.ActivateGlobalProgress(progress =>
+            {
+                progress.IsIndeterminate = true;
+                progress.Text = "正在连接更新源...";
+
+                try
+                {
+                    staged = updater.Download(check,
+                        (text, done, total) =>
+                        {
+                            progress.Text = text;
+                            if (total > 0)
+                            {
+                                progress.IsIndeterminate = false;
+                                progress.ProgressMaxValue = total;
+                                progress.CurrentProgressValue = done;
+                            }
+                        },
+                        () => progress.CancelToken.IsCancellationRequested);
+                }
+                catch (OperationCanceledException)
+                {
+                    cancelled = true;
+                }
+                catch (Exception ex)
+                {
+                    VaultLog.Error("下载更新失败", ex);
+                    failure = ex.Message;
+                }
+            },
+            new GlobalProgressOptions("正在下载 Vault 插件更新 " + check.LatestVersion)
+            {
+                IsIndeterminate = true,
+                Cancelable = true
+            });
+
+            if (cancelled)
+            {
+                VaultLog.Info("用户取消了更新下载");
+                return null;
+            }
+
+            if (failure != null)
+            {
+                PlayniteApi.Dialogs.ShowErrorMessage(
+                    "下载更新失败。\n\n" + failure
+                    + "\n\n可以到 设置 → 扩展 → Vault Demo 换一个「下载镜像」再试。",
+                    "Vault 更新");
+                return null;
+            }
+
+            return staged;
+        }
+
+        /// <summary>
+        /// 写替换脚本 → 拉起它 → 请 Playnite 干净退出。
+        ///
+        /// 顺序很关键：**先起脚本、再退出**。脚本从第一毫秒就在等 Playnite 的进程消失，
+        /// 进程一走它就复制新文件，复制完自己把 Playnite 拉起来。
+        /// 不让 Playnite 自己「重启」是因为那样新实例可能抢先启动、加载到旧 DLL。
+        /// </summary>
+        private void ApplyAndRestart(StagedUpdate staged, bool interactive)
+        {
+            var pluginDir = VaultUpdater.PluginDirectory();
+            if (string.IsNullOrEmpty(pluginDir) || !Directory.Exists(pluginDir))
+            {
+                PlayniteApi.Dialogs.ShowErrorMessage(
+                    "找不到插件安装目录，无法自动替换。\n\n"
+                    + "请手动把下面的文件覆盖到插件目录：\n" + staged.StagingDir,
+                    "Vault 更新");
+                return;
+            }
+
+            string exePath;
+            string processName;
+            if (!VaultUpdater.TryDescribeCurrentProcess(out exePath, out processName))
+            {
+                PlayniteApi.Dialogs.ShowErrorMessage(
+                    "拿不到 Playnite 的进程信息，无法自动重启。\n\n"
+                    + "更新已经下载好了（" + staged.Version + "），"
+                    + "下次 Playnite 启动时会在 12 秒后重新尝试。",
+                    "Vault 更新");
+                return;
+            }
+
+            string scriptPath;
+            try
+            {
+                scriptPath = updater.WriteApplyScript(staged, pluginDir, processName, exePath,
+                    PreserveLaunchArguments());
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Error("写更新脚本失败", ex);
+                PlayniteApi.Dialogs.ShowErrorMessage(
+                    "写更新脚本失败：" + ex.Message + "\n\n暂存目录：" + staged.StagingDir, "Vault 更新");
+                return;
+            }
+
+            string scriptError;
+            if (!VaultUpdater.RunApplyScript(scriptPath, out scriptError))
+            {
+                PlayniteApi.Dialogs.ShowErrorMessage(
+                    "更新脚本没能启动：" + scriptError
+                    + "\n\n可以手动双击运行它完成更新：\n" + scriptPath,
+                    "Vault 更新");
+                return;
+            }
+
+            if (interactive)
+            {
+                PlayniteApi.Dialogs.ShowMessage(
+                    string.Format(
+                        "更新 {0} 已下载校验完毕。\n\n"
+                        + "现在会关闭 Playnite 并在后台完成替换，随后自动重新打开。\n"
+                        + "整个过程通常几秒钟。\n\n"
+                        + "如果没自动重启，请从托盘图标右键退出 Playnite —— 退出后同样会完成更新。",
+                        staged.Version),
+                    "Vault 更新");
+            }
+
+            Notify("vault-update", "Vault 已更新到 " + staged.Version + "，正在重启 Playnite…",
+                NotificationType.Info);
+
+            // 给通知一点时间落到界面上
+            System.Threading.Thread.Sleep(800);
+
+            string quitError;
+            if (!VaultUpdater.TryQuitPlaynite(out quitError))
+            {
+                VaultLog.Warn("自动退出失败：" + quitError);
+                PlayniteApi.Dialogs.ShowMessage(
+                    "更新已经下载好了，但没能自动关闭 Playnite（" + quitError + "）。\n\n"
+                    + "请手动退出 Playnite：更新会在退出后自动完成，并把 Playnite 重新打开。\n\n"
+                    + "注意要从托盘图标右键选择「退出」（设置里开了关闭到托盘时，"
+                    + "点窗口的 × 只会最小化）。",
+                    "Vault 更新");
+            }
+        }
+
+        /// <summary>把当前进程的命令行参数原样带回去，避免重启后丢了用户自己的启动参数。</summary>
+        private static string PreserveLaunchArguments()
+        {
+            try
+            {
+                var args = Environment.GetCommandLineArgs();
+                if (args == null || args.Length <= 1)
+                {
+                    return string.Empty;
+                }
+
+                return string.Join(" ", args.Skip(1).Select(a =>
+                    a.IndexOf(' ') >= 0 ? "\"" + a + "\"" : a).ToArray());
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        /// <summary>弹通知。通知只是锦上添花，失败绝不影响主流程。</summary>
+        private void Notify(string id, string text, NotificationType type)
+        {
+            try
+            {
+                PlayniteApi.Notifications.Add(id, text, type);
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Warn("发送通知失败：" + ex.Message);
+            }
+        }
+
+        // ---------- 主菜单 ----------
+
+        public override IEnumerable<MainMenuItem> GetMainMenuItems(GetMainMenuItemsArgs args)
+        {
+            return new List<MainMenuItem>
+            {
+                new MainMenuItem
+                {
+                    MenuSection = "@Vault",
+                    Description = "检查插件更新",
+                    Action = a => RunUpdateCheck(true)
+                },
+                new MainMenuItem
+                {
+                    MenuSection = "@Vault",
+                    Description = "从 NAS 刷新库条目",
+                    Action = a => RefreshLibraryEntries(true)
+                },
+                new MainMenuItem
+                {
+                    MenuSection = "@Vault",
+                    Description = "打开插件日志",
+                    Action = a => OpenPath(VaultLog.LogPath)
+                }
+            };
+        }
+
+        // ---------- 设置页用的状态文本 ----------
+
+        /// <summary>设置页「插件自动更新」那一段的状态行。</summary>
+        public string DescribeUpdateStatus()
+        {
+            var state = service.State;
+            var text = new StringBuilder();
+
+            text.AppendLine("当前版本：" + VaultUpdater.CurrentVersion());
+            text.Append("上次检查：");
+            text.Append(state.LastUpdateCheckUtc.HasValue
+                ? state.LastUpdateCheckUtc.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                : "还没检查过");
+            if (!string.IsNullOrEmpty(state.LastSeenVersion))
+            {
+                text.Append("　远端最新：" + state.LastSeenVersion);
+            }
+            text.AppendLine();
+
+            if (!string.IsNullOrEmpty(state.LastMirror))
+            {
+                text.AppendLine("上次命中的源：" + state.LastMirror
+                                + "（探测 " + state.LastMirrorLatencyMs + " ms）");
+            }
+
+            text.Append("系统代理：" + HttpFetch.DescribeSystemProxy());
+
+            var pending = updater.PendingStaged();
+            if (pending != null)
+            {
+                text.AppendLine();
+                text.Append("⚠ 已下载但尚未应用：v" + pending.Version
+                            + "（重启 Playnite 会自动装上）");
+            }
+
+            return text.ToString();
+        }
+
+        /// <summary>设置页「自动刷新远端库」那一段的状态行。</summary>
+        public string DescribeAutoRefreshStatus()
+        {
+            var state = service.State;
+            var settings = service.Settings;
+            var text = new StringBuilder();
+
+            text.AppendLine(settings.AutoRefreshEnabled
+                ? "状态：已启用，每 " + settings.AutoRefreshMinutes + " 分钟检查一次"
+                : "状态：未启用");
+            text.AppendLine("上次检查索引：" + FormatLocal(state.LastIndexCheckUtc));
+            text.AppendLine("上次真正写库：" + FormatLocal(state.LastLibraryWriteUtc));
+
+            var fingerprint = state.AppliedIndexHash;
+            text.AppendLine("已应用索引指纹：" + (string.IsNullOrEmpty(fingerprint)
+                ? "(还没有)"
+                : fingerprint.Substring(0, Math.Min(16, fingerprint.Length)) + "…"));
+
+            if (state.ConsecutiveRefreshFailures > 0)
+            {
+                text.AppendLine("连续失败 " + state.ConsecutiveRefreshFailures
+                                + " 次，下一次间隔已放宽到 "
+                                + (settings.AutoRefreshMinutes * (1 << Math.Min(state.ConsecutiveRefreshFailures, 3)))
+                                + " 分钟");
+            }
+
+            if (autoRefresh.IsGameRunning)
+            {
+                text.AppendLine("当前正在运行游戏，已暂停");
+            }
+
+            return text.ToString().TrimEnd();
+        }
+
+        private static string FormatLocal(DateTime? utc)
+        {
+            return utc.HasValue
+                ? utc.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                : "还没发生过";
+        }
+
+        /// <summary>设置页的小按钮用：立刻把 VM 里的编辑结果落盘。</summary>
+        public void SaveSettingsImmediately(VaultSettingsViewModel viewModel)
+        {
+            if (viewModel == null)
+            {
+                return;
+            }
+
+            try
+            {
+                viewModel.EndEdit();
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Error("立即保存设置失败", ex);
+            }
         }
 
         // ---------- 设置 ----------

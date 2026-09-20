@@ -1,16 +1,24 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    开发期命令行工具：直接编译插件源码（而不是引用编译好的 DLL），
-    因此它走的永远是当前最新的生产代码路径。
-    用途：脱离 Playnite 做打包上传 / 下载安装 / 远端索引查看 / 库元数据导出。
+    v1.5.0 自检工具：直接编译插件源码（和 VaultPack 一样的做法），
+    在本地起一个可控的「假 GitHub / 假 Gitee」服务，把更新链路的每一步都真跑一遍。
+
+    为什么不用 Python 起假服务：更新逻辑全在 C# 里，跨进程 + 管道会带来一堆无关变量
+    （历史上就被「stdout 接 PIPE 把服务卡死」坑过一次）。这里用 TcpListener 原地起服务，
+    连节流都是自己控制的。
+
+    用法（三个参数，前缀双横线）：
+      VaultSelfTest.exe            跑全部测试
+      sleep N                      单纯睡 N 秒（模拟「正在运行的 Playnite」进程）
+      launcher                     写一个 launcher-ran.txt（模拟被重新拉起的 Playnite）
   -->
   <PropertyGroup>
     <TargetFramework>net462</TargetFramework>
     <LangVersion>7.3</LangVersion>
     <OutputType>Exe</OutputType>
-    <AssemblyName>VaultPack</AssemblyName>
-    <RootNamespace>VaultPack</RootNamespace>
+    <AssemblyName>VaultSelfTest</AssemblyName>
+    <RootNamespace>VaultSelfTest</RootNamespace>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
@@ -19,9 +27,6 @@
     <DebugSymbols>false</DebugSymbols>
     <Optimize Condition="'$(Configuration)'=='Release'">true</Optimize>
     <NoWarn>$(NoWarn);CS1591;CS0618;NU1701</NoWarn>
-    <!-- Playnite 安装目录：要引用它自带的 Playnite.SDK.dll / Newtonsoft.Json.dll / LiteDB.dll。
-         装在非默认位置就覆盖这个属性：dotnet build -p:PlayniteDir="D:\Somewhere\Playnite"
-         （也可以设同名环境变量 PlayniteDir。） -->
     <PlayniteDir Condition="'$(PlayniteDir)'==''">$(ProgramFiles)\Playnite</PlayniteDir>
   </PropertyGroup>
 
@@ -31,6 +36,8 @@
 
   <ItemGroup>
     <Compile Include="Program.cs" />
+    <Compile Include="MiniHttpServer.cs" />
+    <Compile Include="Fixtures.cs" />
     <Compile Include="..\..\src\VaultDemo\**\*.cs"
              Exclude="..\..\src\VaultDemo\bin\**\*.cs;..\..\src\VaultDemo\obj\**\*.cs" />
   </ItemGroup>
@@ -44,17 +51,11 @@
       <HintPath>$(PlayniteDir)\Newtonsoft.Json.dll</HintPath>
       <Private>true</Private>
     </Reference>
-    <Reference Include="LiteDB">
-      <HintPath>$(PlayniteDir)\LiteDB.dll</HintPath>
-      <Private>true</Private>
-    </Reference>
     <Reference Include="PresentationFramework" />
     <Reference Include="PresentationCore" />
     <Reference Include="WindowsBase" />
     <Reference Include="System.Xaml" />
     <Reference Include="System.Net.Http" />
-    <!-- 插件源码（VaultUpdater.Stage）用了 ZipArchive 解压更新包，
-         这里直接编译插件源码，所以引用必须跟着一起加 —— 漏了会报 CS0012。 -->
     <Reference Include="System.IO.Compression" />
     <Reference Include="System.IO.Compression.FileSystem" />
   </ItemGroup>

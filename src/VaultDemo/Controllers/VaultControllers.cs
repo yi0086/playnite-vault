@@ -33,6 +33,8 @@ namespace VaultDemo.Controllers
 
             api.Dialogs.ActivateGlobalProgress(progress =>
             {
+                // 安装期间自动刷新让路：别和下载抢 NAS 带宽
+                using (VaultPlugin.Instance.BeginTransfer("安装 " + Game.Name))
                 try
                 {
                     VaultLog.Info("开始安装 " + Game.Name + " (" + Game.GameId + ")");

@@ -124,6 +124,34 @@ namespace VaultDemo.Services
 
         public int AdminIterations { get; set; } = 0;
 
+        // ---------- 自动更新 ----------
+
+        /// <summary>启动时自动检查插件更新。</summary>
+        public bool AutoUpdateEnabled { get; set; } = true;
+
+        /// <summary>
+        /// 更新前先问一声。默认**关**（按需求是「自动更新 + 自动重启」）；
+        /// 打开后只会下载并提示，重启由用户点头。
+        /// </summary>
+        public bool AutoUpdatePrompt { get; set; } = false;
+
+        /// <summary>下载镜像：auto / github / gitee。</summary>
+        public string UpdateMirror { get; set; } = "auto";
+
+        /// <summary>用户选择「跳过此版本」时记下的版本号。</summary>
+        public string SkippedVersion { get; set; } = string.Empty;
+
+        // ---------- 自动刷新远端库 ----------
+
+        /// <summary>定时把远端索引同步进 Playnite 库。</summary>
+        public bool AutoRefreshEnabled { get; set; } = false;
+
+        /// <summary>自动刷新间隔（分钟）。</summary>
+        public int AutoRefreshMinutes { get; set; } = 30;
+
+        /// <summary>启动后先刷新一次（30 秒延迟，等 Playnite 自己折腾完）。</summary>
+        public bool AutoRefreshOnStartup { get; set; } = true;
+
         public VaultSettings Clone()
         {
             return new VaultSettings
@@ -146,7 +174,14 @@ namespace VaultDemo.Services
                 ResumePartial = this.ResumePartial,
                 AdminHash = this.AdminHash,
                 AdminSalt = this.AdminSalt,
-                AdminIterations = this.AdminIterations
+                AdminIterations = this.AdminIterations,
+                AutoUpdateEnabled = this.AutoUpdateEnabled,
+                AutoUpdatePrompt = this.AutoUpdatePrompt,
+                UpdateMirror = this.UpdateMirror,
+                SkippedVersion = this.SkippedVersion,
+                AutoRefreshEnabled = this.AutoRefreshEnabled,
+                AutoRefreshMinutes = this.AutoRefreshMinutes,
+                AutoRefreshOnStartup = this.AutoRefreshOnStartup
             };
         }
 

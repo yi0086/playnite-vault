@@ -9,6 +9,41 @@ upload it, and install it back on any machine with metadata included.
 
 ---
 
+## v1.5.0 改了什么
+
+这一版全是「让它自己转起来」：插件会自己升级，库会自己跟 NAS 对齐。
+
+| 新能力 | 怎么做的 |
+|---|---|
+| **打开 Playnite 就检查插件更新，是新的就自动装上并重启** | 启动 12 秒后并发探 GitHub 与 Gitee 的 `releases/latest`，比版本号（`v` 前缀、预发布、`1.10 > 1.9` 都按段比）。有新版就下载、校验、暂存，然后写一个批处理等你退出、覆盖、再把 Playnite 拉起来 |
+| **国内 / 国外自动换源** | 两个源**并发**探测、按实测延迟排序，快的当主源；下载途中速度掉到地板（默认 40 KB/s）以下就自动换另一个源 |
+| **慢 ≠ 装不上** | 所有源都低于地板时，会拿主源再跑一次**不设地板**的兜底下载。慢网络照样能装完，只是慢 |
+| **设置里可开自动刷新远端库，频率自选** | 引擎按 5 分钟 ~ 24 小时的间隔定时拉索引；可选「启动后也刷一次」 |
+| **运行游戏时自动暂停刷新** | 挂在 `OnGameStarted` / `OnGameStopped` 上，游戏期间不抢 NAS 带宽，游戏结束后按已流逝的时间补上 |
+| **索引没变就不动本地库** | 每次拉到索引先算指纹（**刻意排除 `UpdatedAt`**），和上次真正应用过的指纹一致就直接跳过 —— 重新归档不会引发一次没意义的库重写 |
+
+实现上有四个值得记下来的决定：
+
+1. **更新必须由外部脚本完成**。`VaultDemo.dll` 正被 Playnite 进程加载着，Windows 文件锁下运行期不可能覆盖自己。
+   所以顺序是「暂存 → 写好脚本 → 请 Playnite 退出 → 脚本覆盖 → 脚本重新拉起」，**退出和拉起的控制权都不交给 Playnite**
+   （让它自己 Restart 的话，新实例可能赶在文件替换之前就起来，加载到旧 DLL）。
+   退出走的是 `Playnite.PlayniteApplication.Quit(bool)` —— 和托盘「退出」同一条路，因此不会把下次启动带进安全模式。
+2. **脚本里的外部命令一律写 System32 绝对路径**。Git for Windows / MSYS2 会把它们的 `usr\bin` 放进 PATH，
+   那里有个 **Unix 版 `find.exe`：它不认识 `/I`，会直接报错退出**，而脚本正是用 find 的退出码判断
+   「Playnite 是否还在运行」—— 于是脚本会**误判成已经退出，在游戏还开着的时候就去覆盖文件**，覆盖必然失败。
+3. **运行时状态单独放 `state.json`**，不混进 `settings.json`。设置页是「打快照 → 改副本 → 落盘」的模型，
+   自动刷新在后台线程写状态；两者共用一个文件的话，用户此时打开设置页再保存就会把刚写的状态覆盖回去。
+4. **速度地板靠布尔值而不是字符串判断**。第一版是用「说明文本以『太慢』开头」来分类的，
+   而说明文本前面带着候选描述，`StartsWith` 永远不成立 —— 结果「太慢」被当成硬失败，兜底重试根本没触发过。
+   这个 bug 是自检工具抓出来的（见下方 `tools/VaultSelfTest/`）。
+
+`tools/VaultSelfTest/` 是这一版新增的**自检工具**：它在本地用 `TcpListener` 起一个可控的假 GitHub / 假 Gitee，
+把上面每一条都真跑一遍 —— 包含「故意慢的主源会不会换源」「所有源都慢还能不能装上」
+「两个源都连不通时有没有兜底」「Playnite 开着的时候会不会去动文件」「中文路径的批处理会不会乱码」。
+**89 项断言全部实跑**，退出码 0 才算过。上面第 4 条就是它抓出来的。
+
+---
+
 ## v1.4.0 改了什么
 
 这一版的核心是一次存储格式升级（v3：**内容寻址区块**）+ 一个管理口令，动了三处根上的东西：
@@ -55,6 +90,7 @@ Vault 的做法是把 NAS 当成一个**自建的软件仓库**：
 | `tools/`（Python 部分） | 独立解包器：tkinter 图形界面 + 命令行，可打包成免 Python 环境的单文件 exe；解完可选登记回 Playnite | Python 3（标准库 + tkinter） |
 | `tools/webdav_mock.py` | 极简本地 WebDAV 服务，用来离线跑端到端验证 | Python 3 |
 | `tools/e2e-v3-test.py` | v3 端到端验证：造测试目录 → 打包上传 → 查仓库结构 → 解包还原 → 逐字节比对 → 中断续传 | Python 3 |
+| `tools/VaultSelfTest/` | **v1.5.0 自检**：本地假 GitHub / 假 Gitee，把自动更新与自动刷新整条链路真跑一遍（89 项断言） | C# / .NET Framework 4.6.2 |
 | `tools/speedtest.py` | WebDAV 吞吐排查：把「链路 / 服务端 / 客户端」三层分开量 | Python 3 |
 
 ---
@@ -213,7 +249,7 @@ tools\dist\VaultUnpacker.exe --selftest
 
 ```bat
 :: 先编译命令行工具（需要 Playnite 目录提供 SDK DLL）
-dotnet build -c Release -p:PlayniteDir="D:\Game\Playnite" tools\VaultPack\VaultPack.csproj
+dotnet build -c Release -p:PlayniteDir="C:\Playnite" tools\VaultPack\VaultPack.csproj
 
 :: 常规用例：约 223 MB，含一个 200 MB 的跨块文件
 python tools\e2e-v3-test.py
@@ -229,6 +265,25 @@ python tools\e2e-v3-test.py --compress
 片段首尾相接且合计等于文件大小、**至少有一个文件真的跨了多个区块**、
 空文件被建了出来、中文文件名能还原、临时区块文件下完即删、以及中断后靠日志跳过已完成区块。
 
+### 自检：自动更新与自动刷新（v1.5.0）
+
+```bat
+dotnet build -c Release -p:PlayniteDir="C:\Playnite" tools\VaultSelfTest\VaultSelfTest.csproj
+tools\VaultSelfTest\bin\Release\VaultSelfTest.exe
+```
+
+**不需要联网，也不会碰真实的 GitHub / Gitee** —— 它用 `TcpListener` 在 127.0.0.1 上
+起一套可控的假服务，**节流、掉线、404 都是自己控制的**，所以「换了源」「兜底重试」
+这类平时根本没法复现的分支可以稳定地跑出来。
+
+**退出码 0 = 89 项断言全过**，1 = 有失败项。失败项会给出实际值（例如
+「当前内容 = NEW」）而不是只说一句 false。跑完还会把完整报告写到临时目录。
+
+它会真的执行生成的替换批处理：起一个占位进程假装 Playnite 在运行，
+断言**进程还在时绝不动文件**、退出后才替换、然后重新拉起 —— 目标目录刻意用中文名，
+顺带验批处理的 OEM 编码。所以跑它的时候会在任务管理器里一闪而过几个
+`victim.exe` / `launcher.exe`，那是正常的。
+
 ---
 
 ## 目录结构
@@ -236,15 +291,20 @@ python tools\e2e-v3-test.py --compress
 ```
 playnite-vault/
 ├── src/VaultDemo/              Playnite 插件
-│   ├── VaultPlugin.cs          插件主类（LibraryPlugin）
+│   ├── VaultPlugin.cs          插件主类（LibraryPlugin）：菜单、自动更新、自动刷新
 │   ├── Controllers/            安装 / 卸载控制器
 │   ├── Services/               仓库服务：索引、归档、安装、设置
-│   ├── Net/                    WebDAV 客户端（PROPFIND/GET/PUT/MKCOL/DELETE + 断点续传）
+│   │   ├── VaultUpdater.cs     ★ 自更新：探测两源 / 换源下载 / 校验暂存 / 替换脚本
+│   │   ├── LibraryAutoRefresh.cs ★ 自动刷新：定时、暂停、索引指纹
+│   │   ├── VaultRuntimeState.cs  运行时状态（独立 state.json，与设置分开）
+│   │   └── SemVersion.cs       版本比较（按段比，认 v 前缀与预发布）
+│   ├── Net/                    WebDAV 客户端 + HttpFetch（更新用的极简 HTTP，可切代理）
 │   ├── Sync/                   打包、增量同步、进度节流与心跳
 │   ├── Models/                 数据模型（含仓库清单 / 随包元数据）
 │   └── UI/                     设置页、全局进度窗适配
 ├── tools/
 │   ├── VaultPack/              命令行工具（C#，直接编译插件源码，永远走最新生产代码）
+│   ├── VaultSelfTest/          ★ 自更新 / 自动刷新的自检（本地假 GitHub / 假 Gitee）
 │   ├── vault_unpacker/         独立解包器（Python 包）
 │   ├── core.py             来源抽象 + 清单解析 + v1/v2/v3 三种布局解包 + 自检
 │   │                       （v3 = 内容寻址区块：并发下载、按偏移随机写、下完即删、断点日志）
@@ -255,6 +315,7 @@ playnite-vault/
 │   ├── VaultUnpacker.py        图形界面入口（也是打 exe 的入口）
 │   ├── vault-unpack.py         命令行入口
 │   ├── build-vault-unpacker.py 打包成单文件 exe
+│   ├── build-release.py        ★ 打发布产物（插件 zip / 解包器 exe / 中文说明）
 │   ├── make-app-icon.py        生成图标（ico + 内嵌 png）
 │   ├── make-test-fixture.py    造离线测试归档
 │   ├── webdav_mock.py          本地假 WebDAV（端到端验证用）
@@ -263,6 +324,11 @@ playnite-vault/
 │   └── config.example.json     配置模板（复制成 config.json 用）
 └── docs/repo-format.md         仓库格式规范
 ```
+
+> 带 ★ 的是 v1.5.0 新增的。
+
+**发布产物不进 git**：`tools/build-release.py` 会把 zip / exe / 说明文件写到仓库**外面**的
+`../release/v<版本>/`，再用 REST API 挂到两个平台的 Release 上。
 
 ---
 
