@@ -160,8 +160,17 @@ Release 只认 token（SSH 推不了 release）。
   `VaultPack themes-sync --dir … --mode up|down|both [--dry-run] [--force]`；
   插件主菜单「同步主题到 NAS（上传）/ 从 NAS 同步主题（下载）」。
 - `theme-sync-state.json` 与 `settings.json` 同目录 → 命令行与界面**共享同一份基准**。
-- **主题目录名 = `theme.yaml` 的 `Id:`**（Playnite 认的就是它），**不是**清单里的 `AddonId`
-  —— 后者有时是裸 GUID（实测 Light Mode），照抄会得到 Playnite 认不出的目录名。
+- **主题目录名**：`theme.yaml` 的 `Id:` 是权威标识，**目录名只是给人看的**。
+  依据是查用户机器上 Playnite 自己装的 61 个主题：24/25 桌面 + 30/36 全屏同时命中
+  API `addonId` 与 `theme.yaml` 的 `Id:`（两者一致），**没有一个只命中 API addonId**，
+  而 `Anthem` / `Hero` / `Player` / `TrailerLovers` 四个只命中 `theme.yaml` 的 `Id:`
+  （库里的 addonId 已经漂移）。官方自带主题的目录甚至叫 `Default`，而它的 Id 是
+  `Playnite_builtin_DefaultDesktop`。
+  所以 `fetch-playnite-themes.py` 只在**目录名是裸 GUID**（作者清单里只写了 GUID，
+  实测 Light Mode）时才改成 `theme.yaml` 的 `Id:` —— 名字可用就别动，
+  因为远端只增不减，本地改个名会在 NAS 上永久多留一份同样内容。
+- 识别「已装」时同时认 **目录名 / 清单 AddonId / theme.yaml Id**，带不带 `<Name>_` 前缀
+  都按**尾部 GUID** 归一（无 GUID 的名字退回小写全名比对），所以重跑是幂等的。
 - `.part` 文件跳过；`.conflict-*` 目录不进扫描；只有含 `theme.yaml` 的目录才算主题。
 - 索引指纹刻意排除 `UpdatedAt`（同 §4）。
 
@@ -171,7 +180,7 @@ Release 只认 token（SSH 推不了 release）。
 |---|---|---|
 | `tools/VaultSelfTest/` | C# 143 项 | `TcpListener` 起本地假 GitHub/Gitee，**断言全实跑**，不联网、不碰真实仓库 |
 | `tools/python-selftest/` | Python 85 项 | `python tools/python-selftest/run_all.py`；GUI 那项需 tkinter，可设 `VAULT_TK_PYTHON` |
-| `tools/fetch-playnite-themes.py --selftest` | Python 22 项 | 离线；专盯「认主题 / 定目录名 / 解包防穿越」那套判断 |
+| `tools/fetch-playnite-themes.py --selftest` | Python 25 项 | 离线；专盯「认主题 / 定目录名 / 解包防穿越」那套判断 |
 
 自检的价值已被反复证明：换源/兜底重试两个 bug、数据迁移、exe 导入失败、主题目录名、
 zip 路径穿越都是它或同类检查抓出来的。**改动对应模块后先跑自检再谈别的。**

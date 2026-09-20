@@ -284,22 +284,29 @@ def find_installed(themes_dir, kind, ids):
 
 
 def canonicalize_dir(parent, target):
-    """把刚解压出来的目录改名成 theme.yaml 的 `Id:`。返回 (目录, 备注或 None)。
+    """把「只有 GUID、没有名字」的目录改成 theme.yaml 的 `Id:`。返回 (目录, 备注或 None)。
 
-    不改的话会留下一个裸 GUID 目录（作者上传清单里 AddonId 写裸 GUID 的情况），
-    Playnite 虽然也能扫到，但和官方安装器产出的 `Name_Guid` 长得不一样，
-    而且下次 `--force` 会因为旧名对不上而多留一份。
+    Playnite 装主题时目录名是 `<名字>_<GUID>`。清单/接口偶尔只给一个裸 GUID（实测 Light
+    Mode），照抄就得到一个没有名字的目录，跟官方安装器的产物长得不一样。
+
+    反过来说，**目录已经有像样的名字时不动它**。理由不是省事：
+    - Playnite 认主题看的是 `theme.yaml` 里的 `Id:`，目录名只是给人看的
+      （官方自带主题就叫 `Default`，而它的 Id 是 `Playnite_builtin_DefaultDesktop`）；
+    - 仓库那边是**只增不减**的镜像，本地改个名会在 NAS 上永久多留一份同样内容。
+    所以只在「名字本身不可用」时才纠。
     """
     if not os.path.isdir(target):
         return target, None
+    if not GUID_RE.fullmatch(os.path.basename(target).strip()):
+        return target, None                        # 已经有名字了，不动
     canonical = theme_id_of(target)
-    if not canonical or os.path.basename(target) == canonical:
-        return target, None
+    if not canonical or GUID_RE.fullmatch(canonical.strip()):
+        return target, None                        # theme.yaml 自己也是裸 GUID（如 Helium）
     want = os.path.join(parent, canonical)
     if os.path.isdir(want):
         shutil.rmtree(want)
     shutil.move(target, want)
-    return want, "目录名按 theme.yaml 的 Id 改为 %s" % canonical
+    return want, "目录名从裸 GUID 改为 theme.yaml 的 Id：%s" % canonical
 
 
 # --------------------------------------------------------------- 自检
@@ -370,6 +377,20 @@ def selftest():
               theme_id_of(moved), os.path.basename(moved))
         check("已经是规范名时不动它", canonicalize_dir(parent, moved)[1], None)
 
+        # ---- 有名字的目录不许被动。
+        # 依据：查用户机器上 Playnite 自己装的 61 个主题 —— 24/25 桌面 + 30/36 全屏同时命中
+        # API addonId 与 theme.yaml 的 Id；**没有一个只命中 API addonId**；而
+        # Anthem / Hero / Player / TrailerLovers 四个只命中 theme.yaml 的 Id（库里已漂移）。
+        # 结论：Id 权威，但目录名只是给人看的 → 名字可用就别改，否则 NAS 上白多一份（远端只增不减）。
+        named = os.path.join(parent, "GameUpdateStatus_Theme")
+        os.makedirs(named)
+        with io.open(os.path.join(named, "theme.yaml"), "w", encoding="utf-8") as fh:
+            fh.write("Id: GameUpdateStatus\nName: Game Update Status\n")
+        check("已经有名字的目录不动它", canonicalize_dir(parent, named)[1], None)
+        check("它还在原名下", os.path.isdir(named), True)
+        check("也没有按 Id 另建一个目录",
+              os.path.isdir(os.path.join(parent, "GameUpdateStatus")), False)
+
         # ---- 清单解析：取最高版本
         manifest = ("AddonId: %s\n"
                     "Packages:\n"
@@ -434,7 +455,7 @@ def selftest():
     if fails:
         print("self-test 失败 %d 项：%s" % (len(fails), "、".join(fails)))
         return 1
-    print("self-test 全部通过（22 项）")
+    print("self-test 全部通过（25 项）")
     return 0
 
 
