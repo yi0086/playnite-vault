@@ -30,13 +30,20 @@ namespace PlayniteVault.Services
             LegacyGuid
         };
 
-        /// <summary>要搬的文件。多一个不搬：update/ 里是过期暂存包，搬过去只会白占地方。</summary>
+        /// <summary>
+        /// 要搬的文件。多一个不搬：update/ 里是过期暂存包，搬过去只会白占地方。
+        ///
+        /// <c>theme-sync-state.json</c> 是主题同步的三方比对基准。不搬不会丢数据
+        /// （两边内容一致时照样跳过），但会让「我改的」被判成「两边都改了」，
+        /// 白白生成一份 .conflict-* 副本，所以一起搬。
+        /// </summary>
         public static readonly string[] MigratedFiles =
         {
             "settings.json",
             "local-index.json",
             "cache-index.json",
-            "state.json"
+            "state.json",
+            "theme-sync-state.json"
         };
 
         /// <summary>

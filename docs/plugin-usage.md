@@ -224,7 +224,38 @@ python vault-unpack.py --inject-plugin            （源码方式）
 
 ---
 
-## 10. 排错
+## 10. 同步主题（Themes 目录 ⇄ 仓库）
+
+主题是一堆小文件（xaml / yaml / 图片 / 字体），所以走的是**和游戏不一样**的存法：
+仓库里 `themes/` 下面是**普通文件镜像**，结构和本地同构 ——
+`themes/Desktop/{主题Id}/…`、`themes/Fullscreen/{主题Id}/…`，
+外加 `themes/index.json`（每个主题一行指纹）和每个主题自己的 `manifest.json`（文件清单）。
+
+好处是 NAS 上那棵树本身就是一份能用的主题库：可以直接浏览，也可以整个 `Desktop\*` 拷回本地。
+
+用**仓库里的开发工具**（注意：不在发布包里）：
+
+```
+VaultPack themes-sync --dir "D:\Game\Playnite\Themes" --mode up --dry-run   # 先看会动什么
+VaultPack themes-sync --dir "D:\Game\Playnite\Themes" --mode up             # 真正上传
+```
+
+- `--mode up`（默认，备份方向）只上传 / `down` 只下载 / `both` 双向
+- `--dry-run` 只列计划不落盘；`--force` 无视指纹整树重传（用来修「指纹对得上但文件坏了」）
+- 不写 `--dir` 时取 `%PLAYNITE_DIR%\Themes`；WebDAV 设置从插件数据目录里读，也可用 `--settings` 指
+- 第二次跑是增量的：指纹一致的主题直接跳过，改过的主题只重传变了的文件
+
+**冲突策略**（两边都动过同一个主题、又分不出谁是对的）：按修改时间定胜负，
+**输的那一份原地留档**成 `{主题Id}.conflict-local-<时间戳>`（本地）或
+`{主题Id}.conflict-remote-<时间戳>`（远端），一个字节都不丢。
+`.conflict-` 开头的目录不会再被同步扫描。
+
+**远端只增不减**：本地删掉一个主题**不会**连带删掉远端那份 —— 这里当备份档案用，
+不是双向镜像。被删掉的那些只会在结尾的「远端独有」提示里列出来。
+
+---
+
+## 11. 排错
 
 ### 401 未授权
 

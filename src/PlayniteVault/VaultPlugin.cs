@@ -1694,6 +1694,124 @@ namespace PlayniteVault
 
         // ---------- 主菜单 ----------
 
+        /// <summary>
+        /// 同步主题目录（Playnite 的 Themes ⇄ 仓库的 themes/）。
+        /// 引擎就是命令行工具用的那个 <see cref="ThemeSyncEngine"/>，这里只是换成界面驱动。
+        /// </summary>
+        private void SyncThemes(ThemeSyncMode mode)
+        {
+            if (!service.Settings.IsConfigured)
+            {
+                PlayniteApi.Dialogs.ShowMessage("还没有配置 WebDAV 地址，请先到插件设置里填写。", "Playnite Vault");
+                return;
+            }
+
+            var root = Path.Combine(PlayniteApi.Paths.ConfigurationPath, "Themes");
+            if (!Directory.Exists(root))
+            {
+                PlayniteApi.Dialogs.ShowMessage("找不到主题目录：\n" + root, "同步主题");
+                return;
+            }
+
+            var direction = mode == ThemeSyncMode.Upload
+                ? "上传（本地 → NAS）"
+                : mode == ThemeSyncMode.Download ? "下载（NAS → 本地）" : "双向";
+
+            var answer = PlayniteApi.Dialogs.ShowMessage(
+                "主题目录：" + root + "\n方向：" + direction + "\n\n"
+                + "· 两边都改过的主题按修改时间定胜负，输的那份原地留成 .conflict-* 副本，一个字节都不丢\n"
+                + "· 远端只增不减：本地删掉的主题不会连带删掉 NAS 上那份\n\n"
+                + "开始同步？",
+                "同步主题",
+                System.Windows.MessageBoxButton.YesNo,
+                System.Windows.MessageBoxImage.Question);
+
+            if (answer != System.Windows.MessageBoxResult.Yes)
+            {
+                return;
+            }
+
+            var counters = new ThemeSyncCounters();
+            var cancelled = false;
+            string failure = null;
+
+            PlayniteApi.Dialogs.ActivateGlobalProgress(progress =>
+            {
+                var reporter = new ThemeSyncProgressReporter(progress);
+                try
+                {
+                    var engine = new ThemeSyncEngine(service.CreateClient(), root,
+                        Path.Combine(service.DataPath, "theme-sync-state.json"),
+                        service.BuildSyncOptions(false), reporter, progress.CancelToken);
+
+                    counters = engine.Run(new ThemeSyncOptions { Mode = mode }).Counters;
+                }
+                catch (OperationCanceledException)
+                {
+                    cancelled = true;
+                    VaultLog.Info("主题同步被用户取消");
+                }
+                catch (Exception ex)
+                {
+                    VaultLog.Error("主题同步失败", ex);
+                    failure = ex.Message;
+                }
+            },
+            new GlobalProgressOptions("正在同步主题") { IsIndeterminate = false, Cancelable = true });
+
+            if (cancelled)
+            {
+                PlayniteApi.Dialogs.ShowMessage("已取消。下一次同步会从当前状态继续。", "同步主题");
+                return;
+            }
+
+            if (failure != null)
+            {
+                PlayniteApi.Dialogs.ShowMessage("同步失败：\n\n" + failure, "同步主题");
+                return;
+            }
+
+            var report = counters.Describe();
+            if (counters.RemoteOnly.Count > 0)
+            {
+                report += "\n\n远端独有 " + counters.RemoteOnly.Count
+                    + " 个（只提示，不会删除）：\n"
+                    + string.Join("\n", counters.RemoteOnly.ToArray());
+            }
+
+            PlayniteApi.Dialogs.ShowMessage(report, "同步主题");
+        }
+
+        /// <summary>把主题同步的进度接到 Playnite 的全局进度窗上。</summary>
+        private class ThemeSyncProgressReporter : IThemeSyncReporter
+        {
+            private readonly ProgressSink sink;
+
+            public ThemeSyncProgressReporter(GlobalProgressActionArgs progress)
+            {
+                sink = new ProgressSink(progress, "正在同步主题");
+            }
+
+            public void Stage(string text)
+            {
+                // 阶段当标题行，进度窗里的数值/文件名照旧由 DescribeRich 拼
+                if (!string.IsNullOrEmpty(text) && sink != null)
+                {
+                    sink.Title = text;
+                }
+            }
+
+            public void Progress(SyncProgress progress)
+            {
+                sink.Apply(progress);
+            }
+
+            public void Log(string line)
+            {
+                VaultLog.Info("[主题同步] " + line);
+            }
+        }
+
         public override IEnumerable<MainMenuItem> GetMainMenuItems(GetMainMenuItemsArgs args)
         {
             return new List<MainMenuItem>
@@ -1709,6 +1827,18 @@ namespace PlayniteVault
                     MenuSection = "@Vault",
                     Description = "从 NAS 刷新库条目",
                     Action = a => RefreshLibraryEntries(true)
+                },
+                new MainMenuItem
+                {
+                    MenuSection = "@Vault",
+                    Description = "同步主题到 NAS（上传）",
+                    Action = a => SyncThemes(ThemeSyncMode.Upload)
+                },
+                new MainMenuItem
+                {
+                    MenuSection = "@Vault",
+                    Description = "从 NAS 同步主题（下载）",
+                    Action = a => SyncThemes(ThemeSyncMode.Download)
                 },
                 new MainMenuItem
                 {

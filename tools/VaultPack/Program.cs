@@ -24,8 +24,14 @@ namespace VaultPack
     /// </summary>
     internal static class Program
     {
-        /// <summary>插件数据目录名。Playnite 给扩展用的是纯 GUID（不带扩展名前缀）。</summary>
-        private const string PluginDataFolder = "5e76bf50-cb8a-4a87-ad24-1912c746c6f0";
+        /// <summary>
+        /// 插件数据目录名。**v1.6.0 起插件改名为 Playnite-Vault，数据目录也跟着换了**，
+        /// 这里得跟着改，否则读的是迁移前留在旧目录里的那份过期设置。
+        /// 旧目录仍然兜底，是为了让「还没启动过新版 Playnite」的机器照样能用。
+        /// </summary>
+        private const string PluginDataFolder = "Playnite-Vault";
+
+        private const string LegacyPluginDataFolder = "5e76bf50-cb8a-4a87-ad24-1912c746c6f0";
 
         /// <summary>
         /// Playnite 安装目录。优先取环境变量 PLAYNITE_DIR，其次按常见安装位置找。
@@ -75,8 +81,28 @@ namespace VaultPack
         /// <summary>默认读插件数据目录里的设置，拿到 WebDAV 地址与账号。</summary>
         private static string DefaultSettingsPath()
         {
-            return Path.Combine(PlayniteDir(), "ExtensionsData", PluginDataFolder,
-                "settings.json");
+            var extensionsData = Path.Combine(PlayniteDir(), "ExtensionsData");
+
+            var current = Path.Combine(extensionsData, PluginDataFolder, "settings.json");
+            if (File.Exists(current))
+            {
+                return current;
+            }
+
+            // 迁移前的旧目录（改名之前那串 GUID）
+            var legacy = Path.Combine(extensionsData, LegacyPluginDataFolder, "settings.json");
+            if (File.Exists(legacy))
+            {
+                return legacy;
+            }
+
+            return current;
+        }
+
+        /// <summary>Playnite 的主题目录（Desktop / Fullscreen 两个子目录躺在它下面）。</summary>
+        private static string DefaultThemesDir()
+        {
+            return Path.Combine(PlayniteDir(), "Themes");
         }
 
         /// <summary>Playnite 库目录（games.db 及各种字典 .db 都在这里）。</summary>
@@ -133,6 +159,7 @@ namespace VaultPack
                     case "install": return CmdInstall(options);
                     case "rm": return CmdRemove(options);
                     case "dump": return CmdDump(options);
+                    case "themes-sync": return CmdThemesSync(options);
                     default:
                         Console.Error.WriteLine("未知命令：" + command);
                         Usage();
@@ -180,8 +207,14 @@ namespace VaultPack
                     [--conn <并发路数>] [--settings <json>] [--data <dir>]
   VaultPack rm      --id <应用Id> [--yes] [--settings <json>] [--data <dir>]
   VaultPack dump    [--db <games.db>] [--filter <关键字>] [--out <文件>]
+  VaultPack themes-sync [--dir <Themes目录>] [--mode up|down|both] [--dry-run] [--force]
+                    [--state <json>] [--settings <json>] [--data <dir>]
 
 说明:
+  themes-sync 把 Playnite 的 Themes 目录同步到仓库的 themes/ 下（纯文件镜像，
+              结构与本地同构）。--mode up 只上传（默认，备份方向）、down 只下载、
+              both 双向。远端只增不减：本地删掉的主题不会连带删掉远端那份。
+              建议先跑一次 --dry-run 看清楚要动什么。
   meta        从 Playnite 库里抓元数据（开发商/类型/标签/评分/封面…）写成
               可直接喂给 pack --meta 的 JSON；GUID 会自动解析成名称。
               库文件被 Playnite 占用时也能用（走共享读复制）。
@@ -1545,6 +1578,167 @@ namespace VaultPack
             catch (Exception ex)
             {
                 return "<无法解析 " + value.Type + "：" + ex.Message + ">";
+            }
+        }
+
+        // ---------- 主题同步 ----------
+
+        /// <summary>
+        /// 把 Playnite 的 Themes 目录同步到仓库的 themes/ 下。
+        /// 引擎（<see cref="ThemeSyncEngine"/>）在插件里，和界面用的是同一份生产代码，
+        /// 这里只负责把控制台接上去。
+        /// </summary>
+        private static int CmdThemesSync(OptionSet options)
+        {
+            var dir = options.Get("dir", DefaultThemesDir());
+            if (!Directory.Exists(dir))
+            {
+                throw new DirectoryNotFoundException("找不到主题目录：" + dir
+                    + "\n（用 --dir 指定，或把环境变量 PLAYNITE_DIR 指到 Playnite 安装目录）");
+            }
+
+            var service = CreateService(options);
+            var mode = ParseThemeSyncMode(options.Get("mode", "up"));
+            var opt = new ThemeSyncOptions
+            {
+                Mode = mode,
+                DryRun = options.Has("dry-run"),
+                Force = options.Has("force")
+            };
+
+            // 状态文件默认落在**插件数据目录**（跟 settings.json 放一起），
+            // 而不是工具自己的临时目录：三方比对的基准必须和界面共享，
+            // 否则命令行传过一次之后，界面那边没有基准，会把「我改的」误判成「两边都改了」。
+            var settingsPath = options.Get("settings", DefaultSettingsPath());
+            var statePath = options.Get("state",
+                Path.Combine(Path.GetDirectoryName(settingsPath), "theme-sync-state.json"));
+
+            Console.WriteLine("[主题目录] " + dir);
+            Console.WriteLine("[仓库地址] " + service.Settings.WebDavUrl);
+            Console.WriteLine("[同步方向] " + DescribeThemeMode(mode)
+                + (opt.DryRun ? "   （预演：只列计划，不落盘）" : string.Empty));
+            Console.WriteLine();
+
+            var client = service.CreateClient();
+            try
+            {
+                Console.WriteLine("[连通性] OK，仓库根目录下可见 " + client.TestConnection() + " 个条目");
+            }
+            catch (Exception ex)
+            {
+                // 不在这里退出：让引擎抛出更具体的错误（例如索引不是本插件的）
+                Console.WriteLine("[连通性] 探测失败：" + ex.Message);
+            }
+            Console.WriteLine();
+
+            var engine = new ThemeSyncEngine(client, dir, statePath,
+                service.BuildSyncOptions(false), new ConsoleThemeReporter(), CancellationToken.None);
+
+            var result = engine.Run(opt);
+            Console.WriteLine();
+
+            if (result.DryRun)
+            {
+                Console.WriteLine("[预演结束] 以上是这次会做的事；去掉 --dry-run 即真正执行");
+                return 0;
+            }
+
+            Console.WriteLine("[结果] " + result.Counters.Describe());
+            Console.WriteLine("[状态] " + statePath);
+            return 0;
+        }
+
+        private static ThemeSyncMode ParseThemeSyncMode(string value)
+        {
+            switch ((value ?? string.Empty).Trim().ToLowerInvariant())
+            {
+                case "":
+                case "up":
+                case "upload":
+                    return ThemeSyncMode.Upload;
+                case "down":
+                case "download":
+                    return ThemeSyncMode.Download;
+                case "both":
+                case "sync":
+                    return ThemeSyncMode.Both;
+                default:
+                    throw new ArgumentException("--mode 只认 up / down / both，当前值：" + value);
+            }
+        }
+
+        private static string DescribeThemeMode(ThemeSyncMode mode)
+        {
+            switch (mode)
+            {
+                case ThemeSyncMode.Upload: return "只上传（本地 → 仓库）";
+                case ThemeSyncMode.Download: return "只下载（仓库 → 本地）";
+                default: return "双向";
+            }
+        }
+
+        /// <summary>把主题同步的日志与进度打到控制台（进度走单行覆盖）。</summary>
+        private sealed class ConsoleThemeReporter : IThemeSyncReporter
+        {
+            private readonly object gate = new object();
+            private int lastWidth;
+
+            public void Stage(string text)
+            {
+                lock (gate)
+                {
+                    ClearLine();
+                    Console.WriteLine("== " + text);
+                }
+            }
+
+            public void Log(string line)
+            {
+                lock (gate)
+                {
+                    ClearLine();
+                    Console.WriteLine(line);
+                }
+            }
+
+            public void Progress(SyncProgress progress)
+            {
+                lock (gate)
+                {
+                    var width = ConsoleWidth();
+                    var line = progress.Describe();
+                    if (line.Length > width)
+                    {
+                        line = line.Substring(0, width);
+                    }
+
+                    var pad = Math.Max(width, lastWidth);
+                    Console.Write("\r" + line.PadRight(pad));
+                    lastWidth = pad;
+                }
+            }
+
+            private void ClearLine()
+            {
+                if (lastWidth <= 0)
+                {
+                    return;
+                }
+                Console.Write("\r" + new string(' ', lastWidth) + "\r");
+                lastWidth = 0;
+            }
+
+            private static int ConsoleWidth()
+            {
+                try
+                {
+                    return Math.Max(20, Console.WindowWidth - 1);
+                }
+                catch
+                {
+                    // 输出被重定向时 WindowWidth 会抛，给个保守值
+                    return 100;
+                }
             }
         }
 

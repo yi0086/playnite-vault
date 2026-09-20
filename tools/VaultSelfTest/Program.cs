@@ -87,6 +87,7 @@ namespace VaultSelfTest
                 RunApplyScriptTests(root, updater);
                 RunPendingStagedTests(root, updater, dataPath);
                 RunDataMigrationTests(root);
+                RunThemeSyncTests(root);
             }
             catch (Exception ex)
             {
@@ -747,6 +748,249 @@ namespace VaultSelfTest
         /// 否则用户要重新填 WebDAV 地址、本地库索引全丢。
         /// 这里全用真目录真文件跑，别拿「应该会搬」当结论。
         /// </summary>
+        // ---------- 主题同步（对内存版 WebDAV 全实跑） ----------
+
+        /// <summary>
+        /// 主题同步的关键行为都在这里被真跑一遍：上传/幂等/增量/强制/dry-run/
+        /// 下载/只增不删/双向冲突留档/路径穿越/索引归属。
+        /// 刻意不碰真实 NAS —— 这个自检必须能离线跑。
+        /// </summary>
+        private static void RunThemeSyncTests(string root)
+        {
+            Group("主题同步（远端 = 内存版 WebDAV，全实跑）");
+
+            using (var server = new MockWebDavServer())
+            {
+                var local = Path.Combine(root, "themes-a");
+                var state = Path.Combine(root, "theme-state-a.json");
+
+                WriteLocal(Path.Combine(local, "Desktop", "Alpha", "theme.yaml"),
+                    "Id: Alpha\r\nName: Alpha Theme\r\nVersion: 1.0\r\nMode: Desktop\r\n");
+                WriteLocal(Path.Combine(local, "Desktop", "Alpha", "desktop.xaml"), "<Grid/>");
+                WriteLocal(Path.Combine(local, "Desktop", "Alpha", "Resources", "logo.txt"), "hello");
+                WriteLocal(Path.Combine(local, "Fullscreen", "Beta", "theme.yaml"),
+                    "Id: Beta\r\nName: Beta Theme\r\nVersion: 2.1\r\nMode: Fullscreen\r\n");
+                WriteLocal(Path.Combine(local, "Fullscreen", "Beta", "fullscreen.xaml"), "<StackPanel/>");
+
+                // 干扰项：没有 theme.yaml 的目录不算主题；.part 是下载残留
+                WriteLocal(Path.Combine(local, "Desktop", "NotATheme", "readme.txt"), "not a theme");
+                WriteLocal(Path.Combine(local, "Desktop", "Alpha", "desktop.xaml.part"), "junk");
+
+                // ---- 1. 首次上传 ----
+                var r1 = SyncThemes(server, local, state, ThemeSyncMode.Upload);
+                Check(r1.Counters.ThemesUploaded == 2, "首次上传：两个主题都上去了",
+                    "实际 " + r1.Counters.ThemesUploaded);
+                Check(r1.Counters.FilesUploaded == 5, "首次上传：文件数 = 3 + 2",
+                    "实际 " + r1.Counters.FilesUploaded);
+                Check(server.Has("themes/Desktop/Alpha/theme.yaml")
+                      && server.Has("themes/Fullscreen/Beta/fullscreen.xaml"),
+                    "两个模式各自落到 themes/Desktop 与 themes/Fullscreen 下");
+                Check(server.GetText("themes/Desktop/Alpha/Resources/logo.txt") == "hello",
+                    "嵌套子目录里的文件也传上去了，内容一致");
+                Check(server.Has("themes/Desktop/Alpha/manifest.json"), "每个主题写了 manifest.json");
+                Check(server.Has("themes/index.json"), "写出了 themes/index.json");
+                Check(server.GetText("themes/index.json").Contains("Alpha Theme"),
+                    "索引里带上了 theme.yaml 里的 Name");
+                Check(server.GetText("themes/index.json").Contains("\"Version\": \"1.0\"")
+                      || server.GetText("themes/index.json").Contains("1.0"),
+                    "索引里带上了 theme.yaml 里的 Version");
+                Check(!server.AllFiles().Contains("themes/Desktop/NotATheme/readme.txt"),
+                    "没有 theme.yaml 的目录不会被当成主题");
+                Check(!server.AllFiles().Contains("themes/Desktop/Alpha/desktop.xaml.part"),
+                    ".part 残留不会被上传");
+
+                // ---- 2. 幂等 ----
+                var r2 = SyncThemes(server, local, state, ThemeSyncMode.Upload);
+                Check(r2.Counters.FilesUploaded == 0 && r2.Counters.ThemesUnchanged == 2,
+                    "第二次跑：指纹一致，一个文件都不再传",
+                    string.Format("传了 {0} 个文件，未变 {1} 个主题",
+                        r2.Counters.FilesUploaded, r2.Counters.ThemesUnchanged));
+
+                // ---- 3. 改一个文件：只重传那一个 ----
+                WriteLocal(Path.Combine(local, "Desktop", "Alpha", "desktop.xaml"),
+                    "<Grid Background=\"red\"/>");
+                var r3 = SyncThemes(server, local, state, ThemeSyncMode.Upload);
+                Check(r3.Counters.FilesUploaded == 1, "改一个文件只重传那一个",
+                    "实际传了 " + r3.Counters.FilesUploaded);
+                Check(server.GetText("themes/Desktop/Alpha/desktop.xaml") == "<Grid Background=\"red\"/>",
+                    "远端内容已更新");
+                Check(r3.Counters.FilesSkipped == 2, "同主题里没变的两个文件被跳过",
+                    "实际跳过 " + r3.Counters.FilesSkipped);
+
+                // ---- 4. 强制整树重传 ----
+                var r4 = SyncThemes(server, local, state, ThemeSyncMode.Upload, false, true);
+                Check(r4.Counters.FilesUploaded == 5,
+                    "--force 连「指纹一致」的主题也重传（共 5 个文件）",
+                    "实际 " + r4.Counters.FilesUploaded);
+
+                // ---- 5. dry-run 只列计划 ----
+                WriteLocal(Path.Combine(local, "Desktop", "Gamma", "theme.yaml"),
+                    "Id: Gamma\r\nMode: Desktop\r\n");
+                var r5 = SyncThemes(server, local, state, ThemeSyncMode.Upload, true);
+                Check(!server.Has("themes/Desktop/Gamma/theme.yaml"), "--dry-run 不往远端写任何东西");
+                Check(r5.Counters.ThemesUploaded == 0 && r5.Plan.Count > 0,
+                    "dry-run 把计划列出来但计数器保持为零");
+
+                // ---- 6. 空目录整树拉下来 ----
+                var pulled = Path.Combine(root, "themes-pulled");
+                var pulledState = Path.Combine(root, "theme-state-pulled.json");
+                var r6 = SyncThemes(server, pulled, pulledState, ThemeSyncMode.Download);
+                Check(r6.Counters.ThemesDownloaded == 2, "空目录能把远端整树拉下来",
+                    "实际 " + r6.Counters.ThemesDownloaded);
+                Check(ReadLocal(Path.Combine(pulled, "Desktop", "Alpha", "desktop.xaml"))
+                      == "<Grid Background=\"red\"/>", "下载回来的字节与远端一致");
+                Check(ReadLocal(Path.Combine(pulled, "Desktop", "Alpha", "Resources", "logo.txt")) == "hello",
+                    "子目录结构照搬");
+                Check(!File.Exists(Path.Combine(pulled, "Desktop", "Alpha", "manifest.json")),
+                    "远端清单不会被当成主题文件拉到本地");
+
+                var r6b = SyncThemes(server, pulled, pulledState, ThemeSyncMode.Upload);
+                Check(r6b.Counters.FilesUploaded == 0,
+                    "刚拉下来的树再上传是幂等的（两边指纹算法一致）",
+                    "实际传了 " + r6b.Counters.FilesUploaded);
+
+                // ---- 7. 本地删除不镜像到远端 ----
+                Directory.Delete(Path.Combine(pulled, "Fullscreen", "Beta"), true);
+                var r7 = SyncThemes(server, pulled, pulledState, ThemeSyncMode.Upload);
+                Check(server.Has("themes/Fullscreen/Beta/theme.yaml"),
+                    "本地删掉的主题，远端必须还在（远端只增不减）");
+                Check(r7.Counters.RemoteOnly.Contains("Fullscreen/Beta"),
+                    "被删掉的那个只列入「远端独有」提示");
+                Check(server.Deleted.Count == 0, "整套上传模式从未对远端发过 DELETE");
+
+                // ---- 8. 冲突：本地更新 → 本地胜，远端那份留档 ----
+                var newer = Path.Combine(root, "themes-newer");
+                var newerState = Path.Combine(root, "theme-state-newer.json");
+                var future = new DateTime(2030, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+                WriteLocalAt(Path.Combine(newer, "Desktop", "Alpha", "theme.yaml"),
+                    "Id: Alpha\r\nName: Alpha Local\r\nVersion: 9.9\r\nMode: Desktop\r\n", future);
+                WriteLocalAt(Path.Combine(newer, "Desktop", "Alpha", "desktop.xaml"),
+                    "<Grid Background=\"local\"/>", future);
+
+                var r8 = SyncThemes(server, newer, newerState, ThemeSyncMode.Upload);
+                Check(r8.Counters.Conflicts == 1, "两边都改过 → 判定为冲突",
+                    "实际 " + r8.Counters.Conflicts);
+                Check(server.GetText("themes/Desktop/Alpha/desktop.xaml") == "<Grid Background=\"local\"/>",
+                    "冲突时修改时间新的一方胜出（本轮本地赢）");
+
+                var desktopDirs = server.DirsUnder("themes/Desktop");
+                var remoteLoser = desktopDirs.Find(d =>
+                    d.StartsWith("Alpha.conflict-remote-", StringComparison.OrdinalIgnoreCase));
+                Check(remoteLoser != null, "输掉的远端那份留了 .conflict-remote-* 副本",
+                    string.Join("、", desktopDirs.ToArray()));
+                if (remoteLoser != null)
+                {
+                    Check(server.GetText("themes/Desktop/" + remoteLoser + "/desktop.xaml")
+                          == "<Grid Background=\"red\"/>",
+                        "留档副本里是冲突前那份旧内容（一个字节都没丢）");
+                    Check(server.Has("themes/Desktop/" + remoteLoser + "/manifest.json"),
+                        "留档副本里还留着当时的清单");
+                }
+
+                // ---- 9. 冲突：远端更新 → 远端胜，本地那份留档 ----
+                var older = Path.Combine(root, "themes-older");
+                var olderState = Path.Combine(root, "theme-state-older.json");
+                var past = new DateTime(2000, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+                WriteLocalAt(Path.Combine(older, "Desktop", "Alpha", "theme.yaml"),
+                    "Id: Alpha\r\nName: Old\r\nMode: Desktop\r\n", past);
+                WriteLocalAt(Path.Combine(older, "Desktop", "Alpha", "desktop.xaml"),
+                    "<Grid Background=\"old\"/>", past);
+
+                var r9 = SyncThemes(server, older, olderState, ThemeSyncMode.Both);
+                Check(r9.Counters.Conflicts == 1, "反向冲突同样被识别");
+                Check(ReadLocal(Path.Combine(older, "Desktop", "Alpha", "desktop.xaml"))
+                      == "<Grid Background=\"local\"/>",
+                    "远端较新时本地被覆盖成远端那份");
+                var localDirs = Directory.GetDirectories(Path.Combine(older, "Desktop"));
+                Check(Array.Exists(localDirs, d => Path.GetFileName(d)
+                        .StartsWith("Alpha.conflict-local-", StringComparison.OrdinalIgnoreCase)),
+                    "输掉的本地那份留了 .conflict-local-* 副本");
+
+                // ---- 10. 远端清单里的路径穿越必须被拦住 ----
+                var evil = Path.Combine(root, "themes-evil");
+                Directory.CreateDirectory(evil);
+                server.SeedText("themes/Desktop/Evil/theme.yaml", "Id: Evil\r\nMode: Desktop\r\n");
+                server.SeedText("themes/Desktop/Evil/manifest.json",
+                    "{\"Id\":\"Evil\",\"Mode\":\"Desktop\",\"Fingerprint\":\"x\",\"Bytes\":4,"
+                    + "\"UpdatedAt\":\"2026-01-01T00:00:00Z\","
+                    + "\"Files\":[{\"Path\":\"../escaped.txt\",\"Sha1\":\"x\",\"Bytes\":4}]}");
+                server.SeedText("themes/index.json",
+                    "{\"Kind\":\"playnite-vault-themes\",\"Schema\":1,"
+                    + "\"UpdatedAt\":\"2026-01-01T00:00:00Z\",\"Themes\":[{\"Id\":\"Evil\","
+                    + "\"Name\":\"Evil\",\"Mode\":\"Desktop\",\"Files\":1,\"Bytes\":4,"
+                    + "\"Fingerprint\":\"x\",\"UpdatedAt\":\"2026-01-01T00:00:00Z\"}]}");
+
+                var blocked = false;
+                try
+                {
+                    SyncThemes(server, evil, Path.Combine(root, "theme-state-evil.json"),
+                        ThemeSyncMode.Download);
+                }
+                catch (Exception ex)
+                {
+                    blocked = ex.ToString().Contains("路径不安全");
+                }
+                Check(blocked, "远端清单里的 ../ 路径穿越被拒绝");
+                Check(!File.Exists(Path.Combine(evil, "Desktop", "escaped.txt"))
+                      && !File.Exists(Path.Combine(root, "escaped.txt")),
+                    "没有文件逃出主题目录");
+
+                // ---- 11. 索引不是本插件的 → 停下来不覆盖 ----
+                var foreign = Path.Combine(root, "themes-foreign");
+                Directory.CreateDirectory(foreign);
+                server.SeedText("themes/index.json", "{\"Kind\":\"someone-else\",\"Themes\":[]}");
+
+                var refused = false;
+                try
+                {
+                    SyncThemes(server, foreign, Path.Combine(root, "theme-state-foreign.json"),
+                        ThemeSyncMode.Upload);
+                }
+                catch (Exception ex)
+                {
+                    refused = ex.Message.Contains("不是本插件的主题索引");
+                }
+                Check(refused, "远端 index.json 不是本插件的 → 拒绝覆盖");
+                Check(server.GetText("themes/index.json").Contains("someone-else"),
+                    "拒绝之后远端索引原样未动");
+
+                Check(server.Deleted.Count == 0, "全部场景跑完，一次 DELETE 都没发过");
+            }
+        }
+
+        private static ThemeSyncResult SyncThemes(MockWebDavServer server, string localRoot,
+            string stateFile, ThemeSyncMode mode, bool dryRun = false, bool force = false)
+        {
+            var client = new PlayniteVault.Net.WebDavClient(server.BaseUrl, null, null, 30);
+            var engine = new ThemeSyncEngine(client, localRoot, stateFile,
+                new SyncOptions { MaxRetries = 1 }, null, CancellationToken.None);
+            return engine.Run(new ThemeSyncOptions { Mode = mode, DryRun = dryRun, Force = force });
+        }
+
+        private static void WriteLocal(string path, string text)
+        {
+            WriteLocalAt(path, text, null);
+        }
+
+        private static void WriteLocalAt(string path, string text, DateTime? modifiedUtc)
+        {
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+            File.WriteAllText(path, text, new UTF8Encoding(false));
+            if (modifiedUtc != null)
+            {
+                File.SetLastWriteTimeUtc(path, modifiedUtc.Value);
+            }
+        }
+
+        private static string ReadLocal(string path)
+        {
+            return File.Exists(path) ? File.ReadAllText(path, Encoding.UTF8) : null;
+        }
+
         private static void RunDataMigrationTests(string root)
         {
             Group("插件改名后的数据目录迁移");
