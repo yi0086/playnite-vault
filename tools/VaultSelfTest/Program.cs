@@ -765,9 +765,14 @@ namespace VaultSelfTest
             File.WriteAllText(Path.Combine(legacyGuidDir, "state.json"), "{}", Encoding.UTF8);
             // 这个不在迁移清单里，搬过去反而占地方
             File.WriteAllText(Path.Combine(legacyGuidDir, "vault-demo.log"), "旧日志", Encoding.UTF8);
+            // 随包图片缓存：必须整个目录搬（否则下次导入要重新从 NAS 下一遍）
+            var legacyMetaCache = Path.Combine(legacyGuidDir, "meta-cache", "miside");
+            Directory.CreateDirectory(legacyMetaCache);
+            File.WriteAllBytes(Path.Combine(legacyMetaCache, "cover.jpg"),
+                new byte[] { 0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3 });
 
             var moved = VaultDataMigration.MigrateIfNeeded(newDir);
-            Check(moved.Length == 3, "老数据目录（纯 GUID）里的 3 个文件都搬过来了",
+            Check(moved.Length == 4, "老数据目录（纯 GUID）里的 3 个文件 + 1 个目录都搬过来了",
                 "实际 " + moved.Length + "：" + string.Join(", ", moved));
             Check(File.Exists(Path.Combine(newDir, "settings.json"))
                   && File.Exists(Path.Combine(newDir, "local-index.json"))
@@ -777,6 +782,10 @@ namespace VaultSelfTest
                 "内容逐字节搬过来了，不是建了个空文件");
             Check(!File.Exists(Path.Combine(newDir, "vault-demo.log")),
                 "不在清单里的文件（旧日志）不搬");
+            Check(File.Exists(Path.Combine(newDir, "meta-cache", "miside", "cover.jpg")),
+                "meta-cache 里的嵌套文件也搬过来了（递归拷贝）");
+            Check(File.ReadAllBytes(Path.Combine(newDir, "meta-cache", "miside", "cover.jpg")).Length == 7,
+                "meta-cache 里的图片逐字节一致，没被截断");
             Check(File.Exists(Path.Combine(legacyGuidDir, "settings.json")),
                 "老目录原地保留（搬错了还能人工翻回去）");
 
@@ -810,6 +819,20 @@ namespace VaultSelfTest
             Check(Directory.Exists(newDir3), "顺手把新数据目录创建好");
             Check(VaultDataMigration.MigrateIfNeeded(null).Length == 0, "传 null 不炸");
             Check(VaultDataMigration.MigrateIfNeeded("").Length == 0, "传空串不炸");
+
+            // --- 场景 E：新目录只有 meta-cache（没 settings）也算「已有数据」，不能覆盖 ---
+            var extensionsData4 = Path.Combine(baseDir, "ExtensionsData4");
+            var newDir4 = Path.Combine(extensionsData4, "Playnite-Vault");
+            var legacyDir4 = Path.Combine(extensionsData4, VaultDataMigration.LegacyGuid);
+            Directory.CreateDirectory(Path.Combine(newDir4, "meta-cache", "app-x"));
+            File.WriteAllText(Path.Combine(newDir4, "meta-cache", "app-x", "cover.jpg"), "新图",
+                Encoding.UTF8);
+            Directory.CreateDirectory(legacyDir4);
+            File.WriteAllText(Path.Combine(legacyDir4, "settings.json"), "{\"old\":1}", Encoding.UTF8);
+            Check(VaultDataMigration.MigrateIfNeeded(newDir4).Length == 0,
+                "新目录里只有 meta-cache 时也判定为已有数据，不搬");
+            Check(!File.Exists(Path.Combine(newDir4, "settings.json")),
+                "于是老目录的 settings.json 没被搬进来（不会把新装的配置搞乱）");
         }
 
         // ---------- 工具 ----------

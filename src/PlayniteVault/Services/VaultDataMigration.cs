@@ -40,6 +40,18 @@ namespace PlayniteVault.Services
         };
 
         /// <summary>
+        /// 要整个搬过来的子目录。
+        ///
+        /// <c>meta-cache</c> 是从仓库拉下来的随包图片缓存（每个 appId 一个子目录，
+        /// 放封面 / 背景 / 图标）。丢了不会坏，但下次导入要从 NAS 重下一遍 ——
+        /// 这跟「装回去不用重新刮削」的初衷相悖，所以一起搬。
+        /// </summary>
+        public static readonly string[] MigratedDirs =
+        {
+            "meta-cache"
+        };
+
+        /// <summary>
         /// 需要搬就搬。返回实际搬过来的文件名（0 个表示没搬 / 不需要搬）。
         /// 任何异常都吞掉 —— 搬家失败不该让插件起不来。
         /// </summary>
@@ -56,12 +68,9 @@ namespace PlayniteVault.Services
                 Directory.CreateDirectory(dataPath);
 
                 // 新目录已经有数据 → 说明早就用上了，绝不能拿老的盖回来
-                foreach (var name in MigratedFiles)
+                if (HasData(dataPath))
                 {
-                    if (File.Exists(Path.Combine(dataPath, name)))
-                    {
-                        return nothing;
-                    }
+                    return nothing;
                 }
 
                 var parent = Directory.GetParent(dataPath.TrimEnd(
@@ -93,6 +102,20 @@ namespace PlayniteVault.Services
                         moved.Add(name);
                     }
 
+                    foreach (var name in MigratedDirs)
+                    {
+                        var src = Path.Combine(legacyDir, name);
+                        if (!Directory.Exists(src))
+                        {
+                            continue;
+                        }
+
+                        if (CopyDirectory(src, Path.Combine(dataPath, name)))
+                        {
+                            moved.Add(name + "/");
+                        }
+                    }
+
                     if (moved.Count > 0)
                     {
                         VaultLog.Info("插件改名：已把旧数据目录的数据搬过来 " + legacyDir
@@ -107,6 +130,60 @@ namespace PlayniteVault.Services
             }
 
             return nothing;
+        }
+
+        /// <summary>新数据目录里是否已经有本插件的东西（有就不搬，避免覆盖）。</summary>
+        private static bool HasData(string dataPath)
+        {
+            foreach (var name in MigratedFiles)
+            {
+                if (File.Exists(Path.Combine(dataPath, name)))
+                {
+                    return true;
+                }
+            }
+
+            foreach (var name in MigratedDirs)
+            {
+                var dir = Path.Combine(dataPath, name);
+                if (Directory.Exists(dir)
+                    && Directory.GetFileSystemEntries(dir).Length > 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>递归拷贝目录，返回是否真的拷到了文件。单文件失败跳过，不中断整体搬家。</summary>
+        private static bool CopyDirectory(string src, string dst)
+        {
+            var copied = false;
+            Directory.CreateDirectory(dst);
+
+            foreach (var file in Directory.GetFiles(src))
+            {
+                try
+                {
+                    File.Copy(file, Path.Combine(dst, Path.GetFileName(file)), false);
+                    copied = true;
+                }
+                catch (Exception ex)
+                {
+                    VaultLog.Warn("迁移目录时跳过文件 " + file + "：" + ex.Message);
+                }
+            }
+
+            foreach (var dir in Directory.GetDirectories(src))
+            {
+                if (CopyDirectory(dir, Path.Combine(dst, Path.GetFileName(dir))))
+                {
+                    copied = true;
+                }
+            }
+
+            return copied;
         }
     }
 }
