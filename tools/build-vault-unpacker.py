@@ -55,12 +55,16 @@ SPEC = os.path.join(WORK, "spec")
 NAME = "VaultUnpacker"
 
 # 标准库之外用不到的大件，显式排除，避免 PyInstaller 误收
+# 瘦身用的排除清单。**加之前先想清楚**：core.py 顶层就 `from concurrent.futures
+# import ThreadPoolExecutor`，早先这里排除了 "concurrent"，结果 exe 一跑到导入 core
+# 就 ModuleNotFoundError —— 图形界面和解包全废，而且**只在冻结后**才暴露。
+# 现在 build 完会自动跑一次 `--verify-frozen` 把这类问题挡在发布前。
 EXCLUDES = [
     "numpy", "pandas", "matplotlib", "scipy", "PIL", "cv2",
     "PyQt5", "PyQt6", "PySide2", "PySide6", "wx",
     "pytest", "setuptools", "pip", "wheel", "pydoc_data",
     "sqlite3", "unittest", "distutils", "lib2to3", "test",
-    "curses", "asyncio", "concurrent", "multiprocessing", "xmlrpc", "pdb",
+    "curses", "asyncio", "xmlrpc", "pdb",
 ]
 
 
@@ -167,6 +171,10 @@ def main():
         "--hidden-import", "vault_unpacker.gui",
         "--hidden-import", "vault_unpacker.icon",
         "--hidden-import", "vault_unpacker.inject",
+        # cli 只在「带参数」时才 import，PyInstaller 的静态分析看不到 ——
+        # 漏了它 exe 会走「导入失败 → 弹窗报错」的分支：命令行下表现为
+        # **没有输出、一直卡住**（弹窗在等人点确定），非常难查。踩过一次。
+        "--hidden-import", "vault_unpacker.cli",
     ]
     # exe 文件本身（资源管理器里看到的）那个图标。窗口/任务栏图标在运行时由
     # vault_unpacker/icon.py 里内嵌的 PNG 设置，两条路互不依赖。
@@ -211,7 +219,53 @@ def main():
     print("[完成] %s" % exe)
     print("[体积] %.1f MB" % (size / 1048576.0))
     seed_config(exe)
+
+    # 打完必须真的验证一遍。源码能跑不代表冻结后能跑 —— `--exclude-module` 排掉
+    # 运行期真要用的包时，问题只在 exe 里出现。这一关就是为了不让那种 exe 流出去。
+    if not verify_frozen(exe):
+        return 1
     return 0
+
+
+def verify_frozen(exe):
+    """让刚打出来的 exe 自己 import 一遍所有依赖，确认没被误伤。"""
+    print("")
+    print("[验证] 冻结产物导入自检（--verify-frozen）")
+    # --windowed 的 exe 没有控制台，stdout 能不能用取决于调用方；这里重定向到文件，
+    # 不管是哪种情况都看得到结果。
+    report = os.path.join(WORK, "frozen-check.txt")
+    # 强制 UTF-8：不然冻结产物会按系统 OEM 代码页（中文机器是 936）写中文，
+    # 我们按 UTF-8 读回来就是一片乱码，验证日志没法看。
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    try:
+        with open(report, "wb") as fh:
+            rc = subprocess.call([exe, "--verify-frozen"], stdout=fh,
+                                 stderr=subprocess.STDOUT, env=env)
+    except OSError as ex:
+        print("[验证] !! 跑不起来：%s" % ex)
+        return False
+
+    text = ""
+    for enc in ("utf-8", "cp936", "mbcs"):
+        try:
+            with open(report, "r", encoding=enc) as fh:
+                text = fh.read()
+            break
+        except (OSError, UnicodeDecodeError):
+            continue
+
+    for line in text.splitlines():
+        print("        " + line)
+
+    if rc != 0:
+        print("")
+        print("[验证] !! 产物有问题：exe 里有模块导入不了。")
+        print("         常见原因是 tools/build-vault-unpacker.py 的 EXCLUDES 排掉了")
+        print("         运行期真的在用的包（例如 concurrent）。修好再发。")
+        return False
+
+    print("[验证] 通过：exe 里所有依赖都能导入。")
+    return True
 
 
 CONFIG_NAME = "config.json"

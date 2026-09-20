@@ -24,6 +24,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 
 RUNS = [
+    ("entry", "test_entry.py",
+     "exe 入口分流：带参数走命令行（注入插件），不带参数才开界面"),
     ("inject", "test_inject.py",
      "inject.py：定位 Playnite / 注入 / 拒绝坏包 / 路径穿越"),
     ("e2e", "test_inject_e2e.py",

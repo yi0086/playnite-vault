@@ -70,12 +70,18 @@ Playnite → `设置(F4) → 扩展 → Playnite Vault`
 
 > 已装的是哪个版本，进窗口第一屏就能看到；显示「**缺 dll**」就再注入一次。
 
-命令行方式（`vault-unpack.py`；exe 是窗口程序看不到输出，所以这条只适合源码运行）：
+命令行方式（适合脚本 / 无人值守）：
 
 ```
-python vault-unpack.py --inject-plugin
-python vault-unpack.py --inject-plugin --plugin-source gitee --no-restart
+VaultUnpacker.exe --inject-plugin
+VaultUnpacker.exe --inject-plugin --plugin-source gitee --no-restart
+python vault-unpack.py --inject-plugin            （源码方式）
 ```
+
+`--plugin-source` 可选 `bundled`（用 exe 内置的那份，离线可用）/ `auto` / `github` / `gitee`。
+**带参数就是命令行、不带参数才是图形界面**；exe 是窗口程序没有控制台，所以命令行模式
+建议把输出重定向到文件（`> log.txt 2>&1`），否则结果会写到 exe 同目录的
+`vault-unpack-cli.log`。
 
 ---
 

@@ -200,7 +200,7 @@ def main(argv=None):
                     help="Playnite 安装目录（默认自动定位，也可写在配置里）")
     ap.add_argument("--plugin-source", default="auto",
                     choices=("bundled", "auto", "github", "gitee"),
-                    help="插件包来源：bundled = e xe 内置的；auto/github/gitee = 联网取最新")
+                    help="插件包来源：bundled = exe 内置的；auto/github/gitee = 联网取最新")
     ap.add_argument("--no-restart", action="store_true",
                     help="注入前 Playnite 在跑的话，关掉它、注入，但不再拉起来")
     ap.add_argument("--keep-legacy", action="store_true",

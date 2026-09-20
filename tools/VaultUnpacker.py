@@ -22,10 +22,91 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 
+# 命令行开关（在 vault_unpacker/cli.py 里定义）。带了任何一个就只跑命令行，不开界面。
+#
+# 血泪教训：**入口必须先判断命令行**。早先这里只处理 --selftest，别的参数一律走 GUI，
+# 于是「VaultUnpacker.exe --inject-plugin」会一声不吭地弹出图形界面，
+# 脚本里看起来像「命令跑完了但什么都没发生」。
+CLI_FLAGS = frozenset((
+    "--id", "--out", "--base", "--dir", "--user", "--password", "--insecure",
+    "--config", "--list", "--keep-parts", "--part-tmp", "--workers", "--retries",
+    "--register", "--plugin-dir", "--inject-plugin", "--playnite-dir",
+    "--plugin-source", "--no-restart", "--keep-legacy", "--quiet",
+))
+
+
+def _is_cli_invocation(argv):
+    for raw in argv:
+        flag = raw.split("=", 1)[0]
+        if flag in CLI_FLAGS:
+            return True
+        # -h/--help 也该看命令行的帮助 —— 走 GUI 分支的话它会一声不吭弹出主界面
+        if flag in ("-h", "--help"):
+            return True
+        # 认不出来的 -开头参数也当命令行：让 argparse 报错，比静默开界面好排查
+        if flag.startswith("-") and flag not in ("--selftest", "-selftest"):
+            return True
+    return False
+
+
+def _ensure_output():
+    """--windowed 打包后没有控制台时 sys.stdout 可能是 None，写它直接 AttributeError。
+
+    有父进程重定向（脚本里 `> log.txt`）时句柄是有效的，照常输出；
+    真没有就落到 exe 同目录的日志文件，至少结果不丢。
+    """
+    log_path = None
+    # 落地/管道都统一成 UTF-8：中文 Windows 默认按 936 写，调用方按 UTF-8 读就是乱码。
+    # exe 是 --windowed 的，没有控制台，所以不用担心把控制台显示搞乱。
+    try:
+        if sys.stdout is not None:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if sys.stderr is not None:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    if getattr(sys, "frozen", False) and sys.stdout is None:
+        try:
+            base = os.path.dirname(sys.executable)
+        except Exception:
+            base = _HERE
+        log_path = os.path.join(base, "vault-unpack-cli.log")
+        fh = open(log_path, "a", encoding="utf-8", errors="replace")
+        sys.stdout = fh
+        sys.stderr = fh
+    return log_path
+
+
 def main():
     argv = sys.argv[1:]
     if "--selftest" in argv or "-selftest" in argv:
         return _run_selftest(argv)
+    if "--verify-frozen" in argv:
+        return _run_frozen_check()
+
+    if _is_cli_invocation(argv):
+        log_path = _ensure_output()
+        try:
+            from vault_unpacker import cli
+        except Exception as ex:
+            # 命令行下**绝不能**走 _fatal：那个是弹窗、会一直等人点确定，
+            # 脚本看起来就是「卡住了没有输出」。老老实实报错并给非零退出码。
+            msg = ("启动失败：%r\n"
+                   "（如果这是自己打的 exe，检查 PyInstaller 有没有带 "
+                   "--hidden-import vault_unpacker.cli）" % (ex,))
+            try:
+                sys.stderr.write(msg + "\n")
+            except Exception:
+                pass
+            if log_path:
+                try:
+                    sys.stdout.write(msg + "\n")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+            return 1
+        return cli.main(argv)
 
     try:
         from vault_unpacker.gui import main as gui_main
@@ -335,6 +416,132 @@ def _ts():
 def _report_dir():
     import tempfile
     return tempfile.gettempdir()
+
+
+# --------------------------------------------------------------------------
+# 冻结后自检（给打包脚本用）
+# --------------------------------------------------------------------------
+
+# 这些模块必须真的能在冻结后的 exe 里导入。
+#
+# 为什么需要这条：
+# PyInstaller 的 `--exclude-module` 一旦排掉了运行期真的用到的包，问题**只在打包产物里
+# 才出现** —— 源码跑得好好的。踩过一次：`concurrent` 被排除，而 core.py 顶层就
+# `from concurrent.futures import ThreadPoolExecutor`，于是 exe 一导入 core 就
+# ModuleNotFoundError，图形界面和解包全废，却一直没人发现。
+# 所以在 build 之后、发布之前，直接让 exe 自己 import 一遍。
+FROZEN_CHECK_MODULES = (
+    "vault_unpacker",
+    "vault_unpacker.config",
+    "vault_unpacker.core",
+    "vault_unpacker.playnite",
+    "vault_unpacker.inject",
+    "vault_unpacker.icon",
+    "vault_unpacker.cli",
+    "vault_unpacker.gui",
+    # 标准库里容易被 --exclude-module 误伤的
+    "concurrent.futures",
+    "threading",
+    "queue",
+    "hashlib",
+    "tkinter",
+    "tkinter.ttk",
+    "urllib.request",
+    "ssl",
+    "zipfile",
+    "shutil",
+    "tempfile",
+    "json",
+    "base64",
+    "zlib",
+)
+
+
+def _run_frozen_check():
+    """在冻结后的 exe 里逐个 import，确认没有模块被 --exclude-module 误伤。
+
+    退出码：0 全过；1 有导入失败。
+    """
+    import io
+    import traceback
+
+    lines = ["Vault 解包器 · 打包产物导入自检", "时间 : " + _ts(),
+             "冻结 : %s" % ("是" if getattr(sys, "frozen", False) else "否（源码运行）"),
+             "=" * 60, ""]
+    failed = []
+
+    for name in FROZEN_CHECK_MODULES:
+        try:
+            __import__(name)
+            lines.append("[OK]   " + name)
+        except Exception as ex:
+            lines.append("[FAIL] %s —— %r" % (name, ex))
+            lines.append("       " + traceback.format_exc().rstrip().replace("\n", "\n       "))
+            failed.append(name)
+
+    # 真正把 ThreadPoolExecutor 拿来用一下（只 import 子模块不保证类可用）
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            got = list(pool.map(lambda x: x * 2, (1, 2, 3)))
+        if got == [2, 4, 6]:
+            lines.append("[OK]   ThreadPoolExecutor 真能跑（解包并发下载靠它）")
+        else:
+            lines.append("[FAIL] ThreadPoolExecutor 结果不对：%r" % (got,))
+            failed.append("ThreadPoolExecutor 运行")
+    except Exception as ex:
+        lines.append("[FAIL] ThreadPoolExecutor 跑不起来 —— %r" % (ex,))
+        failed.append("ThreadPoolExecutor")
+
+    # tkinter 得能真建窗口，光 import 不够
+    try:
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        root.update_idletasks()
+        root.destroy()
+        lines.append("[OK]   tkinter 能建窗口（图形界面可用）")
+    except Exception as ex:
+        lines.append("[FAIL] tkinter 建窗口失败 —— %r" % (ex,))
+        failed.append("tkinter 建窗口")
+
+    # 内置插件包在不在（「安装插件到 Playnite」里选『用内置的』要用它）
+    try:
+        from vault_unpacker import inject
+        pkg = inject.bundled_package()
+        if pkg:
+            lines.append("[OK]   内置插件包：%s" % pkg)
+        else:
+            lines.append("[!]    没有内置插件包（该选项会退回联网取最新，不算失败）")
+    except Exception as ex:
+        lines.append("[FAIL] 取内置插件包失败 —— %r" % (ex,))
+        failed.append("内置插件包")
+
+    lines.append("")
+    lines.append("=" * 60)
+    lines.append("结论：%s" % ("全部通过" if not failed else "有 %d 项失败：%s"
+                              % (len(failed), ", ".join(failed))))
+    text = "\n".join(lines)
+
+    path = os.path.join(_report_dir(), "VaultUnpacker-frozen-check.txt")
+    try:
+        with io.open(path, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    except Exception:
+        path = None
+
+    try:
+        out = sys.stdout
+        if out is None:
+            out = open(os.path.join(_report_dir(), "vault-unpack-frozen.txt"),
+                       "w", encoding="utf-8")
+        out.write(text + "\n")
+        out.write("报告：%s\n" % path)
+        out.flush()
+    except Exception:
+        pass
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
