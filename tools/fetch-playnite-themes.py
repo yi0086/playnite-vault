@@ -13,15 +13,22 @@
   3. `PackageUrl`                            实际包，`.pthm` 扩展名 = 一个 zip
      解压出来就是主题目录（theme.yaml + xaml + 资源）
 
-装好的目录结构与 Playnite 自己的完全一致：
-    <Themes>\\Desktop\\<AddonId>\\      （AddonId 形如 Mythic_e231056c-...）
-    <Themes>\\Fullscreen\\<AddonId>\\
+装好的目录结构与 Playnite 自己的完全一致 —— 目录名一律取解压后 `theme.yaml` 的
+`Id:`（Playnite 认标识就是它，不是清单里的 AddonId）：
+    <Themes>\\Desktop\\<theme.yaml 的 Id>\\      （形如 Mythic_e231056c-...）
+    <Themes>\\Fullscreen\\<theme.yaml 的 Id>\\
+清单/接口给的 AddonId 只用来建临时目录，落地后按 Id 纠正：它有时是**裸 GUID**
+（实测 Light Mode），照抄就会得到一个 Playnite 认不出的目录名。
 
 用法：
     python tools/fetch-playnite-themes.py --dest "D:\\Game\\Playnite.bak\\Themes"
     python tools/fetch-playnite-themes.py --dest ... --only Mythic
     python tools/fetch-playnite-themes.py --dest ... --kind desktop --limit 3
     python tools/fetch-playnite-themes.py --dest ... --list        # 只列出，不下载
+    python tools/fetch-playnite-themes.py --selftest               # 离线自检，不联网
+
+已装过的主题会按「目录名 / theme.yaml 的 Id」两个角度识别并跳过，所以重跑是幂等的；
+`--force` 才会重新下载。改完认主题/定目录名那套逻辑务必跑一次 `--selftest`。
 
 注意：GitHub 的 raw / release 直连在这台机器上很不稳（连接重置），
 所以每个请求都「直连试一次 → 再走代理试」。代理地址从环境变量
@@ -65,16 +72,18 @@ def log(msg):
 
 # --------------------------------------------------------------- HTTP
 
-def _open(url, proxy=None, timeout=TIMEOUT):
+def _open(url, proxy=None, timeout=None):
     handlers = []
     if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
     req = urllib.request.Request(url, headers={"User-Agent": "vault-theme-fetch"})
-    return urllib.request.build_opener(*handlers).open(req, timeout=timeout)
+    # timeout 一定要走「运行时读全局」而不是默认值绑定：main 里会用 --timeout 改它，
+    # 而 Python 的默认参数在函数定义时就固定了，改全局是改不动默认值的。
+    return urllib.request.build_opener(*handlers).open(req, timeout=timeout or TIMEOUT)
 
 
-def fetch(url, *, binary=False, tries=RETRIES, timeout=TIMEOUT):
+def fetch(url, *, binary=False, tries=RETRIES, timeout=None):
     """直连优先、失败换代理，整体再重试若干轮。"""
     proxies = [None] + ([PROXY] if PROXY else [])
     last = None
@@ -164,13 +173,6 @@ def latest_package(text):
 
 # --------------------------------------------------------------- 主题目录
 
-def installed_ids(themes_dir, kind):
-    d = os.path.join(themes_dir, kind)
-    if not os.path.isdir(d):
-        return set()
-    return {n for n in os.listdir(d) if os.path.isdir(os.path.join(d, n))}
-
-
 def extract_pthm(data, target):
     """`.pthm` 就是 zip。有的包第一层还套着同名目录，这里统一压平一层。"""
     with zipfile.ZipFile(io.BytesIO(data)) as z:
@@ -190,10 +192,15 @@ def extract_pthm(data, target):
             rel = info.filename[len(strip):] if strip and info.filename.startswith(strip) else info.filename
             if not rel.strip("/"):
                 continue
-            # 防路径穿越
+            # 防路径穿越。注意 Windows 上 `os.path.isabs("/x")` 是 **False**
+            # （ntpath 要求分隔符在索引 >0 处），所以根路径要自己判，别指望 isabs。
             safe = os.path.normpath(rel).replace("\\", "/")
-            if safe.startswith("..") or os.path.isabs(safe):
+            if (safe == ".." or safe.startswith("../") or safe.startswith("/")
+                    or safe[1:2] == ":" or os.path.isabs(safe)):
                 continue
+            dest = os.path.normpath(os.path.join(target, *safe.split("/")))
+            if dest != target and not dest.startswith(target + os.sep):
+                continue                                      # 兜底：落点必须还在 target 里
             dest = os.path.join(target, *safe.split("/"))
             if info.is_dir():
                 os.makedirs(dest, exist_ok=True)
@@ -220,6 +227,215 @@ def theme_mode_of(target):
             if m:
                 return m.group(1).strip().capitalize()
     return None
+
+
+def theme_id_of(target):
+    r"""theme.yaml 的顶层 `Id:` —— 唯一权威的主题目录名。
+
+    这里**要求顶格**：`Links:` 之类的子项是缩进的，用 `^\s*Id` 有误取的风险。
+    """
+    for name in ("theme.yaml", "theme.yml"):
+        p = os.path.join(target, name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            with io.open(p, "r", encoding="utf-8-sig", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        m = re.search(r"^Id\s*:\s*(.+?)\s*$", text, re.M)
+        if m:
+            return m.group(1).strip().strip("'\"") or None
+    return None
+
+
+GUID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
+
+
+def theme_key(name):
+    """把一个目录名/Id 归一成可比对的键。
+
+    同一个主题可能叫 `Light Mode_cf0a70bd-…`（Playnite 惯例）也可能只叫
+    `cf0a70bd-…`（作者上传时偷懒），两者其实是一回事 —— 拿尾部的 GUID 对齐。
+    没有 GUID 的名字（`Aniki_Lite` 之类）退回小写全名比对。
+    """
+    m = GUID_RE.search((name or "").strip())
+    return m.group(1).lower() if m else (name or "").strip().lower()
+
+
+def find_installed(themes_dir, kind, ids):
+    """在 `<themes_dir>/<Kind>` 下找这个主题已装的目录，没有则 None。
+
+    `ids` 里可以混着 API 的 addonId、清单的 AddonId、theme.yaml 的 Id —— 只认键
+    （见 `theme_key`），所以三种写法指向同一个目录时不会重复下载。
+    """
+    parent = os.path.join(themes_dir, kind.capitalize())
+    if not os.path.isdir(parent):
+        return None
+    wanted = {theme_key(v) for v in ids if v}
+    for name in os.listdir(parent):
+        p = os.path.join(parent, name)
+        if not os.path.isdir(p):
+            continue
+        if theme_key(name) in wanted or theme_key(theme_id_of(p) or "") in wanted:
+            return p
+    return None
+
+
+def canonicalize_dir(parent, target):
+    """把刚解压出来的目录改名成 theme.yaml 的 `Id:`。返回 (目录, 备注或 None)。
+
+    不改的话会留下一个裸 GUID 目录（作者上传清单里 AddonId 写裸 GUID 的情况），
+    Playnite 虽然也能扫到，但和官方安装器产出的 `Name_Guid` 长得不一样，
+    而且下次 `--force` 会因为旧名对不上而多留一份。
+    """
+    if not os.path.isdir(target):
+        return target, None
+    canonical = theme_id_of(target)
+    if not canonical or os.path.basename(target) == canonical:
+        return target, None
+    want = os.path.join(parent, canonical)
+    if os.path.isdir(want):
+        shutil.rmtree(want)
+    shutil.move(target, want)
+    return want, "目录名按 theme.yaml 的 Id 改为 %s" % canonical
+
+
+# --------------------------------------------------------------- 自检
+
+def selftest():
+    """离线自检：不联网、不碰真实主题目录，只验「认主题 / 定目录名 / 解包」这套判断。
+
+    这套判断是踩过坑的：Light Mode 的清单里 AddonId 是裸 GUID，照抄就得到一个
+    Playnite 认不出的目录名，而且下次 --force 还会多留一份。
+    """
+    import tempfile
+
+    fails = []
+
+    def check(name, got, want):
+        ok = got == want
+        print("  %s  %s" % ("PASS" if ok else "FAIL", name))
+        if not ok:
+            print("        期望 %r，实际 %r" % (want, got))
+            fails.append(name)
+
+    guid = "cf0a70bd-1cf6-4fb3-91fa-35f50f1b5913"
+    # 特意混入一个缩进的嵌套 Id：只有顶格的才是主题自己的 Id
+    yaml_text = ("ThemeApiVersion: 2.6.0\n"
+                 "Id: Light Mode_%s\n"
+                 "Name: Light Mode\n"
+                 "Version: 0.2.0\n"
+                 "Links:\n"
+                 "    Id: 不该被读到的嵌套 Id\n" % guid)
+
+    tmp = tempfile.mkdtemp(prefix="theme-selftest-")
+    try:
+        themes_dir = os.path.join(tmp, "Themes")
+        parent = os.path.join(themes_dir, "Desktop")
+        bare = os.path.join(parent, guid)
+        os.makedirs(bare)
+        with io.open(os.path.join(bare, "theme.yaml"), "w", encoding="utf-8") as fh:
+            fh.write(yaml_text)
+
+        # ---- 认主题
+        check("theme.yaml 的 Id 按顶格读",
+              theme_id_of(bare), "Light Mode_" + guid)
+        check("带前缀名与裸 GUID 是同一个主题",
+              theme_key("Light Mode_" + guid), theme_key(guid))
+        check("只差末位的两个 GUID 不混同",
+              theme_key("8b15c46a-90c2-4fe5-9ebb-1ab25ba7fcb1") ==
+              theme_key("8b15c46a-90c2-4fe5-9ebb-1ab25ba7fcb2"), False)
+        check("没有 GUID 的名字退回小写全名",
+              theme_key("Aniki_Lite"), "aniki_lite")
+        check("Mode 能读出来",
+              theme_mode_of(bare), None)          # 这份 yaml 故意没写 Mode
+
+        # ---- 找已装目录（决定「会不会重复下载」）
+        check("按 API 的裸 GUID 就能找到已装目录",
+              find_installed(themes_dir, "desktop", [guid]), bare)
+        check("按带前缀的 Id 也能找到",
+              find_installed(themes_dir, "desktop", ["Light Mode_" + guid]), bare)
+        check("主题不存在时返回 None",
+              find_installed(themes_dir, "desktop", ["Nonexistent_x"]), None)
+
+        # ---- 定目录名
+        moved, note = canonicalize_dir(parent, bare)
+        check("裸 GUID 目录被改名成 theme.yaml 的 Id",
+              os.path.basename(moved), "Light Mode_" + guid)
+        check("旧目录已经不在", os.path.isdir(bare), False)
+        check("改名留下的说明不为空", bool(note), True)
+        check("目录名与 theme.yaml 的 Id 一致",
+              theme_id_of(moved), os.path.basename(moved))
+        check("已经是规范名时不动它", canonicalize_dir(parent, moved)[1], None)
+
+        # ---- 清单解析：取最高版本
+        manifest = ("AddonId: %s\n"
+                    "Packages:\n"
+                    "  - Version: 0.1.0\n"
+                    "    PackageUrl: https://example.invalid/light_0_1.pthm\n"
+                    "  - Version: 0.2.0\n"
+                    "    PackageUrl: https://example.invalid/light_0_2.pthm\n" % guid)
+        check("清单里取版本最高的包",
+              latest_package(manifest),
+              ("0.2.0", "https://example.invalid/light_0_2.pthm"))
+
+        # ---- 解包：包内单顶层目录要压平（顶多一层同名壳）
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("SoloTheme/theme.yaml", "Id: SoloTheme\n")
+            z.writestr("SoloTheme/xaml/desktop.xaml", "<Grid/>")
+        out = os.path.join(tmp, "unpacked")
+        extract_pthm(buf.getvalue(), out)
+        check("包内单顶层目录被压平",
+              os.path.isfile(os.path.join(out, "theme.yaml")), True)
+        check("压平后子目录跟着下来",
+              os.path.isfile(os.path.join(out, "xaml", "desktop.xaml")), True)
+        check("壳目录没被留下",
+              os.path.isdir(os.path.join(out, "SoloTheme")), False)
+
+        # ---- 解包：顶层不是单一目录时不能乱压
+        buf2 = io.BytesIO()
+        with zipfile.ZipFile(buf2, "w") as z:
+            z.writestr("theme.yaml", "Id: Flat\n")
+            z.writestr("xaml/desktop.xaml", "<Grid/>")
+        out2 = os.path.join(tmp, "unpacked2")
+        extract_pthm(buf2.getvalue(), out2)
+        check("本来就是平的不动它",
+              os.path.isfile(os.path.join(out2, "theme.yaml")), True)
+        check("平的包里 xaml 也在",
+              os.path.isfile(os.path.join(out2, "xaml", "desktop.xaml")), True)
+
+        # ---- 解包：防路径穿越（单独一个包 —— 有可疑条目时压平会主动关掉）
+        buf3 = io.BytesIO()
+        with zipfile.ZipFile(buf3, "w") as z:
+            z.writestr("theme.yaml", "Id: Evil\n")
+            z.writestr("../escaped.txt", "nope")
+            z.writestr("a/../../escaped2.txt", "nope")
+            z.writestr("/abs.txt", "nope")
+            z.writestr("C:/drive.txt", "nope")
+        out3 = os.path.join(tmp, "unpacked3")
+        extract_pthm(buf3.getvalue(), out3)
+        check("向上穿越的条目被丢弃",
+              os.path.exists(os.path.join(tmp, "escaped.txt")), False)
+        check("绕一圈再向上的条目被丢弃",
+              os.path.exists(os.path.join(tmp, "escaped2.txt")), False)
+        check("根路径条目被丢弃",
+              os.path.isfile(os.path.join(out3, "abs.txt")), False)
+        check("带盘符的条目被丢弃",
+              os.path.exists("C:/drive.txt"), False)
+        check("正常条目照样落盘",
+              os.path.isfile(os.path.join(out3, "theme.yaml")), True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print("")
+    if fails:
+        print("self-test 失败 %d 项：%s" % (len(fails), "、".join(fails)))
+        return 1
+    print("self-test 全部通过（22 项）")
+    return 0
 
 
 # --------------------------------------------------------------- 主流程
@@ -267,14 +483,16 @@ def resolve_manifest(entry):
         ver, url = latest_package(text)
         if not url:
             return entry, None, None, "清单里没有 PackageUrl"
+        # 清单里的 AddonId 只当参考（可能是裸 GUID），不覆盖 API 给的 addonId。
         m = re.search(r"^\s*AddonId\s*:\s*(.+?)\s*$", text, re.M)
-        addon_id = (m.group(1).strip().strip("'\"") if m else None) or entry["addonId"]
-        return entry, addon_id, (ver, url), None
+        entry["manifestId"] = (m.group(1).strip().strip("'\"") if m else None) or None
+        return entry, entry["addonId"], (ver, url), None
     except Exception as exc:                              # noqa: BLE001
         return entry, None, None, "%s: %s" % (type(exc).__name__, exc)
 
 
 def main(argv=None):
+    global TIMEOUT
     ap = argparse.ArgumentParser(description="下载 Playnite 官方全部主题")
     ap.add_argument("--dest", help="Playnite 的 Themes 目录，例如 D:\\Game\\Playnite.bak\\Themes")
     ap.add_argument("--kind", choices=["desktop", "fullscreen", "both"], default="both")
@@ -285,7 +503,15 @@ def main(argv=None):
     ap.add_argument("--jobs", type=int, default=4, help="清单解析并发（默认 4）")
     ap.add_argument("--workers", type=int, default=4, help="包下载并发（默认 4）")
     ap.add_argument("--report", help="把结果写成 JSON 到这里")
+    ap.add_argument("--timeout", type=int, default=TIMEOUT,
+                    help="单个请求的超时秒数（默认 %d）。遇到黑洞地址（比如某些自建源）"
+                         "会把每一轮重试都拖满，调小它能让失败快点暴露" % TIMEOUT)
+    ap.add_argument("--selftest", action="store_true",
+                    help="离线自检（不联网、不碰 --dest），验证认主题/定目录名/解包那套判断")
     args = ap.parse_args(argv)
+    if args.selftest:
+        return selftest()
+    TIMEOUT = max(5, args.timeout)
     if not args.dest and not args.list:
         ap.error("必须给 --dest（或用 --list 只看清单）")
 
@@ -322,20 +548,28 @@ def main(argv=None):
 
     def work(entry):
         kind = entry["kind"]
-        target = os.path.join(themes_dir, kind.capitalize(), entry["addonId"])
-        if os.path.isdir(target) and not args.force:
-            n = sum(len(f) for _, _, f in os.walk(target))
+        parent = os.path.join(themes_dir, kind.capitalize())
+        # 已装目录可能叫 API 的 addonId、清单的 AddonId，或 theme.yaml 的 Id —— 三种都认
+        found = find_installed(themes_dir, kind,
+                               [entry.get("addonId"), entry.get("manifestId")])
+        if found and not args.force:
+            n = sum(len(f) for _, _, f in os.walk(found))
             return entry, "skip", n, 0, None
+        target = os.path.join(parent, entry["addonId"])
         try:
             data = fetch(entry["packageUrl"], binary=True)
-            if os.path.isdir(target):
-                shutil.rmtree(target)
-            os.makedirs(os.path.dirname(target), exist_ok=True)
+            for stale in {found, target} - {None}:         # --force 时两种旧名都可能残留
+                if os.path.isdir(stale):
+                    shutil.rmtree(stale)
+            os.makedirs(parent, exist_ok=True)
             n, size = extract_pthm(data, target)
-            real = theme_mode_of(target)
             note = None
+            real = theme_mode_of(target)
             if real and real.lower() != kind:
                 note = "theme.yaml 说的 Mode=%s，与库里的类型(%s)不一致" % (real, kind)
+            _dir, fix = canonicalize_dir(parent, target)
+            if fix:
+                note = ((note + "；") if note else "") + fix
             return entry, "ok", n, size, note
         except Exception as exc:                          # noqa: BLE001
             return entry, "fail", 0, 0, "%s: %s" % (type(exc).__name__, exc)
