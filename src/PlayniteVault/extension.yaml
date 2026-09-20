@@ -1,0 +1,13 @@
+Id: Playnite-Vault
+Name: Playnite Vault
+Author: Yi0086
+Version: 1.6.0
+Module: PlayniteVault.dll
+Type: GameLibrary
+Icon: icon.png
+Links:
+  - Name: GitHub
+    Url: https://github.com/yi0086/playnite-vault
+  - Name: Gitee
+    Url: https://gitee.com/yi0086/playnite-vault
+Description: 把本地大体积游戏归档到 NAS 上的 WebDAV 仓库、需要时再解回本地；元数据随包走，装回去不用重新刮削。

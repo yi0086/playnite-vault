@@ -8,10 +8,10 @@
     python tools/build-release.py 1.5.0 --out D:/somewhere/v1.5.0
 
 产物（默认落在仓库**外面**的 ../release/v<版本>/，二进制不进 git）：
-    VaultDemo-<版本>.zip          插件包，用户解压后整个文件夹丢进 Extensions/
+    PlayniteVault-<版本>.zip          插件包，用户解压后整个文件夹丢进 Extensions/
     VaultUnpacker-<版本>.exe      独立解包器（裸 exe，双击即用）
     使用说明.txt                   给用户看的纯文本说明
-    stage/VaultDemo_<guid>/       打 zip 之前的暂存目录
+    stage/Playnite-Vault/       打 zip 之前的暂存目录
 
 为什么要有这个脚本（而不是临时敲命令）：
   1. 说明文件必须**从 docs/plugin-usage.md 生成**。上一版是把说明手工另写了一份，
@@ -37,9 +37,9 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-PLUGIN_DIR = os.path.join(ROOT, "src", "VaultDemo")
+PLUGIN_DIR = os.path.join(ROOT, "src", "PlayniteVault")
 YAML = os.path.join(PLUGIN_DIR, "extension.yaml")
-DLL = os.path.join(PLUGIN_DIR, "bin", "Release", "VaultDemo.dll")
+DLL = os.path.join(PLUGIN_DIR, "bin", "Release", "PlayniteVault.dll")
 ICON = os.path.join(PLUGIN_DIR, "icon.png")
 UNPACKER = os.path.join(HERE, "dist", "VaultUnpacker.exe")
 USAGE_MD = os.path.join(ROOT, "docs", "plugin-usage.md")
@@ -216,7 +216,7 @@ def main():
     if not plugin_id:
         fail("extension.yaml 里读不到 Id")
 
-    for path, what in ((DLL, "VaultDemo.dll（先编译 Release）"),
+    for path, what in ((DLL, "PlayniteVault.dll（先编译 Release）"),
                        (ICON, "icon.png"),
                        (YAML, "extension.yaml"),
                        (USAGE_MD, "docs/plugin-usage.md")):
@@ -243,7 +243,7 @@ def main():
         % (len(text), text.count("\n")))
 
     # 2) 其余三个文件
-    shutil.copy2(DLL, os.path.join(stage_dir, "VaultDemo.dll"))
+    shutil.copy2(DLL, os.path.join(stage_dir, "PlayniteVault.dll"))
     shutil.copy2(YAML, os.path.join(stage_dir, "extension.yaml"))
     shutil.copy2(ICON, os.path.join(stage_dir, "icon.png"))
 
@@ -252,13 +252,13 @@ def main():
         log("  %-20s %8d 字节" % (name, os.path.getsize(os.path.join(stage_dir, name))))
 
     # 3) 打 zip
-    zip_name = "VaultDemo-%s.zip" % version
+    zip_name = "PlayniteVault-%s.zip" % version
     zip_path = os.path.join(out_dir, zip_name)
     names = build_zip(zip_path, stage_dir, folder)
     log("打包 %s（%d 字节，%d 个条目）" % (zip_name, os.path.getsize(zip_path), len(names)))
 
     # zip 里必须有的三个东西，少一个用户就装不上
-    for need in ("VaultDemo.dll", "extension.yaml", "icon.png"):
+    for need in ("PlayniteVault.dll", "extension.yaml", "icon.png"):
         if not any(n.endswith("/" + need) for n in names):
             fail("zip 里缺少 " + need)
 

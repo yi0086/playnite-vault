@@ -46,6 +46,7 @@ TEMPLATE = {
     "output_parent_dir": "",         # 解包**父目录**，每个应用解到 <它>/<app_id>/
     "register_to_playnite": True,    # 解包后写 local-index.json
     "plugin_data_dir": "",           # 留空自动定位
+    "playnite_dir": "",              # Playnite 安装目录（注入插件用），留空自动定位
     "last_app_id": "",               # 上次选中的应用，纯为方便
 }
 

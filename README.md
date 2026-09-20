@@ -24,7 +24,7 @@ upload it, and install it back on any machine with metadata included.
 
 实现上有四个值得记下来的决定：
 
-1. **更新必须由外部脚本完成**。`VaultDemo.dll` 正被 Playnite 进程加载着，Windows 文件锁下运行期不可能覆盖自己。
+1. **更新必须由外部脚本完成**。`PlayniteVault.dll` 正被 Playnite 进程加载着，Windows 文件锁下运行期不可能覆盖自己。
    所以顺序是「暂存 → 写好脚本 → 请 Playnite 退出 → 脚本覆盖 → 脚本重新拉起」，**退出和拉起的控制权都不交给 Playnite**
    （让它自己 Restart 的话，新实例可能赶在文件替换之前就起来，加载到旧 DLL）。
    退出走的是 `Playnite.PlayniteApplication.Quit(bool)` —— 和托盘「退出」同一条路，因此不会把下次启动带进安全模式。
@@ -85,12 +85,13 @@ Vault 的做法是把 NAS 当成一个**自建的软件仓库**：
 
 | 目录 | 是什么 | 技术栈 |
 |---|---|---|
-| `src/VaultDemo/` | Playnite 插件本体：库来源、安装/卸载控制器、归档菜单、设置页、进度窗 | C# / .NET Framework 4.6.2 |
+| `src/PlayniteVault/` | Playnite 插件本体：库来源、安装/卸载控制器、归档菜单、设置页、进度窗 | C# / .NET Framework 4.6.2 |
 | `tools/VaultPack/` | 命令行工具：打包上传 / 下载安装 / 远端目录浏览 / 测速 / 备份 Playnite 库 / 导出库元数据 | C# / .NET Framework 4.6.2 |
-| `tools/`（Python 部分） | 独立解包器：tkinter 图形界面 + 命令行，可打包成免 Python 环境的单文件 exe；解完可选登记回 Playnite | Python 3（标准库 + tkinter） |
+| `tools/`（Python 部分） | 独立解包器：tkinter 图形界面 + 命令行，可打包成免 Python 环境的单文件 exe；解完可选登记回 Playnite；**还能把插件本身注入进 Playnite 并优雅重启它** | Python 3（标准库 + tkinter） |
 | `tools/webdav_mock.py` | 极简本地 WebDAV 服务，用来离线跑端到端验证 | Python 3 |
 | `tools/e2e-v3-test.py` | v3 端到端验证：造测试目录 → 打包上传 → 查仓库结构 → 解包还原 → 逐字节比对 → 中断续传 | Python 3 |
-| `tools/VaultSelfTest/` | **v1.5.0 自检**：本地假 GitHub / 假 Gitee，把自动更新与自动刷新整条链路真跑一遍（89 项断言） | C# / .NET Framework 4.6.2 |
+| `tools/VaultSelfTest/` | **v1.6.0 自检**：本地假 GitHub / 假 Gitee，把自动更新与自动刷新整条链路真跑一遍，外加插件改名后的数据目录迁移（101 项断言） | C# / .NET Framework 4.6.2 |
+| `tools/python-selftest/` | **Python 侧自检**：注入插件 / 真实 WM_CLOSE 优雅关闭 / GUI 真建窗口（69 项断言），`python tools/python-selftest/run_all.py` 一把跑完 | Python 3 |
 | `tools/speedtest.py` | WebDAV 吞吐排查：把「链路 / 服务端 / 客户端」三层分开量 | Python 3 |
 
 ---
@@ -141,10 +142,14 @@ Vault 的做法是把 NAS 当成一个**自建的软件仓库**：
 
 ### 1. 装插件
 
+**最省事的路子**：打开解包器 → 底栏 **安装插件到 Playnite…** → 点 **注入并重启**。
+它会定位 Playnite、把插件写进 `Extensions\Playnite-Vault\`、优雅重启 Playnite，
+旧版本挪去备份（详见 `docs/plugin-usage.md` 第 2 节）。下面这段是从源码手装的流程。
+
 编译：
 
 ```bat
-dotnet build src\VaultDemo\VaultDemo.csproj -c Release -p:PlayniteDir="C:\Playnite"
+dotnet build src\PlayniteVault\PlayniteVault.csproj -c Release -p:PlayniteDir="C:\Playnite"
 ```
 
 `-p:PlayniteDir` 指向你的 Playnite 安装目录（编译时要引用它自带的 `Playnite.SDK.dll` /
@@ -152,14 +157,18 @@ dotnet build src\VaultDemo\VaultDemo.csproj -c Release -p:PlayniteDir="C:\Playni
 Playnite **便携版**就是把整个文件夹解压到任意位置，ExtensionsData 就躺在它旁边。
 
 把产物复制到 Playnite 的扩展目录（便携版 `<Playnite>\Extensions\`，
-安装版 `%AppData%\Playnite\Extensions\`），目录名用 `extension.yaml` 里的 Id：
+安装版 `%AppData%\Playnite\Extensions\`），**目录名就用 `extension.yaml` 里的 Id**：
 
 ```
-<Playnite>\Extensions\VaultDemo_5e76bf50-cb8a-4a87-ad24-1912c746c6f0\
-    VaultDemo.dll
+<Playnite>\Extensions\Playnite-Vault\
+    PlayniteVault.dll
     extension.yaml
     icon.png
 ```
+
+> v1.6.0 之前 Id 是 `VaultDemo_5e76bf50-…`，目录名也就跟着那一串。改名不影响已经配好的
+> 设置：插件启动时会自己去旧的 `ExtensionsData\<guid>` 里把 `settings.json` /
+> `local-index.json` / `state.json` 搬过来（老目录原地留着，不删）。
 
 重启 Playnite，在「设置 → 扩展」里配置 WebDAV 地址、账号、密码。
 
@@ -290,13 +299,14 @@ tools\VaultSelfTest\bin\Release\VaultSelfTest.exe
 
 ```
 playnite-vault/
-├── src/VaultDemo/              Playnite 插件
+├── src/PlayniteVault/              Playnite 插件
 │   ├── VaultPlugin.cs          插件主类（LibraryPlugin）：菜单、自动更新、自动刷新
 │   ├── Controllers/            安装 / 卸载控制器
 │   ├── Services/               仓库服务：索引、归档、安装、设置
 │   │   ├── VaultUpdater.cs     ★ 自更新：探测两源 / 换源下载 / 校验暂存 / 替换脚本
 │   │   ├── LibraryAutoRefresh.cs ★ 自动刷新：定时、暂停、索引指纹
 │   │   ├── VaultRuntimeState.cs  运行时状态（独立 state.json，与设置分开）
+│   │   ├── VaultDataMigration.cs 插件改名后的数据目录搬家（VaultDemo_<guid> → Playnite-Vault）
 │   │   └── SemVersion.cs       版本比较（按段比，认 v 前缀与预发布）
 │   ├── Net/                    WebDAV 客户端 + HttpFetch（更新用的极简 HTTP，可切代理）
 │   ├── Sync/                   打包、增量同步、进度节流与心跳
@@ -305,10 +315,12 @@ playnite-vault/
 ├── tools/
 │   ├── VaultPack/              命令行工具（C#，直接编译插件源码，永远走最新生产代码）
 │   ├── VaultSelfTest/          ★ 自更新 / 自动刷新的自检（本地假 GitHub / 假 Gitee）
+│   ├── python-selftest/        ★ 注入链路与 GUI 的自检（真关进程、真建窗口）
 │   ├── vault_unpacker/         独立解包器（Python 包）
 │   ├── core.py             来源抽象 + 清单解析 + v1/v2/v3 三种布局解包 + 自检
 │   │                       （v3 = 内容寻址区块：并发下载、按偏移随机写、下完即删、断点日志）
-│   │   ├── playnite.py         定位插件数据目录、读写 local-index.json
+│   │   ├── playnite.py         定位 Playnite / 插件数据目录、读写 local-index.json
+│   │   ├── inject.py           ★ 注入插件：定位 Playnite → 取包 → 优雅关 → 写入 → 重启
 │   │   ├── config.py           外部配置（不进代码）
 │   │   ├── cli.py / gui.py     两个入口
 │   │   └── icon.py             内嵌图标（base64 PNG）

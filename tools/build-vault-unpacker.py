@@ -14,6 +14,10 @@
     · --windowed 不带黑色控制台窗口
     · 只依赖标准库 + tkinter，因此体积主要是 Tcl/Tk 运行时
     · 必须用「带 tkinter 的 Python」来跑本脚本，否则打出来的 exe 起不来
+    · **会把编译好的插件包一起塞进 exe**（--add-data），于是「安装插件到 Playnite」
+      里的「用内置的」没网也能用。所以打 exe 之前先把插件编出来：
+          dotnet build src/PlayniteVault/PlayniteVault.csproj -c Release
+      没编就先打 exe 也行，只是那个选项会退回「联网取最新」。
     · exe 图标取 assets/vault-unpacker.ico（由 make-app-icon.py 生成）；
       没生成过就先跑一次 make-app-icon.py，否则只有默认图标
     · 构建完会把 tools/config.json 复制到 exe 旁边（已存在则不动），
@@ -27,9 +31,19 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 ENTRY = os.path.join(HERE, "VaultUnpacker.py")
 DIST = os.path.join(HERE, "dist")
 ICON = os.path.join(HERE, "assets", "vault-unpacker.ico")
+
+# ---- 内置插件包（给「安装插件到 Playnite」用）----
+# 插件源码编译出来的三个文件 → 打成一个 zip → 作为 exe 的数据一起发布。
+# 这样用户在没网 / GitHub 抽风的时候也能把插件装上。
+PLUGIN_SRC_DIR = os.path.join(ROOT, "src", "PlayniteVault")
+PLUGIN_BUILD_DIR = os.path.join(PLUGIN_SRC_DIR, "bin", "Release")
+PLUGIN_ID = "Playnite-Vault"          # 包内文件夹名 = extension.yaml 的 Id
+PLUGIN_DLL = "PlayniteVault.dll"
+PAYLOAD_DIR = os.path.join(HERE, "plugin_payload")
 
 # PyInstaller 的中间目录放在系统临时目录，而且**每次构建用全新的名字**。
 # 原因：在工作区内原地重建时，PyInstaller 会覆写/清理 workpath 里的上千个文件，
@@ -56,6 +70,64 @@ def check_tkinter():
         return tkinter.TkVersion
     except ImportError:
         return None
+
+
+def read_plugin_version():
+    """从 extension.yaml 抠版本号 —— 版本只认这一个来源。"""
+    yaml = os.path.join(PLUGIN_SRC_DIR, "extension.yaml")
+    if not os.path.isfile(yaml):
+        return None
+    with open(yaml, "r", encoding="utf-8-sig") as f:
+        for line in f:
+            line = line.strip()
+            if line.lower().startswith("version:"):
+                return line.split(":", 1)[1].strip().strip("\"'")
+    return None
+
+
+def build_payload():
+    """把编译好的插件打成 zip，供 exe 内置。返回 (zip 路径, 说明) 或 (None, 原因)。
+
+    为什么用 zip 而不是直接塞三个文件：注入时走的是一条已验证的路径
+    （解 zip → 校验 Id / dll / PE → 写进 Extensions），和「从 release 下载」完全同构。
+    多一种分发方式就多一种出错姿势，没必要。
+    """
+    version = read_plugin_version()
+    if not version:
+        return None, "读不到 src/PlayniteVault/extension.yaml 里的版本号"
+
+    pieces = [("extension.yaml", os.path.join(PLUGIN_SRC_DIR, "extension.yaml")),
+              ("icon.png", os.path.join(PLUGIN_SRC_DIR, "icon.png")),
+              (PLUGIN_DLL, os.path.join(PLUGIN_BUILD_DIR, PLUGIN_DLL))]
+    missing = [name for name, path in pieces if not os.path.isfile(path)]
+    if missing:
+        return None, ("缺这些文件：%s\n"
+                      "先编译插件：dotnet build src/PlayniteVault/PlayniteVault.csproj "
+                      "-c Release -p:PlayniteDir=\"<Playnite 目录>\"" % ", ".join(missing))
+
+    os.makedirs(PAYLOAD_DIR, exist_ok=True)
+    zip_path = os.path.join(PAYLOAD_DIR, "PlayniteVault-%s.zip" % version)
+
+    import zipfile
+    if os.path.exists(zip_path):
+        # 不直接覆写：有些环境带批量删除保护，覆写已有文件会被拦下
+        stale = zip_path + ".old"
+        try:
+            os.replace(zip_path, stale)
+            os.remove(stale)
+        except OSError:
+            pass
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(PLUGIN_ID + "/", b"")
+        for name, path in pieces:
+            info = zipfile.ZipInfo(PLUGIN_ID + "/" + name,
+                                   date_time=(2026, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            with open(path, "rb") as fh:
+                z.writestr(info, fh.read())
+
+    return zip_path, "插件 %s（内置，%d 字节）" % (version, os.path.getsize(zip_path))
 
 
 def main():
@@ -94,6 +166,7 @@ def main():
         "--hidden-import", "vault_unpacker.config",
         "--hidden-import", "vault_unpacker.gui",
         "--hidden-import", "vault_unpacker.icon",
+        "--hidden-import", "vault_unpacker.inject",
     ]
     # exe 文件本身（资源管理器里看到的）那个图标。窗口/任务栏图标在运行时由
     # vault_unpacker/icon.py 里内嵌的 PNG 设置，两条路互不依赖。
@@ -106,6 +179,17 @@ def main():
               "先跑：python tools/make-app-icon.py" % ICON)
     for m in EXCLUDES:
         cmd += ["--exclude-module", m]
+
+    # 把插件包塞进 exe，运行时用 sys._MEIPASS/plugin 找它（见 vault_unpacker/inject.py）。
+    # Windows 上 --add-data 的分隔符是「源码路径;包内路径」。
+    payload, why = build_payload()
+    if payload:
+        cmd += ["--add-data", payload + ";plugin"]
+        print("[构建] %s" % why)
+    else:
+        print("[构建] !! 没能内置插件包：%s" % why)
+        print("[构建]    「安装插件到 Playnite」里的『用内置的』会退回联网取最新。")
+
     cmd.append(ENTRY)
 
     exe = os.path.join(DIST, NAME + ".exe")

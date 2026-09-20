@@ -18,7 +18,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import config, core, icon, playnite
+from . import config, core, icon, inject, playnite
 from . import __version__ as APP_VERSION
 
 APP_TITLE = "Vault 解包器"
@@ -550,6 +550,23 @@ class App(tk.Tk):
         self.btn_cfg = self._btn(foot, "打开配置", self._open_config,
                                  kind="ghost", size=9, padx=10, pady=3)
         self.btn_cfg.pack(side="right")
+        # 「安装插件到 Playnite」单独开一个窗口，不动主界面的布局 ——
+        # 主界面那五张卡片是给「解包」这条主线用的，把安装流程塞进去只会把主线挤乱。
+        self.btn_plug = self._btn(foot, "安装插件到 Playnite…",
+                                  self._open_plugin_dialog,
+                                  kind="main", size=9, padx=12, pady=3)
+        self.btn_plug.pack(side="right", padx=(0, self.px(8)))
+
+    def _open_plugin_dialog(self):
+        """打开「安装插件到 Playnite」窗口（同一个窗口再点就置顶，不重复开）。"""
+        dlg = getattr(self, "_plugin_dlg", None)
+        if dlg is not None and dlg.winfo_exists():
+            dlg.deiconify()
+            dlg.lift()
+            dlg.focus_set()
+            return dlg
+        self._plugin_dlg = PluginInstaller(self)
+        return self._plugin_dlg
 
     def _build_source_card(self, parent):
         card = self._card(parent, "1", "选择来源")
@@ -1562,6 +1579,411 @@ class App(tk.Tk):
                     "确定关闭吗？", parent=self):
                 return
             self.cancel.set()
+        self.destroy()
+
+
+class PluginInstaller(tk.Toplevel):
+    """「安装插件到 Playnite」窗口。
+
+    单独开窗口、不动主界面布局。流程固定为四步，每一步都记进窗口自带的日志：
+
+        定位 Playnite → 拿插件包（内置 / 最新 release）
+        → 优雅关闭 Playnite（发 WM_CLOSE，等同点 ×，不强杀）
+        → 写进 Extensions\\Playnite-Vault → 重新拉起原来那个 Playnite
+
+    为什么必须「先关再写」：PlayniteVault.dll 被 Playnite 进程锁着，运行期覆盖不了。
+    为什么不强杀：强杀会让 Playnite 丢掉还没落盘的库改动。
+    """
+
+    def __init__(self, app):
+        tk.Toplevel.__init__(self, app)
+        self.app = app
+        self.title("安装插件到 Playnite")
+        self.configure(bg=BG)
+        self.transient(app)
+        try:
+            self.iconphoto(False, app.iconphoto(False))  # 有则设，没有就算了
+        except Exception:
+            pass
+
+        self.events = queue.Queue()
+        self.answer = None
+        self.answer_ready = threading.Event()
+        self.worker = None
+        self.cancel = threading.Event()
+
+        self.plugin_root = ""
+        self.source = tk.StringVar(value="bundled")
+        self.restart_var = tk.BooleanVar(value=True)
+        self.move_legacy_var = tk.BooleanVar(value=True)
+
+        self._build()
+        self._autodetect()
+        self.after(POLL_MS, self._pump)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---------------- 布局 ----------------
+
+    def _build(self):
+        a = self.app
+        head = tk.Frame(self, bg=INK)
+        head.pack(fill="x")
+        tk.Label(head, text="安装插件到 Playnite", bg=INK, fg=WHITE,
+                 font=(a.ui_font, 12, "bold")).pack(
+            anchor="w", padx=a.px(14), pady=(a.px(10), 0))
+        tk.Label(head, text="把 Playnite-Vault 插件写进 Playnite 的 Extensions 目录，"
+                            "然后优雅重启它",
+                 bg=INK, fg="#B9C2D6", font=(a.ui_font, 9)).pack(
+            anchor="w", padx=a.px(14), pady=(a.px(2), a.px(10)))
+        tk.Frame(self, bg=YELLOW, height=a.px(4)).pack(fill="x")
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=a.px(14),
+                  pady=(a.px(10), a.px(8)))
+
+        # ---- 1. Playnite 目录 ----
+        card = tk.Frame(body, bg=WHITE, bd=0, highlightthickness=a.px(1),
+                        highlightbackground=LINE, highlightcolor=LINE)
+        card.pack(fill="x")
+        inner = tk.Frame(card, bg=WHITE)
+        inner.pack(fill="x", padx=a.px(12), pady=a.px(10))
+
+        r = tk.Frame(inner, bg=WHITE)
+        r.pack(fill="x")
+        tk.Label(r, text="Playnite 目录", bg=WHITE, fg=INK, anchor="w",
+                 width=12, font=(a.ui_font, 10)).pack(side="left")
+        self.root_var = tk.StringVar()
+        self.e_root = tk.Entry(r, textvariable=self.root_var, bd=0,
+                               relief="flat", font=(a.mono_font, 9),
+                               bg="#F7F8FB", fg=INK,
+                               highlightthickness=a.px(1),
+                               highlightbackground=LINE_SOFT,
+                               highlightcolor=INK)
+        self.e_root.pack(side="left", fill="x", expand=True, ipady=a.px(4))
+        b = a._btn(r, "浏览…", self._pick_root, kind="ghost", size=9,
+                   padx=10, pady=4)
+        b.pack(side="left", padx=(a.px(6), 0))
+        b2 = a._btn(r, "自动检测", self._autodetect, kind="ghost", size=9,
+                    padx=10, pady=4)
+        b2.pack(side="left", padx=(a.px(6), 0))
+
+        self.state_lbl = tk.Label(inner, text="", bg=WHITE, fg=MUTED, anchor="w",
+                                  justify="left", font=(a.ui_font, 9),
+                                  wraplength=a.px(560))
+        self.state_lbl.pack(fill="x", pady=(a.px(8), 0))
+
+        # ---- 2. 插件包来源 ----
+        card2 = tk.Frame(body, bg=WHITE, bd=0, highlightthickness=a.px(1),
+                         highlightbackground=LINE, highlightcolor=LINE)
+        card2.pack(fill="x", pady=(a.px(8), 0))
+        inner2 = tk.Frame(card2, bg=WHITE)
+        inner2.pack(fill="x", padx=a.px(12), pady=a.px(10))
+
+        tk.Label(inner2, text="插件包", bg=WHITE, fg=INK, anchor="w",
+                 font=(a.ui_font, 10, "bold")).pack(anchor="w")
+        seg = tk.Frame(inner2, bg=WHITE)
+        seg.pack(fill="x", pady=(a.px(6), 0))
+        self.seg_btns = {}
+        for key, label in (("bundled", "用内置的（最快）"),
+                           ("github", "GitHub 最新"),
+                           ("gitee", "Gitee 最新")):
+            b = a._btn(seg, label, lambda k=key: self._set_source(k),
+                       kind="ghost", size=9, padx=14, pady=5)
+            b.pack(side="left", padx=(0, a.px(6)))
+            self.seg_btns[key] = b
+
+        tk.Label(inner2, text="内置的那份和解包器一起发布，不用联网；"
+                              "「最新」会去 release 里取 PlayniteVault-<版本>.zip。",
+                 bg=WHITE, fg=MUTED, anchor="w", justify="left",
+                 font=(a.ui_font, 9),
+                 wraplength=a.px(560)).pack(fill="x", pady=(a.px(8), 0))
+
+        # ---- 3. 选项 + 执行 ----
+        card3 = tk.Frame(body, bg=WHITE, bd=0, highlightthickness=a.px(1),
+                         highlightbackground=LINE, highlightcolor=LINE)
+        card3.pack(fill="x", pady=(a.px(8), 0))
+        inner3 = tk.Frame(card3, bg=WHITE)
+        inner3.pack(fill="x", padx=a.px(12), pady=a.px(10))
+
+        self.chk_restart = NeoCheck(
+            inner3, "注入完成后自动重启 Playnite（用原来那个桌面版/全屏版）",
+            self.restart_var, scale=a.s, ui_font=a.ui_font)
+        self.chk_restart.pack(anchor="w")
+        self.chk_legacy = NeoCheck(
+            inner3, "把改名前的旧目录 VaultDemo_* 挪到备份（否则会同时加载两份插件）",
+            self.move_legacy_var, scale=a.s, ui_font=a.ui_font)
+        self.chk_legacy.pack(anchor="w", pady=(a.px(6), 0))
+
+        run = tk.Frame(inner3, bg=WHITE)
+        run.pack(fill="x", pady=(a.px(10), 0))
+        self.btn_go = a._btn(run, "注入并重启", self._start,
+                             kind="pri", size=10, padx=20, pady=7)
+        self.btn_go.pack(side="left")
+        self.btn_close = a._btn(run, "关闭", self._on_close,
+                                kind="ghost", size=10, padx=16, pady=7)
+        self.btn_close.pack(side="right")
+
+        # ---- 4. 日志 ----
+        box = tk.Frame(body, bg=WHITE, bd=0, highlightthickness=a.px(1),
+                       highlightbackground=INK, highlightcolor=INK)
+        box.pack(fill="both", expand=True, pady=(a.px(8), 0))
+        self.log = tk.Text(box, height=12, wrap="word", bd=0, relief="flat",
+                           font=(a.mono_font, 9), bg=LOG_BG, fg=LOG_FG,
+                           insertbackground=WHITE, highlightthickness=0,
+                           selectbackground=BLUE, selectforeground=INK,
+                           padx=a.px(8), pady=a.px(6))
+        self.log.pack(side="left", fill="both", expand=True)
+        lsb = ttk.Scrollbar(box, orient="vertical",
+                            style="Log.Vertical.TScrollbar", command=self.log.yview)
+        lsb.pack(side="right", fill="y")
+        self.log.configure(yscrollcommand=lsb.set, state="disabled")
+        self.log.tag_configure("err", foreground="#FF8296")
+        self.log.tag_configure("ok", foreground="#7BE3A8")
+        self.log.tag_configure("warn", foreground=YELLOW)
+        self.log.tag_configure("dim", foreground="#6E7688")
+
+        self._set_source("bundled")
+        self.update_idletasks()
+        w = max(self.winfo_reqwidth(), a.px(640))
+        h = max(self.winfo_reqheight(), a.px(560))
+        self.geometry("%dx%d" % (w, h))
+
+    # ---------------- 交互 ----------------
+
+    def _set_source(self, key):
+        """三段式选择：选中的那个刷成强调色。
+
+        走 _btn_state 而不是直接 configure(bg=...)：_btn 的悬停处理会按按钮自己
+        记着的 _k 把颜色刷回去，绕过它改色会在鼠标一进一出之后被打回原形。
+        """
+        self.source.set(key)
+        for k, btn in self.seg_btns.items():
+            on = (k == key)
+            btn._k = ((YELLOW, INK, "#FFDF6B", "#EFE6CC") if on
+                      else (WHITE, INK, "#EEF1F6", "#E8EBF1"))
+            self.app._btn_state(btn, True)
+
+    def _pick_root(self):
+        d = filedialog.askdirectory(
+            title="选择 Playnite 安装目录（有 Playnite.DesktopApp.exe 的那个）",
+            parent=self)
+        if d:
+            self.root_var.set(d)
+            self._refresh_state()
+
+    def _autodetect(self):
+        """开机自动检测：配置里存过的优先，没有就扫一遍。"""
+        cfg = self.app.cfg or {}
+        saved = (cfg.get("playnite_dir") or "").strip()
+        root, note = inject.pick_root(saved or None)
+        if root:
+            self.root_var.set(root)
+            self._log("[定位] %s" % note)
+        else:
+            self._log("[定位] " + note.replace("\n", " "))
+        self._refresh_state()
+
+    def _refresh_state(self):
+        root = self.root_var.get().strip()
+        if not root or not os.path.isdir(root):
+            self.state_lbl.configure(text="⚠ 目录不存在。", fg=PINK)
+            self.plugin_root = ""
+            return
+        if not inject.looks_like_playnite_root(root):
+            self.state_lbl.configure(
+                text="⚠ 这个目录里没看到 Playnite.DesktopApp.exe / Extensions，"
+                     "请确认选的是 Playnite 安装目录。", fg=PINK)
+            self.plugin_root = root
+            return
+
+        self.plugin_root = root
+        exts = inject.extensions_dir_of(root)
+        info = inject.installed_info(exts)
+        legacy = inject.legacy_plugin_dirs(exts)
+        running = playnite.is_playnite_running()
+
+        bits = []
+        if info:
+            bits.append("已装 %s：版本 %s%s"
+                        % (inject.PLUGIN_ID, info.get("version") or "?",
+                           "" if info.get("has_dll") else "（**缺 dll**，建议重装）"))
+        else:
+            bits.append("尚未安装 %s" % inject.PLUGIN_ID)
+        if legacy:
+            bits.append("发现改名前的旧目录 %d 个" % len(legacy))
+        if running is True:
+            bits.append("Playnite 正在运行（注入前会自动请它退出）")
+        elif running is None:
+            bits.append("查不出 Playnite 是否在运行")
+        self.state_lbl.configure(text="  ·  ".join(bits), fg=MUTED)
+
+    def _start(self):
+        if self.worker and self.worker.is_alive():
+            return
+        root = self.root_var.get().strip()
+        if not root or not os.path.isdir(root):
+            messagebox.showerror(APP_TITLE, "Playnite 目录不对，没法注入。", parent=self)
+            return
+        self.cancel.clear()
+        self._set_running(True)
+        self.worker = threading.Thread(target=self._run, args=(root,), daemon=True)
+        self.worker.start()
+
+    def _set_running(self, running):
+        self.btn_go.configure(state="disabled" if running else "normal",
+                              text="正在处理…" if running else "注入并重启")
+        self.app._btn_state(self.btn_close, not running)
+        self.chk_restart.set_enabled(not running)
+        self.chk_legacy.set_enabled(not running)
+
+    # ---------------- 干活（后台线程）----------------
+
+    def _run(self, root):
+        try:
+            self._work(root)
+        except inject.InjectError as ex:
+            self.events.put(("fail", str(ex)))
+        except Exception as ex:
+            self.events.put(("fail", "%s: %s" % (type(ex).__name__, ex)))
+        finally:
+            self.events.put(("done", None))
+
+    def _work(self, root):
+        log = lambda m: self.events.put(("log", m))  # noqa: E731
+
+        exts = inject.extensions_dir_of(root)
+        log("[目标] %s" % exts)
+
+        # 1) 拿插件包
+        source = self.source.get()
+        mirror = source if source in ("github", "gitee") else "auto"
+        if source == "bundled":
+            log("[插件包] 使用内置的那份")
+        else:
+            log("[插件包] 去 %s 取最新 release" % source)
+        download_dir = os.path.join(playnite.state_dir(), "plugin-download")
+        zip_path, note = inject.fetch_package(download_dir, source, mirror, log)
+        log("[插件包] %s → %s" % (note, zip_path))
+
+        # 2) 要不要关、关完重启成什么
+        procs = playnite.playnite_processes()
+        was_running = bool(procs)
+        target_exe = None
+        for p in procs or []:
+            if p.get("exe"):
+                target_exe = p["exe"]
+                break
+        if was_running:
+            log("[状态] 注入前 Playnite 在运行：%s"
+                % ", ".join(sorted({p["name"] for p in procs})))
+        else:
+            log("[状态] 注入前 Playnite 没在运行")
+
+        if was_running:
+            state, _ = inject.request_close(log)
+            if state == "timeout":
+                # 为什么还在，只有用户知道（关闭到托盘？卡住了？）——
+                # 决定权交回去，绝不擅自强杀。
+                if self._ask(
+                        "Playnite 没有退出。\n\n"
+                        "常见原因：设置里开了「关闭到托盘」，点 × 只是收进托盘。\n\n"
+                        "· 选「是」：我再试一次（请先去托盘图标上点真正的退出）\n"
+                        "· 选「否」：放弃这次注入\n\n"
+                        "（本工具不会强杀 Playnite —— 强杀会让它丢掉还没落盘的库改动）"):
+                    state2, _ = inject.request_close(log, timeout=90)
+                    if state2 != "closed":
+                        raise inject.InjectError(
+                            "Playnite 仍然没有退出。请手动退出 Playnite 后重试。")
+                else:
+                    raise inject.InjectError("已取消：Playnite 还在运行，没法覆盖插件文件。")
+            elif state == "unknown":
+                raise inject.InjectError(
+                    "查不出 Playnite 是否在运行，为安全起见不注入。\n"
+                    "请先手动确认 Playnite 已退出。")
+
+        # 3) 注入
+        staging = os.path.join(playnite.state_dir(), "plugin-staging")
+        res = inject.install_package(zip_path, exts, staging, log,
+                                     move_legacy=self.move_legacy_var.get())
+        log("[完成] 插件已装到 %s（版本 %s）" % (res["dir"], res["version"]))
+        if res["backup"]:
+            log("[完成] 旧版本备份在 %s" % res["backup"])
+
+        # 4) 重启
+        if was_running and self.restart_var.get():
+            inject.launch(target_exe, log)
+        elif was_running:
+            log("[重启] 按你的选择没有重启，Playnite 现在没在跑。")
+        else:
+            log("[重启] 注入前它本来就没在跑，所以没有替你启动。")
+        self.events.put(("ok", res))
+
+    # ---------------- 主线程侧 ----------------
+
+    def _ask(self, text):
+        """让后台线程等到用户在界面上做出选择。"""
+        self.answer = None
+        self.answer_ready.clear()
+        self.events.put(("ask", text))
+        self.answer_ready.wait(timeout=300)
+        return bool(self.answer)
+
+    def _pump(self):
+        try:
+            while True:
+                ev = self.events.get_nowait()
+                kind = ev[0]
+                if kind == "log":
+                    self._log(ev[1])
+                elif kind == "ask":
+                    self.answer = messagebox.askyesno(APP_TITLE, ev[1], parent=self)
+                    self.answer_ready.set()
+                elif kind == "fail":
+                    self._log("[失败] " + ev[1], "err")
+                    messagebox.showerror(APP_TITLE, ev[1], parent=self)
+                elif kind == "ok":
+                    self._log("[完成] 注入成功。", "ok")
+                    self._remember()
+                    messagebox.showinfo(
+                        APP_TITLE,
+                        "插件已装好。\n\n"
+                        "首次使用请到 Playnite 的 设置 → 扩展 → Playnite Vault "
+                        "里填 WebDAV 地址。", parent=self)
+                elif kind == "done":
+                    self._set_running(False)
+                    self._refresh_state()
+                    self.app._autodetect_playnite(False)
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(POLL_MS, self._pump)
+
+    def _remember(self):
+        """把这次用的 Playnite 目录记到配置里，下次开窗直接填好。"""
+        try:
+            cfg = dict(self.app.cfg or {})
+            cfg["playnite_dir"] = self.root_var.get().strip()
+            self.app.cfg = cfg
+            config.save(cfg)
+            self._log("[配置] 已记住 Playnite 目录", "dim")
+        except Exception as ex:
+            self._log("[配置] 记住目录失败：%s" % ex, "warn")
+
+    def _log(self, text, tag=None):
+        if tag is None:
+            tag = _auto_tag(text)
+        self.log.configure(state="normal")
+        self.log.insert("end", text + "\n", tag or ())
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _on_close(self):
+        if self.worker and self.worker.is_alive():
+            if not messagebox.askyesno(
+                    APP_TITLE,
+                    "正在注入插件。中途关窗不会回滚（已经写进去的文件会留着）。\n\n"
+                    "确定关闭吗？", parent=self):
+                return
         self.destroy()
 
 

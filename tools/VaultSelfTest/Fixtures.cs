@@ -8,18 +8,23 @@ namespace VaultSelfTest
     /// <summary>造测试用的小仓库素材：release JSON + 插件 zip。</summary>
     public static class Fixtures
     {
-        public const string PluginGuidText = "5e76bf50-cb8a-4a87-ad24-1912c746c6f0";
+        /// <summary>旧版插件的数据目录名（迁移逻辑要认它）。</summary>
+        public const string LegacyDataGuid = "5e76bf50-cb8a-4a87-ad24-1912c746c6f0";
 
+        /// <summary>插件 dll 文件名（跟着项目大名走）。</summary>
+        public const string DllName = "PlayniteVault.dll";
+
+        /// <summary>发布包顶层目录名 = extension.yaml 的 Id = 扩展数据目录名。</summary>
         public static string PluginFolder
         {
-            get { return "VaultDemo_" + PluginGuidText; }
+            get { return "Playnite-Vault"; }
         }
 
         /// <summary>和真实发布一致的 GitHub release JSON 形状。</summary>
         public static string GitHubReleaseJson(string version, string assetUrl, long assetSize,
             string assetName = null)
         {
-            assetName = assetName ?? ("VaultDemo-" + version + ".zip");
+            assetName = assetName ?? ("PlayniteVault-" + version + ".zip");
             return "{"
                  + "\"tag_name\":\"v" + version + "\","
                  + "\"name\":\"v" + version + "：自动更新 + 自动刷新远端库\","
@@ -43,15 +48,15 @@ namespace VaultSelfTest
                  + "\"name\":\"v" + version + "\","
                  + "\"body\":\"Gitee 侧说明\","
                  + "\"assets\":["
-                 + "{\"name\":\"VaultDemo-" + version + ".zip\",\"browser_download_url\":\"" + assetUrl
+                 + "{\"name\":\"PlayniteVault-" + version + ".zip\",\"browser_download_url\":\"" + assetUrl
                  + "\",\"size\":" + assetSize + "},"
-                 + "{\"name\":\"VaultDemo-" + version + ".zip.md5\",\"url\":\"" + assetUrl + ".md5\","
+                 + "{\"name\":\"PlayniteVault-" + version + ".zip.md5\",\"url\":\"" + assetUrl + ".md5\","
                  + "\"size\":32}"
                  + "]}";
         }
 
         /// <summary>
-        /// 一个结构正确的发布包：外层是 VaultDemo_&lt;guid&gt; 目录，
+        /// 一个结构正确的发布包：外层是 Playnite-Vault 目录，
         /// 里面有 dll / extension.yaml / icon.png / 中文名的使用说明，外加一段填充数据把体积撑起来
         /// （体积要够大，速度地板才可能被触发）。
         /// </summary>
@@ -60,13 +65,13 @@ namespace VaultSelfTest
             var stream = new MemoryStream();
             using (var zip = new ZipArchive(stream, ZipArchiveMode.Create, true))
             {
-                Add(zip, PluginFolder + "/VaultDemo.dll", DllBytes(version));
+                Add(zip, PluginFolder + "/" + DllName, DllBytes(version));
                 Add(zip, PluginFolder + "/extension.yaml", Encoding.UTF8.GetBytes(
-                    "Id: VaultDemo_" + PluginGuidText + "\n"
-                    + "Name: Vault Demo (NAS Library)\n"
+                    "Id: " + PluginFolder + "\n"
+                    + "Name: Playnite Vault\n"
                     + "Author: Yi0086\n"
                     + "Version: " + version + "\n"
-                    + "Module: VaultDemo.dll\n"
+                    + "Module: " + DllName + "\n"
                     + "Type: GameLibrary\n"
                     + "Icon: icon.png\n"));
                 Add(zip, PluginFolder + "/icon.png", new byte[] { 0x89, 0x50, 0x4E, 0x47, 1, 2, 3 });
@@ -90,7 +95,7 @@ namespace VaultSelfTest
             var body = new byte[4096];
             body[0] = (byte)'M';
             body[1] = (byte)'Z';
-            var tag = Encoding.ASCII.GetBytes("VaultDemo " + version);
+            var tag = Encoding.ASCII.GetBytes("PlayniteVault " + version);
             Array.Copy(tag, 0, body, 64, Math.Min(tag.Length, body.Length - 64));
             return body;
         }
@@ -121,7 +126,7 @@ namespace VaultSelfTest
             var stream = new MemoryStream();
             using (var zip = new ZipArchive(stream, ZipArchiveMode.Create, true))
             {
-                Add(zip, PluginFolder + "/VaultDemo.dll", dllBytes);
+                Add(zip, PluginFolder + "/PlayniteVault.dll", dllBytes);
                 Add(zip, PluginFolder + "/extension.yaml",
                     Encoding.UTF8.GetBytes("Version: " + version + "\n"));
             }

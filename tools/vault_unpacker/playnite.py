@@ -29,15 +29,33 @@ import sys
 import time
 from datetime import datetime, timezone
 
-PLUGIN_DIR_PREFIX = "VaultDemo_"
+# 插件大名（extension.yaml 的 Id）。它同时决定两个目录名：
+#   <Playnite>\Extensions\Playnite-Vault\        插件安装目录（发布包顶层文件夹名）
+#   <Playnite>\ExtensionsData\Playnite-Vault\    扩展数据目录（Playnite 直接拿 Id 当目录名）
+PLUGIN_ID = "Playnite-Vault"
+
 SETTINGS_NAME = "settings.json"
 LOCAL_INDEX_NAME = "local-index.json"
 CACHE_INDEX_NAME = "cache-index.json"
-DEFAULT_GUID = "5e76bf50-cb8a-4a87-ad24-1912c746c6f0"
+
+# 改名之前的命名。**只用来把老数据找出来迁移**，绝不能再拿它们当新目录名 ——
+# 老安装目录 VaultDemo_<guid>，老数据目录（Playnite 会把 Id 里的 <name>_<guid> 拆开）
+LEGACY_DATA_GUID = "5e76bf50-cb8a-4a87-ad24-1912c746c6f0"
+LEGACY_DIR_PREFIX = "VaultDemo_"
+LEGACY_DIR_NAMES = (LEGACY_DIR_PREFIX + LEGACY_DATA_GUID, LEGACY_DATA_GUID)
 
 # 记住上次用过的插件数据目录，方便重复使用
 _STATE_DIR = os.path.join(
     os.environ.get("APPDATA") or os.path.expanduser("~"), "VaultUnpacker")
+
+
+def state_dir():
+    """解包器自己的状态/备份目录（%APPDATA%\\VaultUnpacker）。
+
+    注意这和 config.json 是两回事：配置跟着 exe 走（便携），状态跟着用户走。
+    插件注入的旧版本备份也放这儿 —— 绝不放 Playnite 的 Extensions 目录里。
+    """
+    return _STATE_DIR
 
 
 class PlayniteError(Exception):
@@ -240,12 +258,25 @@ def _pids_of(exe_name):
     return pids
 
 
-def _running_playnite_exe():
-    """正在跑的 Playnite.exe 的完整路径（顺带能挖出便携版放在哪）。"""
-    pids = _pids_of("Playnite.exe")
-    if not pids:
-        return None
+# Playnite 的进程名**不止一个**，而且新版目录里根本没有 Playnite.exe：
+#   桌面版 Playnite.DesktopApp.exe / 全屏版 Playnite.FullscreenApp.exe
+#   管理员模式各加一个 .Admin 后缀；Playnite.exe 只是早期版本留下的启动器
+# 早先这里只认 "Playnite.exe"，于是「Playnite 正在运行」永远返回「没运行」——
+# 后果很实在：解包器会在 Playnite 开着的时候写 local-index.json，
+# 等 Playnite 退出把内存里的库落盘时，我们刚登记的条目就被整份覆盖掉。
+PLAYNITE_EXE_NAMES = (
+    "Playnite.DesktopApp.exe",
+    "Playnite.FullscreenApp.exe",
+    "Playnite.DesktopApp.Admin.exe",
+    "Playnite.FullscreenApp.Admin.exe",
+    "Playnite.exe",
+)
 
+
+def exe_path_of(pid):
+    """按 PID 拿进程完整路径。拿不到返回 None。"""
+    if not sys.platform.startswith("win"):
+        return None
     try:
         import ctypes
         from ctypes import wintypes
@@ -254,19 +285,61 @@ def _running_playnite_exe():
         k32.QueryFullProcessImageNameW.argtypes = [
             wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
             ctypes.POINTER(wintypes.DWORD)]
-        for pid in pids:
-            h = k32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
-            if not h:
-                continue
-            try:
-                buf = ctypes.create_unicode_buffer(1024)
-                n = wintypes.DWORD(1024)
-                if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
-                    return buf.value
-            finally:
-                k32.CloseHandle(h)
+        h = k32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not h:
+            return None
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            n = wintypes.DWORD(1024)
+            if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                return buf.value
+        finally:
+            k32.CloseHandle(h)
     except Exception:
         pass
+    return None
+
+
+def playnite_processes():
+    """正在跑的 Playnite 进程，按进程名去重。
+
+    返回 [{"pid": int, "name": str, "exe": str|None}, ...]；
+    **查不出来时返回 None**（调用方必须当成「不确定」，不能当成「没在跑」）。
+    """
+    if not sys.platform.startswith("win"):
+        return None
+
+    found, unknown = [], False
+    for name in PLAYNITE_EXE_NAMES:
+        pids = _pids_of(name)
+        if pids is None:
+            unknown = True
+            continue
+        for pid in pids:
+            found.append({"pid": pid, "name": name, "exe": exe_path_of(pid)})
+
+    if unknown and not found:
+        return None
+    return found
+
+
+def playnite_install_dirs_from_processes():
+    """从正在跑的 Playnite 进程反推安装目录（最准的一种定位）。"""
+    dirs = []
+    for proc in playnite_processes() or []:
+        exe = proc.get("exe")
+        if exe:
+            d = os.path.dirname(exe)
+            if d and d not in dirs:
+                dirs.append(d)
+    return dirs
+
+
+def _running_playnite_exe():
+    """正在跑的 Playnite 的完整路径（顺带能挖出便携版放在哪）。"""
+    dirs = playnite_install_dirs_from_processes()
+    if dirs:
+        return os.path.join(dirs[0], "Playnite.DesktopApp.exe")
     return None
 
 
@@ -376,9 +449,9 @@ def find_plugin_data_dir():
     """
     返回 (目录, 说明)。找不到就返回 (None, 原因)。
 
-    注意：Playnite 给扩展数据目录用的是**纯 GUID** 命名
-    （ExtensionsData\\5e76bf50-cb8a-4a87-ad24-1912c746c6f0），
-    所以最后一定要落到「按内容判定」上，光看名字会漏。
+    注意：Playnite 给扩展数据目录用的是插件 Id ——
+      v1.6.0 起是 Playnite-Vault，之前是 VaultDemo_<guid>（Playnite 会把名字拆掉只留 GUID）。
+    所以「先按已知名字命中、再按内容全量匹配」，两条路都要走。
     """
     tried = []
     for root in _candidate_roots():
@@ -386,22 +459,22 @@ def find_plugin_data_dir():
             continue
         tried.append(root)
 
-        # 1) 直接命中已知名字（VaultDemo_<GUID> / <GUID>）
-        for name in (PLUGIN_DIR_PREFIX + DEFAULT_GUID, DEFAULT_GUID):
+        # 1) 直接命中已知名字（Playnite-Vault / 旧命名）
+        for name in (PLUGIN_ID,) + LEGACY_DIR_NAMES:
             full = os.path.join(root, name)
             if _matches_plugin(full):
                 return full, "名字命中：%s" % full
 
         names = _dirs_in(root)
 
-        # 2) VaultDemo_ 前缀（老命名）
+        # 2) 旧前缀（VaultDemo_<guid> 之外，可能还有 VaultDemo_别的 的历史目录）
         for name in names:
-            if name.startswith(PLUGIN_DIR_PREFIX):
+            if name.startswith(LEGACY_DIR_PREFIX):
                 full = os.path.join(root, name)
                 if _matches_plugin(full):
                     return full, "名字命中：%s" % full
 
-        # 3) 全量内容匹配（Playnite 实际用的是纯 GUID）
+        # 3) 全量内容匹配
         for name in names:
             full = os.path.join(root, name)
             if _matches_plugin(full):
@@ -413,7 +486,7 @@ def find_plugin_data_dir():
 
     return None, ("没找到 Vault 插件的数据目录。\n"
                   "请在「Playnite 登记」里手动指定 —— 一般是\n"
-                  "  <Playnite 安装目录>\\ExtensionsData\\<GUID>\n"
+                  "  <Playnite 安装目录>\\ExtensionsData\\" + PLUGIN_ID + "\n"
                   "（Playnite 便携版整个文件夹在哪就填哪个盘/目录）\n"
                   "试过这些位置：\n  " + ("\n  ".join(tried) if tried else "(无)"))
 
@@ -587,10 +660,10 @@ def is_playnite_running():
     """
     if not sys.platform.startswith("win"):
         return None
-    pids = _pids_of("Playnite.exe")
-    if pids is None:
+    procs = playnite_processes()
+    if procs is None:
         return None
-    return bool(pids)
+    return bool(procs)
 
 
 def _state_file():

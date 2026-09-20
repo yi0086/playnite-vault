@@ -32,7 +32,7 @@ def build_test_repo(root):
         os.path.join(files_dir, "demo.exe"): (b"DEMO-EXE\x00" * 5120),                 # 45 KB
         os.path.join(files_dir, "readme.txt"): (
             "这是一个来自 NAS 的测试应用。\n"
-            "由 Playnite Vault Demo 插件下载到本地。\n"
+            "由 Playnite Playnite Vault 插件下载到本地。\n"
         ).encode("utf-8"),
         os.path.join(files_dir, "data", "assets.pak"): (b"PAK" * 700000),              # 2.1 MB
     }
@@ -61,7 +61,7 @@ def build_test_repo(root):
 
     index = {
         "Schema": 1,
-        "Name": "Vault Demo Repo",
+        "Name": "Playnite Vault Repo",
         "UpdatedAt": "2026-09-17T06:00:00Z",
         "Apps": [
             {

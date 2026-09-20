@@ -11,7 +11,7 @@ import os
 import sys
 import threading
 
-from . import config, core, playnite
+from . import config, core, inject, playnite
 
 
 class _CliReporter(core.Reporter):
@@ -64,6 +64,8 @@ def _apply_config(args):
         args.out = c.get("output_parent_dir") or ""
     if not args.plugin_dir:
         args.plugin_dir = c.get("plugin_data_dir") or None
+    if not args.playnite_dir:
+        args.playnite_dir = c.get("playnite_dir") or None
     return c
 
 
@@ -83,6 +85,87 @@ def _build_source(args):
         return core.HttpSource(args.base, args.user, args.password,
                                verify_tls=not args.insecure)
     return core.LocalSource(args.dir)
+
+
+def _run_inject(args, cfg):
+    """把插件注入 Playnite（命令行版）。返回退出码。
+
+    顺序是死的：**先让 Playnite 退出 → 再写文件 → 再拉起来**。
+    PlayniteVault.dll 被 Playnite 进程锁着，反过来做必然 Permission denied。
+    关闭走优雅方式（WM_CLOSE），不强杀。
+    """
+    rep = _CliReporter(args.quiet)
+    log = rep.log
+
+    root, note = inject.pick_root(args.playnite_dir)
+    if not root:
+        log("失败：" + note)
+        return 3
+    log("[定位] " + note)
+
+    # 记住这次用的目录，下次不用再 --playnite-dir
+    try:
+        if (cfg.get("playnite_dir") or "") != root:
+            cfg["playnite_dir"] = root
+            config.save(cfg)
+            log("[配置] 已记住 Playnite 目录：" + config.config_path())
+    except Exception as ex:
+        log("[配置] 记住目录失败（不影响注入）：%s" % ex)
+
+    exts = inject.extensions_dir_of(root)
+    info = inject.installed_info(exts)
+    log("[现状] " + ("已装版本 %s（%s）" % (info.get("version"), info["dir"])
+                     if info else "尚未安装 " + inject.PLUGIN_ID))
+
+    try:
+        # 1) 拿包
+        work = os.path.join(playnite.state_dir(), "plugin-download")
+        zip_path, pkgnote = inject.fetch_package(
+            work, args.plugin_source, args.plugin_source
+            if args.plugin_source in ("github", "gitee") else "auto", log)
+        log("[插件包] %s → %s" % (pkgnote, zip_path))
+
+        # 2) 记录注入前在跑哪个 exe，一会儿按原样拉起来
+        procs = playnite.playnite_processes()
+        target_exe = None
+        for p in procs or []:
+            if p.get("exe"):
+                target_exe = p["exe"]
+                break
+
+        if procs:
+            state, _ = inject.request_close(log)
+            if state == "timeout":
+                log("失败：Playnite 没有退出（可能开了「关闭到托盘」）。")
+                log("      请手动退出 Playnite 后重跑本命令 —— 本工具不会强杀它，")
+                log("      强杀会让 Playnite 丢掉还没落盘的库改动。")
+                return 4
+            if state == "unknown":
+                log("失败：查不出 Playnite 是否在运行，为安全起见不注入。")
+                return 4
+        elif procs == []:
+            log("[状态] 注入前 Playnite 没在运行")
+
+        # 3) 注入
+        staging = os.path.join(playnite.state_dir(), "plugin-staging")
+        res = inject.install_package(zip_path, exts, staging, log,
+                                     move_legacy=not args.keep_legacy)
+        log("[完成] 插件已装到 %s（版本 %s）" % (res["dir"], res["version"]))
+        if res["backup"]:
+            log("[完成] 旧版本备份：%s" % res["backup"])
+
+        # 4) 拉起来（原来在跑、且用户没要求别重启）
+        if procs and not args.no_restart:
+            inject.launch(target_exe, log)
+        elif procs:
+            log("[重启] 按要求没有重启。")
+        else:
+            log("[重启] 注入前它没在跑，没有替你启动。")
+        return 0
+
+    except inject.InjectError as ex:
+        log("失败：" + str(ex))
+        return 1
 
 
 def main(argv=None):
@@ -110,10 +193,25 @@ def main(argv=None):
     ap.add_argument("--register", action="store_true",
                     help="解包后登记到 Playnite 的 Vault 插件（需能定位插件数据目录）")
     ap.add_argument("--plugin-dir", default=None, help="手动指定插件数据目录")
+    # ---- 注入插件（和「解包」是两件独立的事，给了 --inject-plugin 就只干这一件）----
+    ap.add_argument("--inject-plugin", action="store_true",
+                    help="把 Playnite-Vault 插件装进 Playnite 的 Extensions 目录")
+    ap.add_argument("--playnite-dir", default=None,
+                    help="Playnite 安装目录（默认自动定位，也可写在配置里）")
+    ap.add_argument("--plugin-source", default="auto",
+                    choices=("bundled", "auto", "github", "gitee"),
+                    help="插件包来源：bundled = e xe 内置的；auto/github/gitee = 联网取最新")
+    ap.add_argument("--no-restart", action="store_true",
+                    help="注入前 Playnite 在跑的话，关掉它、注入，但不再拉起来")
+    ap.add_argument("--keep-legacy", action="store_true",
+                    help="不挪走改名前的旧目录 VaultDemo_*（默认会挪到备份）")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
     cfg = _apply_config(args)
+
+    if args.inject_plugin:
+        return _run_inject(args, cfg)
 
     if not args.base and not args.dir:
         ap.error("必须指定 --base 或 --dir（或在配置文件里填好 webdav_url / local_dir）")

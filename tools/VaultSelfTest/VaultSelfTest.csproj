@@ -38,8 +38,8 @@
     <Compile Include="Program.cs" />
     <Compile Include="MiniHttpServer.cs" />
     <Compile Include="Fixtures.cs" />
-    <Compile Include="..\..\src\VaultDemo\**\*.cs"
-             Exclude="..\..\src\VaultDemo\bin\**\*.cs;..\..\src\VaultDemo\obj\**\*.cs" />
+    <Compile Include="..\..\src\PlayniteVault\**\*.cs"
+             Exclude="..\..\src\PlayniteVault\bin\**\*.cs;..\..\src\PlayniteVault\obj\**\*.cs" />
   </ItemGroup>
 
   <ItemGroup>

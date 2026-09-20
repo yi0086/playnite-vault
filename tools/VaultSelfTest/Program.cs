@@ -4,8 +4,8 @@ using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Threading;
-using VaultDemo.Models;
-using VaultDemo.Services;
+using PlayniteVault.Models;
+using PlayniteVault.Services;
 
 namespace VaultSelfTest
 {
@@ -66,7 +66,7 @@ namespace VaultSelfTest
                  + "（编译期兜底 " + VaultUpdater.FallbackVersion + "）");
             Line("临时目录：" + root);
             Line("OEM 代码页：" + VaultUpdater.OemCodePage());
-            Line("系统代理：" + VaultDemo.Net.HttpFetch.DescribeSystemProxy());
+            Line("系统代理：" + PlayniteVault.Net.HttpFetch.DescribeSystemProxy());
 
             var settings = new VaultSettings();
             var updater = new VaultUpdater(dataPath, settings);
@@ -86,6 +86,7 @@ namespace VaultSelfTest
                 RunFingerprintTests();
                 RunApplyScriptTests(root, updater);
                 RunPendingStagedTests(root, updater, dataPath);
+                RunDataMigrationTests(root);
             }
             catch (Exception ex)
             {
@@ -215,8 +216,8 @@ namespace VaultSelfTest
             Check(SemVersion.IsNewer("1.5.0", "1.5.0-beta.1"), "正式版 > 预发布版");
             Check(!SemVersion.IsNewer("1.5.0-beta.1", "1.5.0"), "预发布版 < 正式版");
 
-            Check(SemVersion.NormalizeText("VaultDemo-1.5.0.zip") == "1.5.0",
-                "从素材名里也能抠出版本", SemVersion.NormalizeText("VaultDemo-1.5.0.zip"));
+            Check(SemVersion.NormalizeText("PlayniteVault-1.5.0.zip") == "1.5.0",
+                "从素材名里也能抠出版本", SemVersion.NormalizeText("PlayniteVault-1.5.0.zip"));
             Check(SemVersion.NormalizeText("v2.0.1") == "2.0.1", "规范化 v2.0.1 → 2.0.1");
             Check(SemVersion.NormalizeText("1.6") == "1.6.0", "1.6 补成 1.6.0");
             Check(SemVersion.NormalizeText("latest") == null, "解析不了返回 null");
@@ -232,23 +233,23 @@ namespace VaultSelfTest
             Group("release JSON 解析");
 
             var github = VaultUpdater.ParseGitHubRelease(
-                Fixtures.GitHubReleaseJson("1.5.0", "https://example/VaultDemo-1.5.0.zip", 12345));
+                Fixtures.GitHubReleaseJson("1.5.0", "https://example/PlayniteVault-1.5.0.zip", 12345));
             Check(github != null && github.Version == "1.5.0", "GitHub 解析出版本");
             Check(github != null && github.Assets.Count == 2, "两个附件都读到了",
                 github == null ? "" : github.Assets.Count.ToString());
 
             var pick = github == null ? null : github.PickPluginAsset();
-            Check(pick != null && pick.Name == "VaultDemo-1.5.0.zip",
+            Check(pick != null && pick.Name == "PlayniteVault-1.5.0.zip",
                 "挑出的是插件 zip，不是同一个 release 里的解包器 exe",
                 pick == null ? "(null)" : pick.Name);
             Check(pick != null && pick.Size == 12345, "附件体积读到了");
             Check(github != null && !string.IsNullOrEmpty(github.Notes), "更新说明读到了");
 
             var gitee = VaultUpdater.ParseGiteeRelease(
-                Fixtures.GiteeReleaseJson("1.6.0", "https://example/VaultDemo-1.6.0.zip", 999));
+                Fixtures.GiteeReleaseJson("1.6.0", "https://example/PlayniteVault-1.6.0.zip", 999));
             Check(gitee != null && gitee.Version == "1.6.0", "Gitee 解析出版本");
             var giteePick = gitee == null ? null : gitee.PickPluginAsset();
-            Check(giteePick != null && giteePick.DownloadUrl == "https://example/VaultDemo-1.6.0.zip",
+            Check(giteePick != null && giteePick.DownloadUrl == "https://example/PlayniteVault-1.6.0.zip",
                 "Gitee 的 browser_download_url 正确取用",
                 giteePick == null ? "(null)" : giteePick.DownloadUrl);
 
@@ -262,15 +263,15 @@ namespace VaultSelfTest
         {
             Group("zip 条目路径判定");
 
-            Check(VaultUpdater.IsSafeEntryName("VaultDemo_x/VaultDemo.dll"), "正常条目放行");
+            Check(VaultUpdater.IsSafeEntryName("Playnite-Vault/PlayniteVault.dll"), "正常条目放行");
             Check(!VaultUpdater.IsSafeEntryName("../evil.dll"), "../ 被拦");
             Check(!VaultUpdater.IsSafeEntryName("a/../../evil.dll"), "中途的 .. 也被拦");
             Check(!VaultUpdater.IsSafeEntryName("/etc/evil.dll"), "绝对路径被拦");
             Check(!VaultUpdater.IsSafeEntryName("C:/evil.dll"), "带盘符被拦");
-            Check(VaultUpdater.DepthOf("VaultDemo.dll") == 0, "DepthOf 顶层 = 0");
-            Check(VaultUpdater.DepthOf("VaultDemo_x/VaultDemo.dll") == 1, "DepthOf 一层 = 1");
+            Check(VaultUpdater.DepthOf("PlayniteVault.dll") == 0, "DepthOf 顶层 = 0");
+            Check(VaultUpdater.DepthOf("Playnite-Vault/PlayniteVault.dll") == 1, "DepthOf 一层 = 1");
             Check(VaultUpdater.DepthOf("a/b/c.dll") == 2, "DepthOf 两层 = 2");
-            Check(VaultUpdater.LeafName("VaultDemo_x/使用说明.txt") == "使用说明.txt", "LeafName 取最后一段");
+            Check(VaultUpdater.LeafName("Playnite-Vault/使用说明.txt") == "使用说明.txt", "LeafName 取最后一段");
         }
 
         // ---------- 4. 更新包校验 ----------
@@ -284,7 +285,7 @@ namespace VaultSelfTest
             var good = Fixtures.WriteFile(Path.Combine(dir, "good.zip"),
                 Fixtures.BuildPluginZip("9.9.9", 0));
             var staged = updater.Stage(good, "9.9.9");
-            Check(staged.Files.Contains("VaultDemo.dll") && staged.Files.Contains("extension.yaml")
+            Check(staged.Files.Contains("PlayniteVault.dll") && staged.Files.Contains("extension.yaml")
                   && staged.Files.Contains("使用说明.txt"),
                 "正常包装出 dll / extension.yaml / 中文名文件",
                 string.Join(",", staged.Files.ToArray()));
@@ -293,13 +294,13 @@ namespace VaultSelfTest
                 Fixtures.WriteFile(Path.Combine(dir, "evil.zip"),
                     Fixtures.BuildZip("9.9.9", "../../evil.dll", true, true)), "9.9.9");
 
-            ExpectReject("拒绝缺 VaultDemo.dll 的包", updater,
+            ExpectReject("拒绝缺 PlayniteVault.dll 的包", updater,
                 Fixtures.WriteFile(Path.Combine(dir, "nodll.zip"),
                     Fixtures.BuildZip("9.9.9", "keep.dll", false, true)), "9.9.9");
 
             ExpectReject("拒绝缺 extension.yaml 的包", updater,
                 Fixtures.WriteFile(Path.Combine(dir, "noyaml.zip"),
-                    Fixtures.BuildZip("9.9.9", "VaultDemo.dll", true, false)), "9.9.9");
+                    Fixtures.BuildZip("9.9.9", "PlayniteVault.dll", true, false)), "9.9.9");
 
             ExpectReject("拒绝包内版本 ≠ release 版本的包", updater,
                 Fixtures.WriteFile(Path.Combine(dir, "mismatch.zip"),
@@ -339,19 +340,19 @@ namespace VaultSelfTest
             var zip = Fixtures.BuildPluginZip("9.9.9", 140 * 1024);
             Line("  测试包体积：" + zip.Length + " 字节");
 
-            var urlGitHub = server.BaseUrl + "dl/github/VaultDemo-9.9.9.zip";
-            var urlGitee = server.BaseUrl + "dl/gitee/VaultDemo-9.9.9.zip";
-            var urlGitHubSlow = server.BaseUrl + "dl/github-slow/VaultDemo-9.9.9.zip";
-            var urlGiteeSlow = server.BaseUrl + "dl/gitee-slow/VaultDemo-9.9.9.zip";
+            var urlGitHub = server.BaseUrl + "dl/github/PlayniteVault-9.9.9.zip";
+            var urlGitee = server.BaseUrl + "dl/gitee/PlayniteVault-9.9.9.zip";
+            var urlGitHubSlow = server.BaseUrl + "dl/github-slow/PlayniteVault-9.9.9.zip";
+            var urlGiteeSlow = server.BaseUrl + "dl/gitee-slow/PlayniteVault-9.9.9.zip";
 
-            server.Set("dl/github/VaultDemo-9.9.9.zip",
+            server.Set("dl/github/PlayniteVault-9.9.9.zip",
                 new MockRoute { Body = zip, ContentType = "application/octet-stream" });
-            server.Set("dl/gitee/VaultDemo-9.9.9.zip",
+            server.Set("dl/gitee/PlayniteVault-9.9.9.zip",
                 new MockRoute { Body = zip, ContentType = "application/octet-stream" });
 
             // ~34 KB/s（4 KB / 120 ms）—— 明显低于 40 KB/s 的生产地板
-            server.Set("dl/github-slow/VaultDemo-9.9.9.zip", MockRoute.Throttled(zip, 4096, 120));
-            server.Set("dl/gitee-slow/VaultDemo-9.9.9.zip", MockRoute.Throttled(zip, 4096, 120));
+            server.Set("dl/github-slow/PlayniteVault-9.9.9.zip", MockRoute.Throttled(zip, 4096, 120));
+            server.Set("dl/gitee-slow/PlayniteVault-9.9.9.zip", MockRoute.Throttled(zip, 4096, 120));
 
             Environment.SetEnvironmentVariable("VAULT_UPDATE_TEST", "1");
             Environment.SetEnvironmentVariable("VAULT_UPDATE_GITHUB_LATEST",
@@ -377,14 +378,14 @@ namespace VaultSelfTest
                 Check(check.LatestVersion == "9.9.9", "最新版本号 = 9.9.9", check.LatestVersion);
                 Check(check.Candidates.Count == 2, "两个源都可用时给出 2 个候选",
                     check.Candidates.Count.ToString());
-                Check(check.Candidates.Count > 0 && check.Candidates[0].Asset.Name == "VaultDemo-9.9.9.zip",
+                Check(check.Candidates.Count > 0 && check.Candidates[0].Asset.Name == "PlayniteVault-9.9.9.zip",
                     "候选里选中的是插件 zip");
 
                 var staged = SafeDownload(updater, check, out string downloadError);
                 Check(staged != null && staged.Version == "9.9.9", "下载并暂存成功", downloadError);
                 if (staged != null)
                 {
-                    Check(File.Exists(Path.Combine(staged.StagingDir, "VaultDemo.dll")), "暂存目录里有 dll");
+                    Check(File.Exists(Path.Combine(staged.StagingDir, "PlayniteVault.dll")), "暂存目录里有 dll");
                     Check(File.Exists(Path.Combine(staged.StagingDir, "使用说明.txt")), "中文文件名也解出来了");
                     Check(File.Exists(staged.ZipPath), "下载下来的原始 zip 留在 update/ 里（便于回滚/诊断）");
                 }
@@ -410,9 +411,9 @@ namespace VaultSelfTest
                     check2.Candidates.Count > 0 ? check2.Candidates[0].Describe() : "(无候选)");
 
                 var staged2 = SafeDownload(updater, check2, out string switchError);
-                Check(server.HitCount("dl/github-slow/VaultDemo-9.9.9.zip") >= 1,
+                Check(server.HitCount("dl/github-slow/PlayniteVault-9.9.9.zip") >= 1,
                     "确实先试了慢的主源");
-                Check(server.HitCount("dl/gitee/VaultDemo-9.9.9.zip") >= 1,
+                Check(server.HitCount("dl/gitee/PlayniteVault-9.9.9.zip") >= 1,
                     "慢到地板以下后自动换了 Gitee");
                 Check(staged2 != null && staged2.Version == "9.9.9", "换源之后仍然装上了 9.9.9",
                     switchError);
@@ -429,8 +430,8 @@ namespace VaultSelfTest
                 Check(staged3 != null && staged3.Version == "9.9.9",
                     "所有源都低于地板时，用主源不限速仍然把包装完（慢 ≠ 装不上）",
                     floorError);
-                Check(server.HitCount("dl/gitee-slow/VaultDemo-9.9.9.zip") >= 1
-                      || server.HitCount("dl/github-slow/VaultDemo-9.9.9.zip") >= 2,
+                Check(server.HitCount("dl/gitee-slow/PlayniteVault-9.9.9.zip") >= 1
+                      || server.HitCount("dl/github-slow/PlayniteVault-9.9.9.zip") >= 2,
                     "兜底重试确实又打了一次下载接口");
 
                 // --- 快照 4：源不可达（连接被掐）→ 另一个源顶上
@@ -576,9 +577,9 @@ namespace VaultSelfTest
             Directory.CreateDirectory(dest);
             Directory.CreateDirectory(stage);
 
-            File.WriteAllText(Path.Combine(dest, "VaultDemo.dll"), "OLD", Encoding.UTF8);
+            File.WriteAllText(Path.Combine(dest, "PlayniteVault.dll"), "OLD", Encoding.UTF8);
             File.WriteAllText(Path.Combine(dest, "keep.txt"), "保留我", Encoding.UTF8);
-            File.WriteAllText(Path.Combine(stage, "VaultDemo.dll"), "NEW", Encoding.UTF8);
+            File.WriteAllText(Path.Combine(stage, "PlayniteVault.dll"), "NEW", Encoding.UTF8);
             File.WriteAllText(Path.Combine(stage, "extension.yaml"), "Version: 9.9.9\n", Encoding.UTF8);
             File.WriteAllText(Path.Combine(stage, "icon.png"), "PNG", Encoding.UTF8);
             File.WriteAllText(Path.Combine(stage, "使用说明.txt"), "说明", Encoding.UTF8);
@@ -636,9 +637,9 @@ namespace VaultSelfTest
             Check(VaultUpdater.RunApplyScript(scriptPath, out runError), "更新脚本能无窗口拉起来", runError);
 
             Thread.Sleep(2500);
-            Check(SafeRead(Path.Combine(dest, "VaultDemo.dll")) == "OLD",
+            Check(SafeRead(Path.Combine(dest, "PlayniteVault.dll")) == "OLD",
                 "Playnite 还开着的时候绝不动文件（不然覆盖必然失败）",
-                "当前内容 = " + SafeRead(Path.Combine(dest, "VaultDemo.dll")));
+                "当前内容 = " + SafeRead(Path.Combine(dest, "PlayniteVault.dll")));
 
             var marker = Path.Combine(e2e, "launcher-ran.txt");
             var deadline = DateTime.UtcNow.AddSeconds(60);
@@ -647,9 +648,9 @@ namespace VaultSelfTest
                 Thread.Sleep(250);
             }
 
-            Check(File.ReadAllText(Path.Combine(dest, "VaultDemo.dll")) == "NEW",
+            Check(File.ReadAllText(Path.Combine(dest, "PlayniteVault.dll")) == "NEW",
                 "进程退出后文件被替换成新版本",
-                SafeRead(Path.Combine(dest, "VaultDemo.dll")));
+                SafeRead(Path.Combine(dest, "PlayniteVault.dll")));
             Check(File.Exists(Path.Combine(dest, "extension.yaml")), "extension.yaml 也替换了");
             Check(SafeRead(Path.Combine(dest, "使用说明.txt")) == "说明",
                 "中文文件名在脚本里没乱码（OEM 编码 + chcp 生效）");
@@ -736,6 +737,79 @@ namespace VaultSelfTest
                 + reloaded.ConsecutiveRefreshFailures + " / "
                 + (reloaded.LastIndexCheckUtc.HasValue
                     ? reloaded.LastIndexCheckUtc.Value.ToString("o") : "(null)"));
+        }
+
+        // ---------- 9. 插件改名后的数据目录迁移 ----------
+
+        /// <summary>
+        /// v1.6.0 把 Id 从 VaultDemo_&lt;guid&gt; 改成 Playnite-Vault ——
+        /// Playnite 用 Id 当扩展数据目录名，所以老数据必须自己搬过来，
+        /// 否则用户要重新填 WebDAV 地址、本地库索引全丢。
+        /// 这里全用真目录真文件跑，别拿「应该会搬」当结论。
+        /// </summary>
+        private static void RunDataMigrationTests(string root)
+        {
+            Group("插件改名后的数据目录迁移");
+
+            var baseDir = Path.Combine(root, "migrate");
+            var extensionsData = Path.Combine(baseDir, "ExtensionsData");
+            var newDir = Path.Combine(extensionsData, "Playnite-Vault");
+            var legacyGuidDir = Path.Combine(extensionsData, VaultDataMigration.LegacyGuid);
+
+            // --- 场景 A：老目录是纯 GUID，新目录还没有 ---
+            Directory.CreateDirectory(legacyGuidDir);
+            File.WriteAllText(Path.Combine(legacyGuidDir, "settings.json"),
+                "{\"WebDavUrl\":\"http://nas/dav\"}", Encoding.UTF8);
+            File.WriteAllText(Path.Combine(legacyGuidDir, "local-index.json"),
+                "{\"Apps\":[]}", Encoding.UTF8);
+            File.WriteAllText(Path.Combine(legacyGuidDir, "state.json"), "{}", Encoding.UTF8);
+            // 这个不在迁移清单里，搬过去反而占地方
+            File.WriteAllText(Path.Combine(legacyGuidDir, "vault-demo.log"), "旧日志", Encoding.UTF8);
+
+            var moved = VaultDataMigration.MigrateIfNeeded(newDir);
+            Check(moved.Length == 3, "老数据目录（纯 GUID）里的 3 个文件都搬过来了",
+                "实际 " + moved.Length + "：" + string.Join(", ", moved));
+            Check(File.Exists(Path.Combine(newDir, "settings.json"))
+                  && File.Exists(Path.Combine(newDir, "local-index.json"))
+                  && File.Exists(Path.Combine(newDir, "state.json")),
+                "搬过来的文件在新目录里确实存在");
+            Check(SafeRead(Path.Combine(newDir, "settings.json")).Contains("http://nas/dav"),
+                "内容逐字节搬过来了，不是建了个空文件");
+            Check(!File.Exists(Path.Combine(newDir, "vault-demo.log")),
+                "不在清单里的文件（旧日志）不搬");
+            Check(File.Exists(Path.Combine(legacyGuidDir, "settings.json")),
+                "老目录原地保留（搬错了还能人工翻回去）");
+
+            // --- 场景 B：新目录已经有数据 → 绝不能被老数据盖回去 ---
+            File.WriteAllText(Path.Combine(newDir, "settings.json"),
+                "{\"WebDavUrl\":\"http://new-nas/dav\"}", Encoding.UTF8);
+            var again = VaultDataMigration.MigrateIfNeeded(newDir);
+            Check(again.Length == 0, "新目录已有数据时不再搬（返回 0 个文件）",
+                "实际 " + again.Length);
+            Check(SafeRead(Path.Combine(newDir, "settings.json")).Contains("http://new-nas/dav"),
+                "新目录里的设置没有被老数据覆盖");
+
+            // --- 场景 C：老目录叫 VaultDemo_<guid>（那种手工放过数据的机器）---
+            // 老目录必须是新目录的**兄弟**目录 —— 迁移就是在同级里找老名字。
+            var extensionsData2 = Path.Combine(baseDir, "ExtensionsData2");
+            var newDir2 = Path.Combine(extensionsData2, "Playnite-Vault");
+            var legacyNamedDir2 = Path.Combine(extensionsData2,
+                "VaultDemo_" + VaultDataMigration.LegacyGuid);
+            Directory.CreateDirectory(legacyNamedDir2);
+            File.WriteAllText(Path.Combine(legacyNamedDir2, "cache-index.json"),
+                "{\"Apps\":[1]}", Encoding.UTF8);
+            var moved2 = VaultDataMigration.MigrateIfNeeded(newDir2);
+            Check(moved2.Length == 1 && moved2[0] == "cache-index.json",
+                "老目录叫 VaultDemo_<guid> 时也认得出",
+                "实际 " + moved2.Length);
+
+            // --- 场景 D：什么都没有 / 路径离谱 → 静默返回，不能炸 ---
+            var newDir3 = Path.Combine(baseDir, "ExtensionsData3", "Playnite-Vault");
+            Check(VaultDataMigration.MigrateIfNeeded(newDir3).Length == 0,
+                "老目录不存在时安静地什么都不做（并且把新目录建出来）");
+            Check(Directory.Exists(newDir3), "顺手把新数据目录创建好");
+            Check(VaultDataMigration.MigrateIfNeeded(null).Length == 0, "传 null 不炸");
+            Check(VaultDataMigration.MigrateIfNeeded("").Length == 0, "传空串不炸");
         }
 
         // ---------- 工具 ----------

@@ -7,10 +7,10 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using Newtonsoft.Json;
-using VaultDemo.Models;
-using VaultDemo.Net;
-using VaultDemo.Services;
-using VaultDemo.Sync;
+using PlayniteVault.Models;
+using PlayniteVault.Net;
+using PlayniteVault.Services;
+using PlayniteVault.Sync;
 
 namespace VaultPack
 {
