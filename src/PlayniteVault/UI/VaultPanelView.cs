@@ -558,6 +558,11 @@ namespace PlayniteVault.UI
             browse.Click += (s, e) => OpenAdmin();
             quick.Children.Add(browse);
 
+            var saveManager = FlatButton("存档管理…", Pink);
+            saveManager.Margin = new Thickness(0, 0, 8, 8);
+            saveManager.Click += (s, e) => plugin.OpenSaveManager(null);
+            quick.Children.Add(saveManager);
+
             var check = FlatButton("检查插件更新", Orange);
             check.Margin = new Thickness(0, 0, 8, 8);
             check.Click += (s, e) => plugin.RunUpdateCheck(true);

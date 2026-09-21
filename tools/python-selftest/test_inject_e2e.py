@@ -87,8 +87,26 @@ target = os.path.join(fake_root, "Extensions", "Playnite-Vault")
 check(os.path.isfile(os.path.join(target, "PlayniteVault.dll")), "dll 已注入")
 check(os.path.isfile(os.path.join(target, "extension.yaml")), "extension.yaml 已注入")
 check(not os.path.isdir(legacy), "改名前的旧目录被挪走了")
+
+
+def repo_plugin_version():
+    """内置插件包该是哪个版本 —— 只认 extension.yaml 这一个来源。
+
+    以前这里写死 "1.6.0"，版本一升这条断言就必然红，而且红得毫无信息量
+    （分不清「注入坏了」还是「只是版本号变了」）。
+    """
+    yaml = os.path.join(ROOT, "src", "PlayniteVault", "extension.yaml")
+    with open(yaml, "r", encoding="utf-8-sig") as fh:
+        for raw in fh:
+            if raw.strip().lower().startswith("version:"):
+                return raw.split(":", 1)[1].strip()
+    return None
+
+
+WANT_VERSION = repo_plugin_version()
+print("  内置包应有版本：%s（取自 extension.yaml）" % WANT_VERSION)
 info = inject.installed_info(os.path.join(fake_root, "Extensions"))
-check(info and info["version"] == "1.6.0", "读回版本 1.6.0",
+check(info and info["version"] == WANT_VERSION, "读回的版本和 extension.yaml 一致",
       json.dumps(info, ensure_ascii=False))
 backups = []
 for root, _dirs, files in os.walk(os.environ["APPDATA"]):

@@ -114,6 +114,20 @@ Release 只认 token（SSH 推不了 release）。
 - **Playnite 的进程名不止一个**：`Playnite.DesktopApp.exe` / `Playnite.FullscreenApp.exe`
   （+ 各自的 `.Admin`）。老代码只认 `Playnite.exe` → 「在不在跑」永远判错，
   会在 Playnite 开着时写 `local-index.json` 然后被覆盖。见 `playnite.PLAYNITE_EXE_NAMES`。
+- **关窗口要连「不可见的主窗口」一起算**（v1.7.0 修）。Playnite 常驻托盘时主窗口
+  `IsWindowVisible` 就是 `false` —— 只挑可见窗口的话一个都挑不出来，用户看到的是
+  「已向 0 个窗口发出关闭请求 → 等满 60 秒 → 请手动退出 Playnite」，而其实给那个
+  隐藏主窗口发 `WM_CLOSE` 和点 × 完全等效。现在：可见窗口优先，**全部不可见时
+  退一步挑「标题非空且不是已知辅助窗口」的**（`_pick_close_targets`）。
+  辅助窗口清单（`GDI+ Window` / `Default IME` / `CiceroUIWndFrame` / `.NET-BroadcastEventWindow`…）
+  是照真机枚举出来的，不是猜的。
+- **等待期间要能重试补发**。Playnite 还在启动、窗口尚未建出时，第一轮枚举是空的；
+  那时若只发一次就干等，必然等满超时。现在 `request_close` 在等待循环里每秒重试一次，
+  找到窗口就补发。
+- **内置插件包必须按版本号挑，不能按文件名排序**（v1.7.0 修）。`sorted(os.listdir())`
+  取第一个 zip 是**字符串排序**：目录里 1.6.0 与 1.7.0 并存时会挑中**旧的**；
+  而且将来 `1.10.0` 会排在 `1.9.0` 前面。现在 `_payload_version_key` 按数字段比大小，
+  解析不出来的排最后（不会被选中）。
 
 ## 8. exe 打包的两条硬规矩
 
@@ -178,9 +192,13 @@ Release 只认 token（SSH 推不了 release）。
 
 | 工具 | 规模 | 说明 |
 |---|---|---|
-| `tools/VaultSelfTest/` | C# 160 项 | `TcpListener` 起本地假 GitHub/Gitee，**断言全实跑**，不联网、不碰真实仓库 |
-| `tools/python-selftest/` | Python 85 项 | `python tools/python-selftest/run_all.py`；GUI 那项需 tkinter，可设 `VAULT_TK_PYTHON` |
+| `tools/VaultSelfTest/` | C# 239 项 | `TcpListener` 起本地假 GitHub/Gitee，**断言全实跑**，不联网、不碰真实仓库 |
+| `tools/python-selftest/` | Python 109 项 | `python tools/python-selftest/run_all.py`；**设 `VAULT_TK_PYTHON` 指向带 tkinter 的解释器**，否则 GUI 与「真实 WM_CLOSE」两段会被跳过 |
 | `tools/fetch-playnite-themes.py --selftest` | Python 25 项 | 离线；专盯「认主题 / 定目录名 / 解包防穿越」那套判断 |
+
+`python-selftest` 四组：entry 27 / inject 42 / e2e 13 / gui 31。**e2e 那组会真的
+优雅关掉本机正在跑的 Playnite**（它的第 1 段走的就是 `--inject-plugin` 那条真路径，
+只是目标目录换成临时目录）—— 跑之前先确认自己没有在游戏里。
 
 自检的价值已被反复证明：换源/兜底重试两个 bug、数据迁移、exe 导入失败、主题目录名、
 zip 路径穿越都是它或同类检查抓出来的。**改动对应模块后先跑自检再谈别的。**
@@ -210,7 +228,44 @@ zip 路径穿越都是它或同类检查抓出来的。**改动对应模块后�
   侧边栏页直接 `new VaultAdminWindow` 就等于开后门 —— 自检 §11 有一条从 IL 里
   搜 `newobj` 令牌的断言盯着它，并且带**正对照**（同一个检测器能在插件里找到那句 new）。
 
-## 13. 环境坑（本机特有）
+## 13. 云存档（v1.7.0 起）
+
+设计契约单独写在 **`docs/cloud-save.md`**（九节：复刻对象 / 仓库布局 / 快照与分支 /
+保留策略 / 触发策略 / 路径来源与自适应 / 嗅探 / 接口入口 / 「绝不静默丢」红线）。
+**改这块之前先读它。** 这里只记代码里看不出来的事。
+
+- **Playnite 自带的云存档是「有骨架、没后端」**：桌面端里 `Game.SavePaths` 数据模型、
+  存档管理窗口、嗅探器都在，但**没有云存储 DLL，也没有 `CloudStorage` 目录**。
+  所以插件补的不是「接上同一个后端」，而是它缺的那层传输 —— 换成 NAS/WebDAV。
+- **`SavePath` 的实测成员**（反射验过，SDK 6.13）：`GameSaveType` / `Path` / `Title`
+  可写，`AutoAdaptive` 可写，**`Name` 只读**。别给 `Name` 赋值。
+- **`Playnite.SDK.AutoAdaptivePathHelper` 是空壳**：`GetRealPath` / `TransformPath1`
+  对 23 种写法（`{WinLocalAppData}`、`%LOCALAPPDATA%`…）**原样返回**，
+  `IsAdaptivePath` 恒为 `false`。也就是说**不存在一套「Playnite 的 token 契约」可供对齐**，
+  插件只能自持 token 表；`SavePathAdapter.FromPlaynite()` 负责把文档里那些写法搬到自己的表上。
+  **别**指望调那个 helper 拿「标准答案」，它不会给。
+- 路径来源是**两份合并**：Playnite 的 `Game.SavePaths` 优先，插件自己的 `save-paths.json`
+  补充，按 `Title` 归并（`VaultSaveService.MergedPaths()`）。写回时也分开写：
+  Playnite 来的行走 `api.Database.Games.Update`，插件来的行落 JSON。
+- 对象存储沿用 v3 那套**内容寻址**（`objects/xx/<sha1>`）：同一份内容在不同快照、
+  不同分支之间天然只存一份，不需要额外的去重表。
+- `manifest.json` 带 `Kind` 守卫：**不是本插件写的存档仓库就直接拒绝**，
+  免得把别人（或游戏自己的）manifest 当成存档索引去改。
+- 保留策略**按分支独立算**：pinned 永不删、最新一份必留、`0` = 无限。
+  任何删除都必须显式给 `AllowDelete`。
+- **绝不静默丢**：恢复前先备份；有冲突就落 `.conflict-*`；上传前还会把远端现状推一份
+  `before-restore` 快照兜底 —— 那份要用**另一个** `SaveSyncEngine` 实例跑，
+  否则上传期的计数器会串进恢复期的统计里。
+- 嗅探三层（常见位置 / 会话差分 / PCGamingWiki）+ 手动补充，**全部只产候选、绝不自动写入**。
+  会话差分靠 mtime+size 指纹加「向上爬」父目录来定改动范围。
+- PCGamingWiki 的 `{{p|...}}` 模板**必须按顶层 `|` 切**：路径里还有 `{{p|userprofile}}`
+  这种带内嵌竖线的写法，naive split 一定切错。
+- 命令行入口：`VaultPack saves --action list|branches|upload|download|delete|prune|sniff`；
+  `delete` / `prune` 必须给 `--allow-delete`。
+- 自检在 `RunSaveTests()`（路径自适应 / 同步引擎 / 嗅探三组），引擎全程对着
+  **内存版 WebDAV** 跑，不联网。
+
+## 14. 环境坑（本机特有）
 
 - **Bash 工具缺基础命令**：先 `export PATH="/usr/bin:/bin:/usr/local/bin:$PATH"`，
   否则 `ls` / `head` / `dirname` / `rm` 全报 command not found（`rm` 挂了还会连累整条命令 exit 127）。
@@ -232,3 +287,17 @@ zip 路径穿越都是它或同类检查抓出来的。**改动对应模块后�
   主题抓取脚本曾因此把每个请求都拖满 180s，一次下载卡了 12 分钟。
 - Windows 上 **`os.path.isabs("/x")` 返回 `False`**（ntpath 要求分隔符出现在索引 >0 处），
   所以防路径穿越不能只靠 `isabs`，要自己判前导 `/` 和盘符。
+- **Git Bash 里给 Windows 程序传路径要用 Windows 形式**：`python.exe /c/tmp/x.py`
+  会被解释成 `C:\c\tmp\x.py`（报「can't open file」）→ 写 `C:/tmp/x.py`。
+  同理，脚本里往 `/tmp/a.txt` 写的东西实际落在 **`C:\tmp\a.txt`**；找不到文件先看那儿。
+- **`taskkill //F //PID` 在 Git Bash 里会被参数转换搞坏**（报「无效参数/选项 - '//F'」，
+  而退出码还是 0，很容易以为杀掉了）→ 改用 PowerShell `Stop-Process -Id <pid> -Force`，
+  并用 `Get-NetTCPConnection -LocalPort <port>` 回验端口确实释放。
+- **`Popen(DETACHED_PROCESS)` 拉起的 GUI 进程，别在另一条命令里去查**：
+  启动它的那条命令一结束，它可能已经被回收 → 看起来像「启动了又立刻退出」。
+  把「启动 + sleep + 查进程」放进**同一条命令**里做。
+- **PowerShell 工具查进程的 stdout 也可能为空**（`Get-Process | Select` 什么都不回）
+  → 别把「没输出」当成「没进程」，用 `tasklist /FO CSV` 落文件再 grep。
+- **`.NET` 单文件 exe 的 `PlayniteDir` 默认是 `$(ProgramFiles)\Playnite`**，本机 Playnite
+  在 `D:\Game\Playnite` → 三个 csproj 编译都要显式给 `-p:PlayniteDir="D:\Game\Playnite"`
+  或设同名环境变量，否则 `VaultPack` 会 CS0246。

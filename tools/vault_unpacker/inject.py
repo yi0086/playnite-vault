@@ -191,19 +191,45 @@ def payload_dir():
     return d if os.path.isdir(d) else None
 
 
+def _payload_version_key(filename):
+    """从 `PlayniteVault-1.2.3.zip` 这类文件名抠出版本，返回**可排序**的元组。
+
+    为什么不能直接用文件名排序：那是字符串排序，`1.10.0` 会排在 `1.9.0` 前面，
+    于是升到 1.10 之后内置包反而会退回 1.9；目录里留着旧版本时
+    （比如 1.6.0 与 1.7.0 并存）也会挑中旧的。这里按数字段比大小。
+    解析不出来的给 `(-1,)`，永远排在能解析的后面（＝不被选中）。
+    """
+    stem = os.path.basename(filename or "")
+    if stem.lower().endswith(".zip"):
+        stem = stem[:-4]
+    if stem.startswith(PACKAGE_PREFIX):
+        stem = stem[len(PACKAGE_PREFIX):]
+    parts = []
+    for chunk in stem.split("."):
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        parts.append(int(digits))
+    return (tuple(parts), stem) if parts else ((-1,), stem)
+
+
 def bundled_package():
-    """内置插件包路径。没有就 None。"""
+    """内置插件包路径 —— 有多个时取**版本最高**的那个。没有就 None。"""
     d = payload_dir()
     if not d:
         return None
     try:
-        names = sorted(os.listdir(d))
+        names = [n for n in os.listdir(d) if n.lower().endswith(".zip")]
     except OSError:
         return None
-    for name in names:
-        if name.lower().endswith(".zip"):
-            return os.path.join(d, name)
-    return None
+    if not names:
+        return None
+    names.sort(key=_payload_version_key)
+    return os.path.join(d, names[-1])
 
 
 def _opener(use_system_proxy):
@@ -454,8 +480,36 @@ def install_package(zip_path, extensions_dir, staging_dir, log=None,
 # 关闭 / 重启 Playnite
 # --------------------------------------------------------------------------
 
-def _top_level_windows(pid):
-    """这个进程的可见顶层窗口句柄。关窗口要发给窗口，不是发给进程。"""
+# 进程会造一堆跟「退出」无关的辅助窗口，这些即使标题非空也不能当主窗口发 WM_CLOSE。
+# 真正的 WPF 主窗口类名是 HwndWrapper[...]，不在这里面。
+_HELPER_WINDOW_TITLE_PREFIXES = (
+    "GDI+ Window",
+    ".NET-BroadcastEventWindow",
+    "Default IME",
+    "MSCTFIME UI",
+    "CiceroUIWndFrame",
+    "SystemResourceNotifyWindow",
+    "MediaContextNotificationWindow",
+)
+
+
+def _is_helper_window(title):
+    """标题看着像辅助窗口（不是用户眼里的那个主窗口）吗？"""
+    t = (title or "").strip()
+    if not t:
+        return True
+    for prefix in _HELPER_WINDOW_TITLE_PREFIXES:
+        if t.startswith(prefix):
+            return True
+    return False
+
+
+def _enumerate_top_level_windows(pid):
+    """这个进程的全部顶层窗口 → [{"hwnd", "visible", "title"}]。
+
+    只枚举、不做取舍：取舍放在 _pick_close_targets 里，那部分是纯数据运算，
+    能离线自检（Win32 这层在测试环境里没法造）。查不出来返回 []。
+    """
     if not sys.platform.startswith("win"):
         return []
     try:
@@ -463,20 +517,49 @@ def _top_level_windows(pid):
         from ctypes import wintypes
 
         user32 = ctypes.WinDLL("user32", use_last_error=True)
-        handles = []
+        out = []
         proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
         def callback(hwnd, _lparam):
             wpid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
-            if wpid.value == pid and user32.IsWindowVisible(hwnd):
-                handles.append(hwnd)
+            if wpid.value != pid:
+                return True
+            n = user32.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            out.append({
+                "hwnd": hwnd,
+                "visible": bool(user32.IsWindowVisible(hwnd)),
+                "title": buf.value,
+            })
             return True
 
         user32.EnumWindows(proc(callback), 0)
-        return handles
+        return out
     except Exception:
         return []
+
+
+def _pick_close_targets(windows):
+    """从顶层窗口里挑出该发 WM_CLOSE 的句柄。
+
+    优先可见窗口 —— 正常情况就是这么拍的。但 Playnite 有个很常见的设置是
+    「最小化到托盘 / 关闭到托盘」：那时主窗口 `IsWindowVisible` 就是 False。
+    只认可见窗口的话一个都挑不出来，用户只会看到「请手动退出 Playnite」，
+    可明明给那个隐藏的主窗口发 WM_CLOSE 跟点右上角的 × 是同一回事，
+    完全能优雅退出。所以可见窗口一个都没有时，退一步：标题非空、
+    且不是已知辅助窗口的，都算候选。
+    """
+    visible = [w for w in windows if w.get("visible")]
+    if visible:
+        return [w["hwnd"] for w in visible]
+    return [w["hwnd"] for w in windows if not _is_helper_window(w.get("title"))]
+
+
+def _top_level_windows(pid):
+    """该给这个进程的哪些窗口发关闭消息。"""
+    return _pick_close_targets(_enumerate_top_level_windows(pid))
 
 
 def request_close(log=None, timeout=CLOSE_TIMEOUT):
@@ -508,15 +591,40 @@ def request_close(log=None, timeout=CLOSE_TIMEOUT):
         return "unknown", procs
 
     sent = 0
+    hidden_main = False
     for proc in procs:
-        for hwnd in _top_level_windows(proc["pid"]):
+        windows = _enumerate_top_level_windows(proc["pid"])
+        for hwnd in windows:
+            if not hwnd["visible"] and not _is_helper_window(hwnd["title"]):
+                hidden_main = True
+        for hwnd in _pick_close_targets(windows):
             user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
             sent += 1
+
     if log:
-        log("[关闭] 已向 %d 个窗口发出关闭请求，等它自己退…" % sent)
+        if sent:
+            log("[关闭] 已向 %d 个窗口发出关闭请求，等它自己退…" % sent)
+            if hidden_main:
+                log("[关闭] 注意：主窗口当前不可见（托盘模式），照样发了 WM_CLOSE —— "
+                    "这跟点 × 等效，不是强杀。")
+        else:
+            log("[关闭] 这个进程还没建出可关闭的窗口，等它自己退…")
 
     deadline = time.time() + max(5.0, timeout)
+    next_try = time.time() + 1.0
     while time.time() < deadline:
+        if sent == 0 and time.time() >= next_try:
+            # 一上来一个窗口都没找到（Playnite 可能正在启动、窗口还没建出来）。
+            # 不能在原地干等满超时 —— 隔一秒再找一次，找到了就补发。
+            for proc in procs:
+                for hwnd in _pick_close_targets(
+                        _enumerate_top_level_windows(proc["pid"])):
+                    user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                    sent += 1
+            if sent and log:
+                log("[关闭] 等到窗口建出来了，已补发关闭请求。")
+            next_try = time.time() + 1.0
+
         left = playnite.playnite_processes()
         if left is not None and not left:
             if log:
@@ -525,7 +633,8 @@ def request_close(log=None, timeout=CLOSE_TIMEOUT):
         time.sleep(0.5)
 
     if log:
-        log("[关闭] 等了 %.0f 秒还没退 —— 可能设了「关闭到托盘」或卡住了。" % timeout)
+        log("[关闭] 等了 %.0f 秒还没退 —— 可能卡住了，或者它压根不响应 WM_CLOSE。"
+            % timeout)
     return "timeout", procs
 
 

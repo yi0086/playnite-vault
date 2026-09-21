@@ -170,6 +170,82 @@ src = open(os.path.join(TOOLS, "vault_unpacker", "inject.py"),
 check("taskkill" not in src and "TerminateProcess" not in src,
       "源码里确实没有强杀（taskkill / TerminateProcess）")
 
+print("")
+print("== 挑关闭窗口：托盘模式下也要挑得出来 ==")
+# 这组是纯数据运算，不碰 Win32 —— 真实窗口在这层造不出来。
+H = inject._is_helper_window
+check(H("GDI+ Window (Playnite.DesktopApp.exe)"), "标题前缀是 GDI+ Window 的算辅助窗口")
+check(H("Default IME") and H("MSCTFIME UI") and H("CiceroUIWndFrame"),
+      "输入法/系统那几个辅助窗口都算辅助窗口")
+check(H(".NET-BroadcastEventWindow.4.0.0.0.3b1d6b0.0"), "带后缀的广播窗口也算辅助窗口")
+check(H("") and H("   "), "没有标题的窗口算辅助窗口")
+check(not H("Playnite"), "标题是 Playnite 的是主窗口，不算辅助窗口")
+
+P = inject._pick_close_targets
+check(P([{"hwnd": 1, "visible": True, "title": "Playnite"},
+         {"hwnd": 2, "visible": False, "title": "Playnite"}]) == [1],
+      "有可见窗口时只发给可见的那个（不给隐藏窗口发第二发）")
+tray = [{"hwnd": 7, "visible": False, "title": "Playnite"},
+        {"hwnd": 8, "visible": False, "title": "GDI+ Window (Playnite.DesktopApp.exe)"},
+        {"hwnd": 9, "visible": False, "title": ".NET-BroadcastEventWindow.4.0.0.0.3b1d6b0.0"},
+        {"hwnd": 10, "visible": False, "title": ""}]
+check(P(tray) == [7],
+      "全部窗口都不可见（托盘模式）时，挑出隐藏的主窗口 —— 修复前这里必然是空")
+check(P([{"hwnd": 8, "visible": False, "title": "Default IME"},
+         {"hwnd": 10, "visible": False, "title": ""}]) == [],
+      "一个主窗口都没有时宁可不发，也不乱给辅助窗口发 WM_CLOSE")
+check(P([]) == [], "窗口列表为空时返回空，不炸")
+
+# 真机对照：Playnite 此刻就在跑（而且是托盘/隐藏状态），拿它验一遍上面那条。
+live = playnite.playnite_processes() or []
+if live:
+    wins = inject._enumerate_top_level_windows(live[0]["pid"])
+    print("  Playnite 顶层窗口：" + json.dumps(
+        [{"visible": w["visible"], "title": w["title"]} for w in wins],
+        ensure_ascii=False))
+    check(len(wins) >= 1, "能枚举出正在运行的 Playnite 的顶层窗口")
+    if not [w for w in wins if w["visible"]]:
+        check(bool(inject._top_level_windows(live[0]["pid"])),
+              "真机上 Playnite 窗口全不可见，但照样挑出了关闭目标（就是这次修的 bug）")
+else:
+    print("  （Playnite 没在跑，跳过真机对照）")
+
+print("")
+print("== 内置插件包：多个版本并存时挑最新的 ==")
+K = inject._payload_version_key
+check(K("PlayniteVault-1.10.0.zip") > K("PlayniteVault-1.9.0.zip"),
+      "1.10.0 大于 1.9.0（按文件名排会反过来 —— 这就是这个 bug 的根）")
+check(K("PlayniteVault-1.7.0.zip") > K("PlayniteVault-1.6.0.zip"), "1.7.0 大于 1.6.0")
+check(K("一个说不上版本的包.zip") < K("PlayniteVault-0.0.1.zip"),
+      "版本解析不出来的排最后（不会被选中）")
+
+pd = os.path.join(tmp, "payload-dir")
+os.makedirs(pd, exist_ok=True)
+for n in ("PlayniteVault-1.6.0.zip", "PlayniteVault-1.9.0.zip",
+          "PlayniteVault-1.10.0.zip", "note.txt"):
+    with open(os.path.join(pd, n), "wb") as fh:
+        fh.write(b"")
+_saved_payload_dir = inject.payload_dir
+inject.payload_dir = lambda: pd
+try:
+    picked = os.path.basename(inject.bundled_package() or "")
+finally:
+    inject.payload_dir = _saved_payload_dir
+check(picked == "PlayniteVault-1.10.0.zip",
+      "1.6 / 1.9 / 1.10 并存时挑出 1.10.0", picked)
+check(inject.bundled_package() and
+      inject.bundled_package().lower().endswith(".zip"),
+      "非 zip 文件不会被当成插件包")
+
+real_payload = inject.bundled_package()
+if real_payload:
+    bar = os.path.dirname(real_payload)
+    present = [n for n in os.listdir(bar) if n.lower().endswith(".zip")]
+    best = sorted(present, key=K)[-1]
+    print("  仓库里的内置包：" + ", ".join(present) + "  → 选中 " + os.path.basename(real_payload))
+    check(os.path.basename(real_payload) == best,
+          "真机目录里并存两个 zip 时，选中的确实是版本最高的那个")
+
 shutil.rmtree(tmp, ignore_errors=True)
 print("")
 print("通过 %d 项，失败 %d 项" % (ok, fail))

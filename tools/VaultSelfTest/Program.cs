@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Text;
 using System.Threading;
@@ -89,6 +90,7 @@ namespace VaultSelfTest
                 RunPendingStagedTests(root, updater, dataPath);
                 RunDataMigrationTests(root);
                 RunThemeSyncTests(root);
+                RunSaveTests(root);
                 RunSidebarPanelTests();
             }
             catch (Exception ex)
@@ -958,6 +960,470 @@ namespace VaultSelfTest
 
                 Check(server.Deleted.Count == 0, "全部场景跑完，一次 DELETE 都没发过");
             }
+        }
+
+        /// <summary>
+        /// 云存档（v1.7.0）。三块一起验：
+        ///   · <b>路径自适应</b> —— 折叠/展开的往返、最长根优先、「写了占位符却当成普通路径」必须被拦；
+        ///   · <b>同步引擎</b> —— 上传/幂等/增量/分支/保留/恢复/留底/坏对象拒收，全在内存版 WebDAV 上真跑；
+        ///   · <b>嗅探</b> —— 启发式的打分与黑名单、会话差分「向上爬」的作用域、PCGamingWiki 的模板切参数。
+        /// 刻意不碰真实 NAS：这一组必须能离线跑。
+        /// </summary>
+        private static void RunSaveTests(string root)
+        {
+            Group("云存档 · 路径自适应");
+
+            var fakeGameDir = Path.Combine(root, "saves-adapter", "HollowKnight");
+            Directory.CreateDirectory(fakeGameDir);
+
+            var localAppData = SavePathAdapter.Expand(SavePathAdapter.LocalAppData, fakeGameDir);
+            Check(!string.IsNullOrEmpty(localAppData),
+                "本机能展开 {LocalAppData}（拿不到根的话下面几条都没意义）");
+
+            if (!string.IsNullOrEmpty(localAppData))
+            {
+                var absolute = Path.Combine(localAppData, "TeamCherry", "Hollow Knight");
+                var folded = SavePathAdapter.Collapse(absolute, fakeGameDir);
+                Check(folded == SavePathAdapter.LocalAppData + Path.DirectorySeparatorChar
+                       + "TeamCherry" + Path.DirectorySeparatorChar + "Hollow Knight",
+                    "绝对路径折成 {LocalAppData}\\... 形式", folded);
+
+                var back = SavePathAdapter.Expand(folded, fakeGameDir);
+                Check(string.Equals(back, absolute, StringComparison.OrdinalIgnoreCase),
+                    "折叠后再展开能回到原路径（往返一致）", back);
+                Check(SavePathAdapter.Collapse(folded, fakeGameDir) == folded,
+                    "折叠是幂等的（对已经带 token 的路径再折一次不变）");
+            }
+
+            // LocalLow 必须优先于 UserProfile：先命中最长的那个根
+            var profile = SavePathAdapter.Expand(SavePathAdapter.UserProfile, fakeGameDir);
+            if (!string.IsNullOrEmpty(profile))
+            {
+                var localLow = Path.Combine(profile, "AppData", "LocalLow", "Team Cherry", "HK");
+                var folded = SavePathAdapter.Collapse(localLow, fakeGameDir);
+                Check(folded.StartsWith(SavePathAdapter.LocalAppDataLow, StringComparison.OrdinalIgnoreCase),
+                    "LocalLow 下的路径折成 {LocalAppDataLow}，不会被 {UserProfile} 吞掉", folded);
+            }
+
+            Check(SavePathAdapter.Collapse(Path.Combine(fakeGameDir, "save"), fakeGameDir)
+                  == SavePathAdapter.GameDir + Path.DirectorySeparatorChar + "save",
+                "游戏安装目录内的路径折成 {GameDir}\\save");
+
+            // 这一条防的是「把 {{p|hkcu}} 当成目录名真建出来」：
+            // PCGamingWiki 没映射到的模板不是 {Xxx} 的形状，只查 TokenShape 会漏掉
+            var spec = new SavePathSpec
+            {
+                Title = "坏路径",
+                Type = SaveElementType.Directory,
+                Path = "{{p|hkcu}}\\Software\\SomeGame",
+                AutoAdaptive = true
+            };
+            List<string> unresolved;
+            var resolved = SavePathAdapter.Resolve(spec, fakeGameDir, out unresolved);
+            Check(resolved.Length == 0 && unresolved.Count > 0,
+                "没映射到的 {{p|...}} 模板被标成未解析，不会当成普通路径", resolved);
+            Check(SavePathAdapter.HasToken("{{p|hkcu}}\\Software"),
+                "HasToken() 认得出 {{p|...}} 这种形状");
+
+            var literalSpec = new SavePathSpec
+            {
+                Title = "没勾自适应却写了 token",
+                Type = SaveElementType.Directory,
+                Path = "{LocalAppData}\\Foo",
+                AutoAdaptive = false
+            };
+            resolved = SavePathAdapter.Resolve(literalSpec, fakeGameDir, out unresolved);
+            Check(resolved.Length == 0 && unresolved.Count > 0,
+                "写着 token 却没勾「自适应」→ 拒绝当普通路径用（否则会建出字面量目录）");
+
+            var wiki = SavePathAdapter.FromPcgamingWiki("{{p|userprofile}}\\Documents\\My Games\\HK");
+            var expectedWiki = SavePathAdapter.UserProfile + Path.DirectorySeparatorChar
+                               + "Documents" + Path.DirectorySeparatorChar + "My Games"
+                               + Path.DirectorySeparatorChar + "HK";
+            Check(wiki == expectedWiki, "PCGamingWiki 的 {{p|userprofile}} 翻成 {UserProfile}", wiki);
+
+            // ================================================================
+            Group("云存档 · 同步引擎（远端 = 内存版 WebDAV）");
+
+            using (var server = new MockWebDavServer())
+            {
+                var data = Path.Combine(root, "save-data");
+                var gameDir = Path.Combine(root, "save-game");
+                Directory.CreateDirectory(data);
+                Directory.CreateDirectory(gameDir);
+
+                var saveRoot = Path.Combine(root, "save-local", "Saves");
+                WriteLocal(Path.Combine(saveRoot, "slot1.sav"), "SLOT-ONE");
+                WriteLocal(Path.Combine(saveRoot, "slot2.sav"), "SLOT-TWO");
+                WriteLocal(Path.Combine(saveRoot, "sub", "meta.dat"), "META-A");
+
+                var specs = new List<SavePathSpec>
+                {
+                    new SavePathSpec
+                    {
+                        Title = "saves",
+                        Type = SaveElementType.Directory,
+                        Path = saveRoot,
+                        AutoAdaptive = false,
+                        Source = SaveSource.Plugin
+                    }
+                };
+
+                const string GameId = "11111111-2222-3333-4444-555555555555";
+                const string GameName = "Hollow Knight";
+
+                // ---- 1. 首次上传 ----
+                var engine = SaveEngine(server, data, "PC-A");
+                var manifest = SaveManifestFor(GameId, GameName, specs);
+                var o1 = engine.Upload(GameId, GameName, gameDir, manifest,
+                    new SaveSyncOptions { Origin = SaveSnapshotOrigin.Manual });
+
+                Check(o1.Ok, "首次上传成功", o1.Failure);
+                Check(o1.Counters.SnapshotsUploaded == 1 && o1.Counters.FilesUploaded == 3,
+                    "三个文件都传上去了", o1.Counters.Describe());
+                Check(server.Has("saves/" + GameId + "/manifest.json"), "写出了 manifest.json");
+                Check(server.Has("saves/" + GameId + "/snapshots/main/" + o1.SnapshotId + ".json"),
+                    "快照清单落在了 snapshots/main/ 下");
+                Check(server.Has("saves/index.json"), "写出了全局索引");
+                Check(server.GetText("saves/index.json").Contains(GameName),
+                    "索引里带上了游戏名");
+
+                var sha = SaveSyncEngine.Sha1Text("SLOT-ONE");
+                Check(server.Has("saves/" + GameId + "/objects/" + sha.Substring(0, 2) + "/" + sha),
+                    "内容按 sha1 寻址落到 objects/xx/ 下");
+                Check(server.GetText("saves/" + GameId + "/objects/" + sha.Substring(0, 2) + "/" + sha)
+                      == "SLOT-ONE", "对象内容与本地字节一致");
+
+                var snapshotJson = server.GetText("saves/" + GameId + "/snapshots/main/"
+                                                 + o1.SnapshotId + ".json");
+                Check(snapshotJson.Contains("slot1.sav") && snapshotJson.Contains("\"Sha1\""),
+                    "快照清单里记了相对路径与内容指纹");
+
+                // 路径定义（Paths）里带用户自己写的路径是合理的；要卡的是**文件条目**
+                // 一律用相对路径 —— 混进一个 C:\... 就会让这份快照在别的机器上用不了。
+                var loaded = engine.LoadSnapshot(GameId, SaveBranch.Default, o1.SnapshotId, true);
+                var filePaths = loaded == null
+                    ? new List<string>()
+                    : loaded.Files.Select(f => f.Path).ToList();
+                Check(loaded != null && filePaths.Count == 3
+                      && filePaths.All(p => !Path.IsPathRooted(p) && p.IndexOf(':') < 0
+                                            && !p.StartsWith("/", StringComparison.Ordinal)),
+                    "快照里每个文件都是相对路径（没有本机绝对路径，换台机器才用得了）",
+                    string.Join("；", filePaths.ToArray()));
+
+                // ---- 2. 幂等：内容没变不造新快照 ----
+                var m2 = engine.LoadManifest(GameId);
+                Check(m2 != null, "能从远端读回 manifest.json");
+                var o2 = engine.Upload(GameId, GameName, gameDir, m2, new SaveSyncOptions());
+                Check(o2.Ok && o2.Counters.SnapshotsUnchanged == 1
+                      && o2.Counters.SnapshotsUploaded == 0,
+                    "内容一致时不造新快照（免得刷出一堆空历史）", o2.Counters.Describe());
+
+                // ---- 3. 改一个文件：只传新内容，别的靠对象复用 ----
+                WriteLocal(Path.Combine(saveRoot, "slot1.sav"), "SLOT-ONE-V2");
+                var o3 = engine.Upload(GameId, GameName, gameDir, m2, new SaveSyncOptions());
+                Check(o3.Ok && o3.Counters.SnapshotsUploaded == 1,
+                    "改一个文件 → 造一份新快照", o3.Counters.Describe());
+                Check(o3.Counters.FilesUploaded == 1,
+                    "只上传了变化的那一个对象", o3.Counters.Describe());
+                Check(o3.Counters.ObjectsReused >= 2,
+                    "没变的两个对象被复用（内容寻址去重）", o3.Counters.Describe());
+
+                // ---- 4. 分支互不影响 ----
+                var m4 = engine.LoadManifest(GameId);
+                var o4 = engine.Upload(GameId, GameName, gameDir, m4,
+                    new SaveSyncOptions { Branch = "ng+", Comment = "二周目" });
+                Check(o4.Ok, "能在新分支上上传", o4.Failure);
+
+                var m4b = engine.LoadManifest(GameId);
+                Check(m4b.SnapshotsIn(SaveBranch.Default).Count == 2,
+                    "main 分支仍是两条快照，没被新分支挤掉",
+                    m4b.SnapshotsIn(SaveBranch.Default).Count.ToString());
+                Check(m4b.SnapshotsIn("ng+").Count == 1, "ng+ 分支有一条自己的快照");
+                Check(m4b.SnapshotsIn("ng+")[0].Comment == "二周目", "快照的注释也存下来了");
+
+                var ngEngine = SaveEngine(server, data, "PC-A");
+                var ngManifest = ngEngine.LoadManifest(GameId);
+                var o4c = ngEngine.Upload(GameId, GameName, gameDir, ngManifest, new SaveSyncOptions());
+                Check(o4c.Ok && o4c.Counters.SnapshotsUnchanged == 1,
+                    "幂等是按分支分别算的（ng+ 分支自己比自己的头）", o4c.Counters.Describe());
+
+                // ---- 5. 恢复：远端回到旧版，本地多出来的文件不许删 ----
+                WriteLocal(Path.Combine(saveRoot, "slot1.sav"), "SLOT-ONE-V3-本地乱改");
+                WriteLocal(Path.Combine(saveRoot, "extra-新文件.sav"), "本地多出来的");
+                WriteLocal(Path.Combine(saveRoot, "slot2.sav"), "SLOT-TWO-也被改了");
+
+                var m5 = engine.LoadManifest(GameId);
+                var o5 = engine.Download(GameId, GameName, gameDir, m5,
+                    new SaveSyncOptions { SnapshotId = o1.SnapshotId });
+                Check(o5.Ok, "恢复成功", o5.Failure);
+                Check(ReadLocal(Path.Combine(saveRoot, "slot1.sav")) == "SLOT-ONE",
+                    "slot1 回到快照里的内容（覆盖式恢复）");
+                Check(ReadLocal(Path.Combine(saveRoot, "slot2.sav")) == "SLOT-TWO",
+                    "slot2 也回到快照里的内容");
+                Check(File.Exists(Path.Combine(saveRoot, "extra-新文件.sav")),
+                    "本地多出来的文件没有被删掉（恢复只做加法）");
+                Check(o5.Counters.SafetyBackups >= 1,
+                    "恢复前留了底（本地这份）", o5.Counters.Describe());
+
+                var backupRoot = Path.Combine(data, "save-backup", GameId);
+                Check(Directory.Exists(backupRoot)
+                      && Directory.GetFiles(backupRoot, "*", SearchOption.AllDirectories).Length > 0,
+                    "本地留底目录里真有文件（不是只报了一句话）");
+
+                var m5b = engine.LoadManifest(GameId);
+                var beforeRestore = m5b.SnapshotsIn(SaveBranch.Default)
+                    .Count(s => s.Origin == SaveSnapshotOrigin.BeforeRestore);
+                Check(beforeRestore >= 1,
+                    "恢复前还往远端推了一份「恢复前」快照（第二层保险）", beforeRestore + " 份");
+
+                // ---- 6. 坏对象必须拒收，不能拿去覆盖存档 ----
+                var badSha = SaveSyncEngine.Sha1Text("SLOT-TWO");
+                server.SeedText("saves/" + GameId + "/objects/" + badSha.Substring(0, 2) + "/" + badSha,
+                    "被篡改成坏内容了");
+                WriteLocal(Path.Combine(saveRoot, "slot2.sav"), "恢复前先写上本地内容");
+
+                var badData = Path.Combine(root, "save-data-bad");
+                Directory.CreateDirectory(badData);
+                var badEngine = SaveEngine(server, badData, "PC-A");
+                var m6 = badEngine.LoadManifest(GameId);
+                var o6 = badEngine.Download(GameId, GameName, gameDir, m6,
+                    new SaveSyncOptions { SnapshotId = o1.SnapshotId, SnapshotBeforeRestore = false });
+                Check(o6.Ok && o6.Counters.FilesSkipped >= 1,
+                    "远端坏对象被跳过并计入跳过数", o6.Counters.Describe());
+                Check(ReadLocal(Path.Combine(saveRoot, "slot2.sav")) != "被篡改成坏内容了",
+                    "坏内容没有被写进存档（校验不过就不落盘）");
+
+                // ---- 7. dry-run 不写远端 ----
+                using (var dryServer = new MockWebDavServer())
+                {
+                    var dryEngine = SaveEngine(dryServer, data, "PC-A");
+                    var dryManifest = SaveManifestFor("dry-game", "Dry Game", specs);
+                    var o7 = dryEngine.Upload("dry-game", "Dry Game", gameDir, dryManifest,
+                        new SaveSyncOptions { DryRun = true });
+                    Check(o7.Ok && o7.DryRun && dryServer.AllFiles().Count == 0,
+                        "dry-run 一份快照都不写（也不漏报为真跑了）");
+                    Check(o7.Plan.Count > 0, "dry-run 会列出计划，让人知道将要发生什么");
+                }
+
+                // ---- 8. 保留策略：按分支算、标星不删、最新必留 ----
+                using (var keepServer = new MockWebDavServer())
+                {
+                    var keepEngine = SaveEngine(keepServer, Path.Combine(root, "save-data-keep"), "PC-K");
+                    var keepManifest = SaveManifestFor("keep-game", "Keep Game", specs);
+                    var keptIds = new List<string>();
+
+                    for (var i = 0; i < 5; i++)
+                    {
+                        WriteLocal(Path.Combine(saveRoot, "slot1.sav"), "V" + i);
+                        var outcome = keepEngine.Upload("keep-game", "Keep Game", gameDir,
+                            keepManifest, new SaveSyncOptions { Force = true, Pinned = i == 0 });
+                        keptIds.Add(outcome.SnapshotId);
+                    }
+
+                    Check(keepManifest.SnapshotsIn(SaveBranch.Default).Count == 5,
+                        "不带删除许可时：一份都不删（只是报告）",
+                        keepManifest.SnapshotsIn(SaveBranch.Default).Count.ToString());
+                    Check(keepServer.Deleted.Count == 0,
+                        "没开删除许可 → 一次 DELETE 都没发过");
+
+                    var pruned = keepEngine.Prune("keep-game", keepManifest,
+                        new SaveSyncOptions { KeepPerBranch = 2, AllowDelete = true });
+                    var remaining = keepManifest.SnapshotsIn(SaveBranch.Default);
+                    Check(pruned.Ok && remaining.Count == 3,
+                        "keep=2 时：最新的 2 份 + 1 份标星的 = 3 份",
+                        remaining.Count + " 份（"
+                        + string.Join("、", remaining.Select(s => s.Id).ToArray()) + "）");
+                    Check(remaining.Any(s => s.Id == keptIds[0]), "标星的那份不会被保留策略吃掉");
+                    Check(remaining.Any(s => s.Id == keptIds[4]), "最新的一份永远留着");
+                    Check(remaining.Count(s => s.Id == keptIds[1]) == 0,
+                        "中间那些没标星的旧快照被裁掉了");
+                    Check(keepServer.Deleted.Count > 0, "开了删除许可后才真发 DELETE");
+                    Check(keepServer.Has("saves/keep-game/snapshots/main/" + keptIds[0] + ".json"),
+                        "标星快照的文件在远端也还在");
+                }
+
+                // ---- 9. 远端清单不是本插件的 → 停下来 ----
+                using (var foreignServer = new MockWebDavServer())
+                {
+                    foreignServer.SeedText("saves/foreign-game/manifest.json",
+                        "{\"Kind\":\"someone-else\",\"Schema\":1,\"GameId\":\"foreign-game\"}");
+                    var foreignEngine = SaveEngine(foreignServer,
+                        Path.Combine(root, "save-data-foreign"), "PC-F");
+                    var refused = false;
+                    try
+                    {
+                        foreignEngine.LoadManifest("foreign-game");
+                    }
+                    catch (Exception ex)
+                    {
+                        refused = ex.Message.Contains("不是本插件的存档清单");
+                    }
+
+                    Check(refused, "远端 manifest.json 不是本插件的 → 拒绝当成存档仓库");
+                    Check(foreignServer.GetText("saves/foreign-game/manifest.json")
+                          .Contains("someone-else"), "拒绝之后远端清单原样未动");
+                }
+            }
+
+            // ================================================================
+            Group("云存档 · 嗅探");
+
+            var sniffRoot = Path.Combine(root, "sniff");
+            var sniffGame = Path.Combine(sniffRoot, "HollowKnight");
+            Directory.CreateDirectory(sniffGame);
+
+            // 像存档的：游戏目录下的 Saves
+            WriteLocal(Path.Combine(sniffGame, "Saves", "user1.dat"), "SAVE-DATA-0123456789");
+            // 不像存档的：缓存/日志目录必须在打分阶段就被黑名单拦掉
+            WriteLocal(Path.Combine(sniffGame, "Cache", "user1.dat"), "SAVE-DATA-0123456789");
+            WriteLocal(Path.Combine(sniffGame, "logs", "output_log.txt"), "log line");
+
+            var ctx = new SaveSniffContext
+            {
+                GameName = "Hollow Knight",
+                GameInstallDir = sniffGame,
+                Budget = TimeSpan.FromSeconds(5)
+            };
+
+            var found = SaveSniffer.Heuristic(ctx);
+            var saves = found.Find(c => SavePathAdapter.StartsWithRoot(c.AbsolutePath,
+                Path.Combine(sniffGame, "Saves")));
+            Check(saves != null, "游戏目录下的 Saves 被嗅探到",
+                string.Join("；", found.Select(c => c.AbsolutePath).ToArray()));
+            Check(found.Find(c => c.AbsolutePath.EndsWith("Cache", StringComparison.OrdinalIgnoreCase))
+                  == null, "Cache 目录被黑名单拦掉（不当作候选）");
+            Check(found.Find(c => c.AbsolutePath.EndsWith("logs", StringComparison.OrdinalIgnoreCase))
+                  == null, "logs 目录被黑名单拦掉");
+            Check(saves == null || saves.TokenPath.StartsWith(SavePathAdapter.GameDir,
+                      StringComparison.OrdinalIgnoreCase),
+                "游戏目录下的候选折成了 {GameDir}\\...（换台机器照样能用）",
+                saves == null ? "(没找到)" : saves.TokenPath);
+            Check(saves == null || saves.Reasons.Count > 0,
+                "候选带上了「为什么推荐它」的理由，不是光秃秃一个分数");
+            Check(saves == null || !saves.HasUnresolved, "候选里没有解析不了的占位符");
+
+            // 名字不像、也不含存档词的目录不该被推荐
+            WriteLocal(Path.Combine(sniffGame, "Textures", "a.dds"), "binary");
+            var textures = found.Find(c =>
+                c.AbsolutePath.EndsWith("Textures", StringComparison.OrdinalIgnoreCase));
+            Check(textures == null, "既不沾游戏名、又不含存档词的目录不推荐",
+                textures == null ? null : "分数 " + textures.Score);
+
+            // 会话差分
+            var watchRoot = Path.Combine(sniffRoot, "watch");
+            WriteLocal(Path.Combine(watchRoot, "GameA", "cfg.ini"), "before-config");
+            WriteLocal(Path.Combine(watchRoot, "GameA", "profile.dat"), "before-profile");
+            WriteLocal(Path.Combine(watchRoot, "Other", "untouched.dat"), "never-changed");
+            WriteLocal(Path.Combine(watchRoot, "GameA", "sub", "deeper.sav"), "before-deep");
+
+            var limits = new SaveSniffLimits { MaxDepth = 4, MaxEntries = 5000, MaxMilliseconds = 5000 };
+            var before = SaveSniffer.Capture(watchRoot, limits);
+
+            WriteLocal(Path.Combine(watchRoot, "GameA", "profile.dat"), "AFTER-profile-changed");
+            WriteLocal(Path.Combine(watchRoot, "GameA", "sub", "deeper.sav"), "AFTER-deep-changed");
+
+            var after = SaveSniffer.Capture(watchRoot, limits);
+            var diff = SaveSniffer.Diff(before, after, ctx);
+
+            Check(diff.Count >= 1, "会话差分至少给出一个候选",
+                string.Join("；", diff.Select(c => c.AbsolutePath).ToArray()));
+            Check(diff.Any(c => c.AbsolutePath.EndsWith("GameA", StringComparison.OrdinalIgnoreCase)),
+                "变了两个文件的 GameA 被判为作用域（向上爬的结果）",
+                string.Join("；", diff.Select(c => c.AbsolutePath).ToArray()));
+            Check(!diff.Any(c => c.AbsolutePath.Equals(watchRoot, StringComparison.OrdinalIgnoreCase)),
+                "没有爬到监听根：Other/ 没变，所以作用域停在 GameA");
+
+            var noChange = SaveSniffer.Diff(after, after, ctx);
+            Check(noChange.Count == 0, "什么都没变时一个候选都不给（不硬凑）");
+
+            Check(SaveSniffer.WatchRoots(sniffGame).Count > 0,
+                "会话差分有明确的监听根清单（不是整个盘）");
+
+            // 游戏名切词
+            var tokens = SaveSniffer.GameNameTokens(new SaveSniffContext
+            {
+                GameName = "Hollow Knight: Voidheart Edition"
+            });
+            Check(tokens.Contains("hollow") && tokens.Contains("knight"),
+                "游戏名切出了 hollow / knight", string.Join("、", tokens.ToArray()));
+            Check(!tokens.Contains("edition"),
+                "版本类噪声词（edition）被丢掉，免得把同名目录误判成存档");
+
+            // PCGamingWiki 解析：路径里的 {{p|...}} 自带竖线，切参数时不能被它带偏
+            const string wikitext = "{{Game data|\n"
+                + "{{Game data/saves|Windows|{{p|userprofile}}\\Documents\\My Games\\Hollow Knight}}\n"
+                + "{{Game data/saves|Linux|{{p|home}}/.config/unity3d/Team Cherry}}\n"
+                + "{{Game data/config|Windows|{{p|hkcu}}\\Software\\TeamCherry\\Hollow Knight}}\n"
+                + "{{Game data/saves|Microsoft Store|{{p|localappdata}}\\Packages\\HK\\Saves}}\n"
+                + "}}";
+
+            var wikiRows = SaveSniffer.EnumerateGameDataRows(wikitext).ToList();
+            Check(wikiRows.Count == 4, "四条 Game data 行都找出来了（含 config 与跨平台）",
+                wikiRows.Count.ToString());
+            Check(wikiRows.Any(r => r.Os == "Windows" && r.Kind.EndsWith("saves"))
+                  && wikiRows.First(r => r.Os == "Windows" && r.Kind.EndsWith("saves"))
+                      .RawPath.Contains("My Games"),
+                "Windows 那条的参数切对了（{{p|userprofile}} 里的竖线没把参数切坏）",
+                string.Join(" | ", wikiRows.Select(r => r.Kind + "=" + r.RawPath).ToArray()));
+
+            var wikiCandidates = SaveSniffer.FromPcgamingWiki(wikitext, ctx);
+            Check(wikiCandidates.Count == 2,
+                "只留下 Windows 能用的两条：saves + Microsoft Store（Linux 与注册表都跳过）",
+                string.Join("；", wikiCandidates.Select(c => c.TokenPath).ToArray()));
+            var wikiSaves = wikiCandidates.Find(c => c.TokenPath.Contains("My Games"));
+            Check(wikiSaves != null
+                  && wikiSaves.TokenPath.StartsWith(SavePathAdapter.UserProfile,
+                      StringComparison.OrdinalIgnoreCase),
+                "抓来的路径已经翻成我们的 token 形式",
+                wikiSaves == null ? "(没找到)" : wikiSaves.TokenPath);
+            Check(wikiSaves != null && wikiSaves.Source == SaveSniffSource.PcgamingWiki,
+                "候选带上了来源标签（用来说明「这条是抓来的」）");
+            Check(wikiCandidates.Find(c => c.TokenPath.Contains("hkcu") || c.TokenPath.Contains("{{"))
+                  == null, "HKcu 注册表位置与没映射的模板都不作为候选给出");
+
+            // 合并去重
+            var merged = PcgamingWikiClient.Merge(wikiCandidates, found);
+            Check(merged.Count > 0, "三档结果能合并成一个列表", merged.Count + " 条");
+            Check(merged.SequenceEqual(merged.OrderByDescending(c => c.Score)),
+                "合并后按分数降序（最能确定的排前面）");
+
+            // ================================================================
+            Group("云存档 · 默认值与结果对象");
+
+            Check(new SaveSyncOptions().KeepPerBranch == 10, "默认每个分支保留 10 份");
+            Check(new SaveSyncOptions().SafetyBackup, "恢复前留底默认是开的");
+            Check(new SaveSyncOptions().SnapshotBeforeRestore, "恢复前推快照默认也是开的");
+            Check(new SaveSyncOptions().AllowDelete == false, "默认不发 DELETE（要显式开）");
+
+            var failed = SaveSyncOutcome.Fail("远端连不上");
+            Check(!failed.Ok && failed.Describe().Contains("远端连不上"),
+                "失败结果保留了原因，不是只说一句「失败」");
+
+            var planned = new SaveSyncOutcome
+            {
+                Ok = true,
+                DryRun = true,
+                Counters = new SaveSyncCounters { SnapshotsUploaded = 2, BytesUp = 2048 }
+            };
+            Check(planned.Describe().Contains("预演"), "预演的结果会被显式标注");
+        }
+
+        /// <summary>造一个连内存版 WebDAV 的存档引擎（自检里别去碰真实 NAS）。</summary>
+        private static SaveSyncEngine SaveEngine(MockWebDavServer server, string dataPath,
+            string machine)
+        {
+            var client = new PlayniteVault.Net.WebDavClient(server.BaseUrl, null, null, 30);
+            return new SaveSyncEngine(client, dataPath, new SyncOptions { MaxRetries = 1 },
+                null, CancellationToken.None, machine);
+        }
+
+        private static SaveGameManifest SaveManifestFor(string gameId, string gameName,
+            List<SavePathSpec> specs)
+        {
+            var manifest = SaveGameManifest.NewFor(gameId, gameName);
+            manifest.Paths = specs.Select(s => s.GetCopy()).ToList();
+            return manifest;
         }
 
         private static ThemeSyncResult SyncThemes(MockWebDavServer server, string localRoot,

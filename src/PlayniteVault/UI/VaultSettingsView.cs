@@ -6,6 +6,7 @@ using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Media;
 using Playnite.SDK;
+using PlayniteVault.Models;
 using PlayniteVault.Net;
 using PlayniteVault.Services;
 
@@ -236,6 +237,79 @@ namespace PlayniteVault.UI
             set { editing.AutoRefreshOnStartup = value; OnPropertyChanged("AutoRefreshOnStartup"); }
         }
 
+        // ---------- 云存档 ----------
+
+        /// <summary>云存档总开关。</summary>
+        public bool SaveSyncEnabled
+        {
+            get { return editing.SaveSyncEnabled; }
+            set { editing.SaveSyncEnabled = value; OnPropertyChanged("SaveSyncEnabled"); }
+        }
+
+        /// <summary>
+        /// 触发方式的界面索引。选项顺序就是 <see cref="SaveTriggerMode"/> 的枚举值顺序，
+        /// 所以下标可以直接当枚举用 —— 这样「界面上第几个」与「存进去的值」
+        /// 只有一个对应关系，不会出现两边各写一份而默默错位的情况。
+        /// </summary>
+        public int SaveTriggerIndex
+        {
+            get
+            {
+                var value = (int)editing.SaveTrigger;
+                return value < 0 || value > 2 ? 0 : value;
+            }
+            set
+            {
+                var clamped = value < 0 ? 0 : (value > 2 ? 2 : value);
+                editing.SaveTrigger = (SaveTriggerMode)clamped;
+                OnPropertyChanged("SaveTriggerIndex");
+            }
+        }
+
+        /// <summary>每个分支最多留几份；0 = 无限。</summary>
+        public int SaveKeepPerBranch
+        {
+            get { return editing.SaveKeepPerBranch; }
+            set
+            {
+                editing.SaveKeepPerBranch = value < 0 ? 0 : value;
+                OnPropertyChanged("SaveKeepPerBranch");
+            }
+        }
+
+        public string SaveDefaultBranch
+        {
+            get { return editing.SaveDefaultBranch ?? "main"; }
+            set
+            {
+                var name = (value ?? string.Empty).Trim();
+                editing.SaveDefaultBranch = name.Length == 0 ? "main" : name;
+                OnPropertyChanged("SaveDefaultBranch");
+            }
+        }
+
+        public bool SaveBackupBeforeRestore
+        {
+            get { return editing.SaveBackupBeforeRestore; }
+            set { editing.SaveBackupBeforeRestore = value; OnPropertyChanged("SaveBackupBeforeRestore"); }
+        }
+
+        public int SaveKeepLocalBackups
+        {
+            get { return editing.SaveKeepLocalBackups; }
+            set
+            {
+                editing.SaveKeepLocalBackups = value < 0 ? 0 : value;
+                OnPropertyChanged("SaveKeepLocalBackups");
+            }
+        }
+
+        public bool SaveSessionSniff
+        {
+            get { return editing.SaveSessionSniff; }
+            set { editing.SaveSessionSniff = value; OnPropertyChanged("SaveSessionSniff"); }
+        }
+
         /// <summary>设置落盘之后触发，插件据此重新定时 / 重新校验。</summary>
         public event Action SettingsSaved;
 
@@ -345,6 +419,13 @@ namespace PlayniteVault.UI
             OnPropertyChanged("AutoRefreshEnabled");
             OnPropertyChanged("AutoRefreshMinutes");
             OnPropertyChanged("AutoRefreshOnStartup");
+            OnPropertyChanged("SaveSyncEnabled");
+            OnPropertyChanged("SaveTriggerIndex");
+            OnPropertyChanged("SaveKeepPerBranch");
+            OnPropertyChanged("SaveDefaultBranch");
+            OnPropertyChanged("SaveBackupBeforeRestore");
+            OnPropertyChanged("SaveKeepLocalBackups");
+            OnPropertyChanged("SaveSessionSniff");
         }
     }
 
@@ -552,6 +633,130 @@ namespace PlayniteVault.UI
             panel.Children.Add(refreshStatusText);
         }
 
+        // ---------- 云存档 ----------
+
+        private void BuildSaveSection(StackPanel panel)
+        {
+            panel.Children.Add(Section("云存档"));
+
+            panel.Children.Add(new TextBlock
+            {
+                Text = "把存档也存到 NAS 上（与游戏仓库共用同一个 WebDAV）。像每个游戏各自的存档目录"
+                     + "会被按内容去重后存成快照，换机器/回滚都能用。\n"
+                     + "路径定义先读 Playnite 自己那份，插件再叠加一份；两边靠「名字」对齐。",
+                TextWrapping = TextWrapping.Wrap,
+                Opacity = 0.6,
+                FontSize = 11,
+                Margin = new Thickness(0, 0, 0, 8)
+            });
+
+            var enableBox = new CheckBox
+            {
+                Content = "启用云存档（关闭后连菜单里的存档项也不出现）",
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            enableBox.SetBinding(CheckBox.IsCheckedProperty, Bind("SaveSyncEnabled"));
+            panel.Children.Add(enableBox);
+
+            var triggerBox = new ComboBox
+            {
+                Width = 380,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                ItemsSource = new[]
+                {
+                    "只在我点的时候（最安全，默认）",
+                    "游戏退出后自动上传一份",
+                    "退出后自动上传 + 启动前问一句要不要拉远端的"
+                }
+            };
+            triggerBox.SetBinding(ComboBox.SelectedIndexProperty, Bind("SaveTriggerIndex"));
+            panel.Children.Add(Field("什么时候自动动存档", triggerBox));
+            panel.Children.Add(new TextBlock
+            {
+                Text = "「启动前问一句」**不会静默覆盖**：它会先把当前本地存档留一份底"
+                     + "（本地 + 远端各一份），再按你的回答决定要不要拉。\n"
+                     + "自动上传只在内容真的变了才造快照 —— 内容没变就不产生新快照。",
+                TextWrapping = TextWrapping.Wrap,
+                Opacity = 0.6,
+                FontSize = 11,
+                Margin = new Thickness(0, -6, 0, 10)
+            });
+
+            panel.Children.Add(Field("默认分支名", BuildBranchBox()));
+            panel.Children.Add(NumberField("每个分支最多保留几份（0 = 无限）", "SaveKeepPerBranch",
+                "超出部分从最旧的开始删。**标星的快照永远不删**，每条分支至少留最新一份；\n"
+                + "删完会顺手回收没人引用到的文件内容（只在该游戏自己的目录里做）。\n"
+                + "没开删除许可的操作一次 DELETE 都不发。"));
+
+            var backupBox = new CheckBox
+            {
+                Content = "恢复前先把当前状态也推一份快照到远端（除了本地留底以外的第二层保险）",
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            backupBox.SetBinding(CheckBox.IsCheckedProperty, Bind("SaveBackupBeforeRestore"));
+            panel.Children.Add(backupBox);
+
+            panel.Children.Add(NumberField("本地「恢复前留底」最多留几份（0 = 不限）", "SaveKeepLocalBackups",
+                "远端连不上的时候，本地这份就是唯一的保险，所以留底这一步永远先做、且不受网络影响。"));
+
+            var sniffBox = new CheckBox
+            {
+                Content = "游戏运行时记一份目录指纹，退出后做「会话差分」找存档位置",
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            sniffBox.SetBinding(CheckBox.IsCheckedProperty, Bind("SaveSessionSniff"));
+            panel.Children.Add(sniffBox);
+            panel.Children.Add(new TextBlock
+            {
+                Text = "指纹只记「文件名 + 大小 + 修改时间」，不读内容，而且限深度/限文件数/限时间，"
+                     + "不会把游戏拖慢。差分出来的候选会存下来，等你打开存档管理时确认 —— "
+                     + "**嗅探从不自己写路径定义**。",
+                TextWrapping = TextWrapping.Wrap,
+                Opacity = 0.6,
+                FontSize = 11,
+                Margin = new Thickness(0, -6, 0, 10)
+            });
+
+            var openButton = new Button
+            {
+                Content = "打开存档管理",
+                Padding = new Thickness(14, 4, 14, 4),
+                HorizontalAlignment = HorizontalAlignment.Left
+            };
+            openButton.Click += (s, e) =>
+            {
+                var plugin = VaultPlugin.Instance;
+                if (plugin != null)
+                {
+                    plugin.OpenSaveManager(null);
+                }
+            };
+            panel.Children.Add(openButton);
+
+            panel.Children.Add(new TextBlock
+            {
+                Text = SavePathAdapter.Describe(),
+                TextWrapping = TextWrapping.Wrap,
+                Opacity = 0.55,
+                FontSize = 11,
+                Margin = new Thickness(0, 8, 0, 0)
+            });
+        }
+
+        /// <summary>默认分支名：可编辑下拉，常见分支给了几个现成的，也允许自己写。</summary>
+        private static ComboBox BuildBranchBox()
+        {
+            var combo = new ComboBox
+            {
+                Width = 200,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                IsEditable = true,
+                ItemsSource = new[] { "main", "ng+", "mod" }
+            };
+            combo.SetBinding(ComboBox.TextProperty, Bind("SaveDefaultBranch"));
+            return combo;
+        }
+
         private void Build()
         {
             var panel = new StackPanel { Margin = new Thickness(12) };
@@ -662,6 +867,7 @@ namespace PlayniteVault.UI
 
             BuildUpdateSection(panel);
             BuildAutoRefreshSection(panel);
+            BuildSaveSection(panel);
 
             panel.Children.Add(Section("仓库管理口令"));
             var adminHint = new TextBlock

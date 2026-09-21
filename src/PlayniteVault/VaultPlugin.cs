@@ -37,6 +37,8 @@ namespace PlayniteVault
         private readonly VaultSettingsViewModel settingsVm;
         private readonly VaultUpdater updater;
         private readonly LibraryAutoRefresh autoRefresh;
+        private readonly VaultSaveService saves;
+        private readonly SaveTriggers saveTriggers;
 
         /// <summary>正在进行的传输数（安装 / 归档 / 修复）。自动刷新要避开它们。</summary>
         private int transferCount;
@@ -59,6 +61,12 @@ namespace PlayniteVault
         public VaultUpdater Updater
         {
             get { return updater; }
+        }
+
+        /// <summary>存档服务（路径定义 / 清单 / 引擎）。界面与触发层都从这儿拿。</summary>
+        public VaultSaveService SaveService
+        {
+            get { return saves; }
         }
 
         public VaultPlugin(IPlayniteAPI api) : base(api)
@@ -86,6 +94,9 @@ namespace PlayniteVault
 
             autoRefresh = new LibraryAutoRefresh(service, ApplyRemoteIndex, DispatchToUi);
             autoRefresh.Completed += OnAutoRefreshCompleted;
+
+            saves = new VaultSaveService(service, api, dataPath);
+            saveTriggers = new SaveTriggers(this, saves, api);
 
             VaultLog.Info("VaultPlugin 已构造，数据目录=" + service.DataPath
                 + "，版本=" + VaultUpdater.CurrentVersion());
@@ -126,6 +137,29 @@ namespace PlayniteVault
 
         // ---------- 运行游戏时暂停自动刷新 ----------
 
+        /// <summary>
+        /// 游戏要启动了。这台机器上「录音指 / 问要不要拉远端存档」就发生在这时候 ——
+        /// 必须早于游戏开始写存档文件，否则指纹就没意义了。
+        /// </summary>
+        public override void OnGameStarting(OnGameStartingEventArgs args)
+        {
+            if (args == null || args.Game == null)
+            {
+                return;
+            }
+
+            try
+            {
+                var game = PlayniteApi.Database.Games.FirstOrDefault(g => g.Id == args.Game.Id);
+                saveTriggers.OnGameStarting(game ?? args.Game);
+            }
+            catch (Exception ex)
+            {
+                // 启动路径上一律不往外抛：插件的问题不该拦着用户玩游戏
+                VaultLog.Error("启动前的存档处理失败（已忽略）", ex);
+            }
+        }
+
         public override void OnGameStarted(OnGameStartedEventArgs args)
         {
             VaultLog.Info("游戏已启动" + (args == null || args.Game == null ? "" : "：" + args.Game.Name)
@@ -137,6 +171,21 @@ namespace PlayniteVault
         {
             VaultLog.Info("游戏已结束，自动刷新恢复");
             autoRefresh.SetGameRunning(false);
+
+            if (args == null || args.Game == null)
+            {
+                return;
+            }
+
+            try
+            {
+                var game = PlayniteApi.Database.Games.FirstOrDefault(g => g.Id == args.Game.Id);
+                saveTriggers.OnGameStopped(game ?? args.Game);
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Error("游戏退出后的存档处理失败（已忽略）", ex);
+            }
         }
 
         // ---------- 传输占用 ----------
@@ -640,6 +689,20 @@ namespace PlayniteVault
             items.Add(new GameMenuItem
             {
                 MenuSection = "Vault",
+                Description = "存档：上传到 NAS",
+                Action = a => UploadSaveNow(FirstGame(a))
+            });
+
+            items.Add(new GameMenuItem
+            {
+                MenuSection = "Vault",
+                Description = "存档：存档管理（路径 / 快照 / 分支）",
+                Action = a => OpenSaveManager(FirstGame(a))
+            });
+
+            items.Add(new GameMenuItem
+            {
+                MenuSection = "Vault",
                 Description = "管理仓库应用（删除，需管理口令）",
                 Action = a => OpenRepositoryManager()
             });
@@ -659,6 +722,162 @@ namespace PlayniteVault
             });
 
             return items;
+        }
+
+        // ---------- 云存档 ----------
+
+        /// <summary>
+        /// 从菜单参数里取出「那个游戏」，并**换成库里的实例**。
+        /// 菜单参数给的对象未必是库里那一份，拿它去 <c>Database.Games.Update</c>
+        /// 会写不进去（而且不报错，最难查的那种）。所以统一按 Id 回库取一次。
+        /// </summary>
+        private Game FirstGame(GameMenuItemActionArgs args)
+        {
+            if (args == null || args.Games == null || args.Games.Count == 0)
+            {
+                return null;
+            }
+
+            return ResolveGame(args.Games[0]);
+        }
+
+        private Game ResolveGame(Game game)
+        {
+            if (game == null || PlayniteApi.Database == null)
+            {
+                return game;
+            }
+
+            try
+            {
+                var fromDb = PlayniteApi.Database.Games.FirstOrDefault(g => g.Id == game.Id);
+                return fromDb ?? game;
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Warn("从库里取游戏失败，用菜单给的那份：" + ex.Message);
+                return game;
+            }
+        }
+
+        /// <summary>主菜单没有「选中项」参数，就用主视图当前选中的那个游戏当默认。</summary>
+        private Game SelectGuess()
+        {
+            try
+            {
+                var selected = PlayniteApi.MainView.SelectedGames;
+                if (selected != null)
+                {
+                    var first = selected.FirstOrDefault();
+                    if (first != null)
+                    {
+                        return first;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Warn("取当前选中的游戏失败：" + ex.Message);
+            }
+
+            return null;
+        }
+
+        /// <summary>打开存档管理窗口。<paramref name="game"/> 只是「预选哪个」，可以为空。</summary>
+        public void OpenSaveManager(Game game)
+        {
+            try
+            {
+                var window = new VaultSaveWindow(this, saves, PlayniteApi)
+                {
+                    Owner = System.Windows.Application.Current != null
+                        ? System.Windows.Application.Current.MainWindow
+                        : null
+                };
+
+                if (game != null)
+                {
+                    window.Preselect(game);
+                }
+
+                window.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Error("打开存档管理窗口失败", ex);
+                PlayniteApi.Dialogs.ShowErrorMessage("打开存档管理失败：" + ex.Message, "Playnite Vault");
+            }
+        }
+
+        /// <summary>
+        /// 右键菜单的「上传到 NAS」：一步到位，不开窗口。
+        /// 这是日常最常用的那个动作，所以它不该逼用户再点两下。
+        /// </summary>
+        public void UploadSaveNow(Game game)
+        {
+            game = ResolveGame(game);
+            if (game == null)
+            {
+                PlayniteApi.Dialogs.ShowErrorMessage("没拿到游戏，请从游戏的右键菜单里点。",
+                    "Playnite Vault");
+                return;
+            }
+
+            if (!saves.Settings.IsConfigured)
+            {
+                PlayniteApi.Dialogs.ShowErrorMessage("还没配置 NAS 地址，先去插件设置里填。",
+                    "Playnite Vault");
+                return;
+            }
+
+            using (BeginTransfer("存档上传"))
+            {
+                SaveSyncOutcome outcome = null;
+                List<string> notes = null;
+                try
+                {
+                    var engine = saves.CreateEngine(System.Threading.CancellationToken.None,
+                        new NullSaveReporter());
+                    var manifest = saves.GetManifest(engine, game, true, out notes);
+                    outcome = engine.Upload(game.Id.ToString(), game.Name, game.InstallDirectory,
+                        manifest, new SaveSyncOptions
+                        {
+                            Branch = string.IsNullOrWhiteSpace(saves.Settings.SaveDefaultBranch)
+                                ? SaveBranch.Default
+                                : saves.Settings.SaveDefaultBranch.Trim(),
+                            KeepPerBranch = saves.Settings.SaveKeepPerBranch,
+                            Origin = SaveSnapshotOrigin.Manual
+                        });
+                }
+                catch (Exception ex)
+                {
+                    VaultLog.Error("上传存档失败：" + game.Name, ex);
+                    PlayniteApi.Dialogs.ShowErrorMessage("上传存档失败：" + ex.Message, "Playnite Vault");
+                    return;
+                }
+
+                if (!outcome.Ok)
+                {
+                    PlayniteApi.Dialogs.ShowErrorMessage(
+                        "「" + game.Name + "」的存档没传上去：" + outcome.Failure, "Playnite Vault");
+                    return;
+                }
+
+                var text = outcome.Counters.SnapshotsUploaded > 0
+                    ? "已上传快照 " + outcome.SnapshotId + Environment.NewLine
+                      + outcome.Counters.Describe()
+                    : "存档内容与远端最新快照一致，没有造新快照。" + Environment.NewLine
+                      + "（当前远端最新：" + outcome.SnapshotId + "）";
+
+                if (notes != null && notes.Count > 0)
+                {
+                    text += Environment.NewLine + Environment.NewLine
+                            + "需要注意：" + Environment.NewLine + "· "
+                            + string.Join(Environment.NewLine + "· ", notes.ToArray());
+                }
+
+                PlayniteApi.Dialogs.ShowMessage(text, "Playnite Vault 云存档");
+            }
         }
 
         /// <summary>
@@ -1937,6 +2156,12 @@ namespace PlayniteVault
                     MenuSection = "@Vault",
                     Description = "从 NAS 同步主题（下载）",
                     Action = a => SyncThemes(ThemeSyncMode.Download)
+                },
+                new MainMenuItem
+                {
+                    MenuSection = "@Vault",
+                    Description = "存档管理（云存档）",
+                    Action = a => OpenSaveManager(SelectGuess())
                 },
                 new MainMenuItem
                 {

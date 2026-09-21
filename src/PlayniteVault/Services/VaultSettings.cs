@@ -1,4 +1,5 @@
 using System;
+using PlayniteVault.Models;
 
 namespace PlayniteVault.Services
 {
@@ -152,6 +153,32 @@ namespace PlayniteVault.Services
         /// <summary>启动后先刷新一次（30 秒延迟，等 Playnite 自己折腾完）。</summary>
         public bool AutoRefreshOnStartup { get; set; } = true;
 
+        // ---------- 云存档（v1.7.0） ----------
+
+        /// <summary>
+        /// 总开关。默认**开着**但触发方式是手动的 —— 功能看得见、菜单里有，
+        /// 但不会自己动你的存档。想自动上传得显式改下面那一项。
+        /// </summary>
+        public bool SaveSyncEnabled { get; set; } = true;
+
+        /// <summary>什么时候自动动存档。默认只在你点的时候动。</summary>
+        public SaveTriggerMode SaveTrigger { get; set; } = SaveTriggerMode.Manual;
+
+        /// <summary>每个分支最多留几份快照；<b>0 = 无限</b>。</summary>
+        public int SaveKeepPerBranch { get; set; } = 10;
+
+        /// <summary>默认分支名（新游戏的存档都往这条上推）。</summary>
+        public string SaveDefaultBranch { get; set; } = "main";
+
+        /// <summary>恢复前先把当前状态也推一份快照（第二层保险）。</summary>
+        public bool SaveBackupBeforeRestore { get; set; } = true;
+
+        /// <summary>本地「恢复前留底」最多留几份（每游戏），0 = 不限。</summary>
+        public int SaveKeepLocalBackups { get; set; } = 5;
+
+        /// <summary>游戏运行时录一份目录指纹，退出后做会话差分（给「还是不知道存档在哪」用）。</summary>
+        public bool SaveSessionSniff { get; set; } = true;
+
         public VaultSettings Clone()
         {
             return new VaultSettings
@@ -181,7 +208,14 @@ namespace PlayniteVault.Services
                 SkippedVersion = this.SkippedVersion,
                 AutoRefreshEnabled = this.AutoRefreshEnabled,
                 AutoRefreshMinutes = this.AutoRefreshMinutes,
-                AutoRefreshOnStartup = this.AutoRefreshOnStartup
+                AutoRefreshOnStartup = this.AutoRefreshOnStartup,
+                SaveSyncEnabled = this.SaveSyncEnabled,
+                SaveTrigger = this.SaveTrigger,
+                SaveKeepPerBranch = this.SaveKeepPerBranch,
+                SaveDefaultBranch = this.SaveDefaultBranch,
+                SaveBackupBeforeRestore = this.SaveBackupBeforeRestore,
+                SaveKeepLocalBackups = this.SaveKeepLocalBackups,
+                SaveSessionSniff = this.SaveSessionSniff
             };
         }
 

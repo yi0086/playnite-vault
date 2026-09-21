@@ -233,7 +233,7 @@ namespace PlayniteVault.Services
         // ---------- 当前版本 ----------
 
         /// <summary>编译期兜底版本，extension.yaml 读不到时用它。</summary>
-        public const string FallbackVersion = "1.6.0";
+        public const string FallbackVersion = "1.7.0";
 
         /// <summary>
         /// 当前插件版本。**以 extension.yaml 为准** —— Playnite 也是读这个文件，

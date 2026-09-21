@@ -9,6 +9,46 @@ upload it, and install it back on any machine with metadata included.
 
 ---
 
+## v1.7.0 改了什么
+
+这一版补的是**云存档**。
+
+Playnite 自己内置了云存档的**界面和数据模型** —— 游戏编辑里的「存档」栏、存档管理窗口、
+自动嗅探器都有，但**没有云存储实现**：桌面端里既没有云存储 DLL，也没有 `CloudStorage` 目录，
+等于有骨架没后端。这一版把缺的那层传输补上：**存档存进 NAS**。
+
+| 新能力 | 怎么做的 |
+|---|---|
+| **存档进 NAS，按快照 + 分支管理** | 快照就是一次「当时是什么样」；分支给「多周目 / 多存档线」各开一条，保留份数各算各的 |
+| **路径两份合并，Playnite 优先** | 读 `Game.SavePaths`，再合上插件自己的补充表，按游戏标题归并（写回时也分开写回去） |
+| **三档自动嗅探 + 手动补充** | 常见位置启发式 / 本次游戏会话差分（mtime+size 指纹 + 向上爬父目录）/ PCGamingWiki 页面解析；**全部只列候选，绝不自动写入** |
+| **触发时机可选（设置里切）** | 手动 / 停止游戏后自动上传 / 停止后上传＋启动时问要不要拉新 |
+| **保留策略按分支独立** | 每个分支最多留几份（`0` = 无限）、固定过的永不删、最新一份必留 |
+| **绝不静默丢东西** | 恢复是「先备份、再覆盖」；冲突落 `.conflict-*`；上传前先把远端现状推一份兜底快照；删除必须显式确认 |
+| **内容寻址存储** | 沿用 v3 那套 `objects/xx/<sha1>`：同一份内容跳快照、跳分支只存一份 |
+| **命令行同样能用** | `VaultPack saves --action list\|branches\|upload\|download\|sniff`；`delete` / `prune` 必须额外给 `--allow-delete` |
+
+有个实测结论值得记下来：Playnite SDK 里的 `AutoAdaptivePathHelper` 在这一版（6.13）
+是个**恒等函数** —— `{WinLocalAppData}`、`%LOCALAPPDATA%` 等 20 多种写法一律原样返回，
+`IsAdaptivePath` 恒为 `false`。也就是说没有一套官方 token 契约可供对齐，
+插件自持一张表，并在读取时把文档里那些写法翻过来。
+
+设计契约单独写在 [`docs/cloud-save.md`](docs/cloud-save.md)，用户手册见
+[`docs/plugin-usage.md` 第 12 节](docs/plugin-usage.md)。
+
+顺带修掉了解包器两个真 bug（都是被自检逼出来的）：
+
+1. **托盘状态下的 Playnite 关不掉** —— 原来只给「可见」窗口发 `WM_CLOSE`，
+   而托盘/隐藏时主窗口 `IsWindowVisible` 就是 `false` → 「0 个窗口 → 等满 60 秒 →
+   请你手动退出」。现在可见优先，全不可见时退一步挑隐藏的主窗口，并在等待期间重试补发。
+2. **内置插件包按文件名排序取第一个** —— 1.6.0 与 1.7.0 并存时会挑中**旧的**；
+   而且将来 `1.10.0` 会被排在 `1.9.0` 前面。改成按版本号比大小。
+
+自检规模：C# **239 项**、Python 侧 **109 项**（entry 27 / inject 42 / e2e 13 / gui 31）、
+主题抓取 25 项，三套退出码都要 0。
+
+---
+
 ## v1.5.0 改了什么
 
 这一版全是「让它自己转起来」：插件会自己升级，库会自己跟 NAS 对齐。
@@ -90,8 +130,8 @@ Vault 的做法是把 NAS 当成一个**自建的软件仓库**：
 | `tools/`（Python 部分） | 独立解包器：tkinter 图形界面 + 命令行，可打包成免 Python 环境的单文件 exe；解完可选登记回 Playnite；**还能把插件本身注入进 Playnite 并优雅重启它** | Python 3（标准库 + tkinter） |
 | `tools/webdav_mock.py` | 极简本地 WebDAV 服务，用来离线跑端到端验证 | Python 3 |
 | `tools/e2e-v3-test.py` | v3 端到端验证：造测试目录 → 打包上传 → 查仓库结构 → 解包还原 → 逐字节比对 → 中断续传 | Python 3 |
-| `tools/VaultSelfTest/` | **v1.6.0 自检**：本地假 GitHub / 假 Gitee，把自动更新与自动刷新整条链路真跑一遍，外加插件改名后的数据目录迁移（101 项断言） | C# / .NET Framework 4.6.2 |
-| `tools/python-selftest/` | **Python 侧自检**：注入插件 / 真实 WM_CLOSE 优雅关闭 / GUI 真建窗口（69 项断言），`python tools/python-selftest/run_all.py` 一把跑完 | Python 3 |
+| `tools/VaultSelfTest/` | **v1.7.0 自检**：本地假 GitHub / 假 Gitee，把自动更新与自动刷新整条链路真跑一遍，外加改名迁移、主题同步、云存档引擎与嗅探（**239 项断言**） | C# / .NET Framework 4.6.2 |
+| `tools/python-selftest/` | **Python 侧自检**：注入插件 / 真实 WM_CLOSE 优雅关闭 / GUI 真建窗口（**109 项断言**），`python tools/python-selftest/run_all.py` 一把跑完（设 `VAULT_TK_PYTHON` 指向带 tkinter 的解释器，GUI 与「真实关闭」两段才会跑） | Python 3 |
 | `tools/speedtest.py` | WebDAV 吞吐排查：把「链路 / 服务端 / 客户端」三层分开量 | Python 3 |
 
 ---

@@ -160,6 +160,7 @@ namespace VaultPack
                     case "rm": return CmdRemove(options);
                     case "dump": return CmdDump(options);
                     case "themes-sync": return CmdThemesSync(options);
+                    case "saves": return CmdSaves(options);
                     default:
                         Console.Error.WriteLine("未知命令：" + command);
                         Usage();
@@ -209,12 +210,24 @@ namespace VaultPack
   VaultPack dump    [--db <games.db>] [--filter <关键字>] [--out <文件>]
   VaultPack themes-sync [--dir <Themes目录>] [--mode up|down|both] [--dry-run] [--force]
                     [--state <json>] [--settings <json>] [--data <dir>]
+  VaultPack saves   [--action list|upload|download|delete|branches|prune|sniff]
+                    --game <游戏Id> [--name <显示名>] [--install <安装目录>]
+                    [--path '标题={LocalAppData}\游戏\存档[;标题2=路径2…]']
+                    [--branch <分支>] [--snapshot <快照Id>] [--keep <n>]
+                    [--dry-run] [--force] [--allow-delete] [--pin] [--comment <说明>]
+                    [--settings <json>] [--data <dir>]
 
 说明:
   themes-sync 把 Playnite 的 Themes 目录同步到仓库的 themes/ 下（纯文件镜像，
               结构与本地同构）。--mode up 只上传（默认，备份方向）、down 只下载、
               both 双向。远端只增不减：本地删掉的主题不会连带删掉远端那份。
               建议先跑一次 --dry-run 看清楚要动什么。
+  saves       云存档。与插件界面共用同一个引擎（SaveSyncEngine），所以两边行为一致。
+              upload 需要 --path + --install；download/delete/prune 需要 --game。
+              路径里写 {LocalAppData}、{GameDir} 这类占位符会自动按「自适应」处理。
+              delete 与 prune **必须显式加 --allow-delete** 才真发 DELETE。
+              sniff 只把候选打出来，不写任何东西（要采用就自己写进 --path）。
+              文件型存档在路径前加 file: 前缀（默认按目录处理）。
   meta        从 Playnite 库里抓元数据（开发商/类型/标签/评分/封面…）写成
               可直接喂给 pack --meta 的 JSON；GUID 会自动解析成名称。
               库文件被 Playnite 占用时也能用（走共享读复制）。
@@ -1646,6 +1659,521 @@ namespace VaultPack
             Console.WriteLine("[结果] " + result.Counters.Describe());
             Console.WriteLine("[状态] " + statePath);
             return 0;
+        }
+
+        // ==================================================================
+        //  云存档
+        // ==================================================================
+
+        /// <summary>
+        /// <c>VaultPack saves …</c>。引擎本身不认识 Playnite，所以这里能直接把
+        /// 「路径定义 + 游戏目录」喂进去 —— 与插件界面走的是同一条生产代码路径。
+        /// </summary>
+        private static int CmdSaves(OptionSet options)
+        {
+            var action = (options.Get("action", "list") ?? "list").Trim().ToLowerInvariant();
+            var service = CreateService(options);
+            var client = service.CreateClient();
+            var dataPath = options.Get("data",
+                Path.Combine(Path.GetDirectoryName(DefaultSettingsPath()), "saves"));
+
+            var engine = new SaveSyncEngine(client, dataPath, service.BuildSyncOptions(false),
+                new ConsoleSaveReporter(), CancellationToken.None);
+
+            var gameId = options.Get("game");
+            var branch = options.Get("branch", SaveBranch.Default);
+
+            Console.WriteLine("[仓库地址] " + service.Settings.WebDavUrl);
+            Console.WriteLine("[动作]     " + action);
+            if (!string.IsNullOrWhiteSpace(gameId))
+            {
+                Console.WriteLine("[游戏]     " + gameId + "　分支 " + branch);
+            }
+            Console.WriteLine();
+
+            switch (action)
+            {
+                case "list":
+                    return SaveList(engine, gameId);
+
+                case "branches":
+                    return SaveBranches(engine, options, gameId);
+
+                case "upload":
+                    return SaveUpload(engine, options, gameId, branch);
+
+                case "download":
+                    return SaveDownload(engine, options, gameId, branch);
+
+                case "delete":
+                    return SaveDelete(engine, options, gameId, branch);
+
+                case "prune":
+                    return SavePrune(engine, options, gameId, branch);
+
+                case "sniff":
+                    return SaveSniff(options, gameId);
+
+                default:
+                    throw new ArgumentException("未知的 --action：" + action
+                        + "（可用：list / upload / download / delete / branches / prune / sniff）");
+            }
+        }
+
+        private static int SaveList(SaveSyncEngine engine, string gameId)
+        {
+            if (string.IsNullOrWhiteSpace(gameId))
+            {
+                var index = engine.LoadSaveIndex();
+                if (index.Games.Count == 0)
+                {
+                    Console.WriteLine("远端还没有任何存档。");
+                    return 0;
+                }
+
+                Console.WriteLine("游戏                                                  快照  分支      体积  最后更新");
+                foreach (var game in index.Games)
+                {
+                    Console.WriteLine(string.Format("{0,-50} {1,5} {2,5} {3,10}  {4}",
+                        Clip(game.GameName, 50), game.Snapshots, game.Branches,
+                        SyncProgress.FormatSize(game.Bytes),
+                        game.UpdatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")));
+                }
+
+                return 0;
+            }
+
+            var manifest = engine.LoadManifest(SaveSyncEngine.SafeGameKey(gameId));
+            if (manifest == null)
+            {
+                Console.WriteLine("远端没有这个游戏的存档。");
+                return 0;
+            }
+
+            Console.WriteLine("[游戏名] " + manifest.GameName);
+            Console.WriteLine("[体积]   " + SyncProgress.FormatSize(manifest.TotalBytes)
+                              + "（去重后按实际内容算）");
+            Console.WriteLine();
+
+            foreach (var b in manifest.Branches)
+            {
+                Console.WriteLine("分支 " + b.Name + "　" + b.SnapshotCount + " 份"
+                                  + (string.IsNullOrEmpty(b.Comment) ? "" : "　" + b.Comment));
+                foreach (var s in manifest.SnapshotsIn(b.Name))
+                {
+                    Console.WriteLine("    " + s.Describe());
+                }
+            }
+
+            return 0;
+        }
+
+        private static int SaveBranches(SaveSyncEngine engine, OptionSet options, string gameId)
+        {
+            var key = RequireGame(gameId);
+            var manifest = engine.LoadManifest(key) ?? SaveGameManifest.NewFor(key, key);
+
+            var create = options.Get("create");
+            if (string.IsNullOrWhiteSpace(create))
+            {
+                // 只是列出来
+                foreach (var b in manifest.Branches)
+                {
+                    Console.WriteLine("* " + b.Name + "　" + b.SnapshotCount + " 份"
+                                      + (string.IsNullOrEmpty(b.CreatedFrom) ? "" : "　来自 " + b.CreatedFrom)
+                                      + (string.IsNullOrEmpty(b.Comment) ? "" : "　" + b.Comment));
+                }
+
+                return 0;
+            }
+
+            var from = options.Get("from");
+            engine.CreateBranch(key, manifest, create, from,
+                "命令行创建" + (string.IsNullOrWhiteSpace(from) ? "" : "（自 " + from + " 分叉）"));
+
+            Console.WriteLine("[完成] 分支「" + create + "」已创建"
+                              + (string.IsNullOrWhiteSpace(from) ? "（空分支）" : "，自快照 " + from + " 分叉"));
+            Console.WriteLine("[提示] 上传时加 --branch " + create + " 就往这条分支上推");
+            return 0;
+        }
+
+        private static int SaveUpload(SaveSyncEngine engine, OptionSet options, string gameId,
+            string branch)
+        {
+            var key = RequireGame(gameId);
+            var installDir = options.Get("install");
+            List<SavePathSpec> specs;
+            List<string> parseNotes;
+            ParsePathSpecs(options.Get("paths") ?? options.Get("path"), installDir,
+                out specs, out parseNotes);
+
+            if (specs.Count == 0)
+            {
+                throw new ArgumentException(
+                    "至少要给一条 --path，格式：--path \"标题={LocalAppData}\\游戏\\存档\"\n"
+                    + "多条用分号隔开，文件型加 file: 前缀（例如 file:cfg={GameDir}\\cfg.ini）");
+            }
+
+            foreach (var note in parseNotes)
+            {
+                Console.WriteLine("[路径] " + note);
+            }
+
+            var manifest = engine.LoadManifest(key) ?? SaveGameManifest.NewFor(key, key);
+            manifest.GameName = options.Get("name", manifest.GameName);
+            manifest.Paths = specs;
+
+            var outcome = engine.Upload(key, manifest.GameName, installDir, manifest,
+                new SaveSyncOptions
+                {
+                    Branch = branch,
+                    KeepPerBranch = ParseInt(options.Get("keep"), 10),
+                    DryRun = options.Has("dry-run"),
+                    Force = options.Has("force"),
+                    ShowName = options.Get("snapshot-name"),
+                    Comment = options.Get("comment"),
+                    Pinned = options.Has("pin"),
+                    Origin = SaveSnapshotOrigin.Manual
+                });
+
+            Console.WriteLine();
+            if (!outcome.Ok)
+            {
+                Console.Error.WriteLine("[失败] " + outcome.Failure);
+                return 2;
+            }
+
+            if (outcome.DryRun)
+            {
+                Console.WriteLine("[预演结束] 去掉 --dry-run 即真正执行");
+                return 0;
+            }
+
+            Console.WriteLine("[完成] 快照 " + (outcome.SnapshotId ?? "(无)")
+                              + "　" + outcome.Counters.Describe());
+            return 0;
+        }
+
+        private static int SaveDownload(SaveSyncEngine engine, OptionSet options, string gameId,
+            string branch)
+        {
+            var key = RequireGame(gameId);
+            var manifest = engine.LoadManifest(key);
+            if (manifest == null)
+            {
+                throw new InvalidOperationException("远端没有这个游戏的存档：" + key);
+            }
+
+            var outcome = engine.Download(key, manifest.GameName, options.Get("install"), manifest,
+                new SaveSyncOptions
+                {
+                    Branch = branch,
+                    SnapshotId = options.Get("snapshot"),
+                    DryRun = options.Has("dry-run"),
+                    SafetyBackup = !options.Has("no-backup"),
+                    SnapshotBeforeRestore = !options.Has("no-backup-snapshot"),
+                    KeepLocalBackups = ParseInt(options.Get("keep-local"), 5),
+                    KeepPerBranch = ParseInt(options.Get("keep"), 10)
+                });
+
+            Console.WriteLine();
+            if (!outcome.Ok)
+            {
+                Console.Error.WriteLine("[失败] " + outcome.Failure);
+                return 2;
+            }
+
+            if (outcome.DryRun)
+            {
+                Console.WriteLine("[预演结束] 去掉 --dry-run 即真正执行");
+                return 0;
+            }
+
+            Console.WriteLine("[完成] 恢复自 " + outcome.SnapshotId + "　"
+                              + outcome.Counters.Describe());
+            return 0;
+        }
+
+        private static int SaveDelete(SaveSyncEngine engine, OptionSet options, string gameId,
+            string branch)
+        {
+            var key = RequireGame(gameId);
+            var snapshotId = options.Require("snapshot");
+            var manifest = engine.LoadManifest(key);
+            if (manifest == null)
+            {
+                throw new InvalidOperationException("远端没有这个游戏的存档：" + key);
+            }
+
+            var outcome = engine.DeleteSnapshot(key, manifest, branch, snapshotId,
+                new SaveSyncOptions
+                {
+                    // 命令行要删就必须明写 --allow-delete：删除是不可逆的，
+                    // 不能让一个手滑的命令把它带走
+                    AllowDelete = options.Has("allow-delete"),
+                    DryRun = options.Has("dry-run"),
+                    KeepPerBranch = ParseInt(options.Get("keep"), 10)
+                });
+
+            Console.WriteLine();
+            if (!outcome.Ok)
+            {
+                Console.Error.WriteLine("[失败] " + outcome.Failure);
+                Console.Error.WriteLine("[提示] 删除需要显式加 --allow-delete");
+                return 2;
+            }
+
+            Console.WriteLine("[完成] " + outcome.Counters.Describe());
+            return 0;
+        }
+
+        private static int SavePrune(SaveSyncEngine engine, OptionSet options, string gameId,
+            string branch)
+        {
+            var key = RequireGame(gameId);
+            var manifest = engine.LoadManifest(key);
+            if (manifest == null)
+            {
+                throw new InvalidOperationException("远端没有这个游戏的存档：" + key);
+            }
+
+            var outcome = engine.Prune(key, manifest, new SaveSyncOptions
+            {
+                Branch = branch,
+                KeepPerBranch = ParseInt(options.Get("keep"), 10),
+                AllowDelete = options.Has("allow-delete"),
+                DryRun = options.Has("dry-run")
+            });
+
+            Console.WriteLine();
+            if (!outcome.Ok)
+            {
+                Console.Error.WriteLine("[失败] " + outcome.Failure);
+                return 2;
+            }
+
+            Console.WriteLine("[完成] " + outcome.Counters.Describe()
+                              + (options.Has("dry-run") ? "（预演）" : ""));
+            return 0;
+        }
+
+        private static int SaveSniff(OptionSet options, string gameId)
+        {
+            if (string.IsNullOrWhiteSpace(gameId))
+            {
+                throw new ArgumentException("嗅探需要 --game（至少用来推路径），建议同时给 --name 与 --install");
+            }
+
+            var ctx = new SaveSniffContext
+            {
+                GameName = options.Get("name", gameId),
+                GameInstallDir = options.Get("install"),
+                Budget = TimeSpan.FromSeconds(ParseInt(options.Get("budget"), 8)),
+                MinScore = ParseInt(options.Get("min-score"), 30)
+            };
+
+            Console.WriteLine("[游戏名] " + ctx.GameName);
+            Console.WriteLine("[安装目录] " + (string.IsNullOrWhiteSpace(ctx.GameInstallDir)
+                ? "(未提供，{GameDir} 有关的线索会缺失)"
+                : ctx.GameInstallDir));
+            Console.WriteLine();
+
+            var all = new List<SaveSniffCandidate>();
+
+            Console.WriteLine("== 常见位置 ==");
+            var heuristic = SaveSniffer.Heuristic(ctx);
+            all.AddRange(heuristic);
+            PrintCandidates(heuristic);
+
+            if (options.Has("wiki"))
+            {
+                Console.WriteLine();
+                Console.WriteLine("== PCGamingWiki ==");
+                string error;
+                var wiki = PcgamingWikiClient.TrySniff(ctx.GameName, ctx, out error);
+                all.AddRange(wiki);
+                if (wiki.Count == 0)
+                {
+                    Console.WriteLine("  （没抓到：" + (error ?? "未知原因") + "）");
+                }
+                else
+                {
+                    PrintCandidates(wiki);
+                }
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("== 合并去重后 ==");
+            var merged = PcgamingWikiClient.Merge(all);
+            PrintCandidates(merged);
+
+            Console.WriteLine();
+            Console.WriteLine("嗅探结果**不会自动写进任何地方**。要采用就在 --path 里显式写上，"
+                              + "例如：");
+            if (merged.Count > 0)
+            {
+                Console.WriteLine("  VaultPack saves --action upload --game " + gameId
+                                  + " --install \"" + (ctx.GameInstallDir ?? "<安装目录>")
+                                  + "\" --path \"" + merged[0].Title + "="
+                                  + merged[0].EffectivePath + "\"");
+            }
+
+            return 0;
+        }
+
+        private static void PrintCandidates(List<SaveSniffCandidate> candidates)
+        {
+            if (candidates.Count == 0)
+            {
+                Console.WriteLine("  （没有候选）");
+                return;
+            }
+
+            foreach (var candidate in candidates)
+            {
+                Console.WriteLine(candidate.Describe());
+            }
+        }
+
+        /// <summary>
+        /// 解析 <c>--path</c>。每条格式 <c>[file:|dir:][标题=]路径</c>，多条用分号隔开。
+        ///
+        /// <para>判定「这算不算标题」的规则：<c>=</c> 出现在第一个路径分隔符之前才算标题。
+        /// 不这么定的话，一条名字里真带 <c>=</c> 的路径会被切得莫名其妙
+        /// （存档文件名里出现 <c>=</c> 并不罕见）。</para>
+        /// </summary>
+        private static void ParsePathSpecs(string raw, string installDir,
+            out List<SavePathSpec> specs, out List<string> notes)
+        {
+            specs = new List<SavePathSpec>();
+            notes = new List<string>();
+
+            foreach (var piece in (raw ?? string.Empty).Split(new[] { ';' }))
+            {
+                var item = piece.Trim();
+                if (item.Length == 0)
+                {
+                    continue;
+                }
+
+                var type = SaveElementType.Directory;
+                if (item.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+                {
+                    type = SaveElementType.File;
+                    item = item.Substring(5).Trim();
+                }
+                else if (item.StartsWith("dir:", StringComparison.OrdinalIgnoreCase))
+                {
+                    item = item.Substring(4).Trim();
+                }
+
+                var title = string.Empty;
+                var eq = item.IndexOf('=');
+                if (eq > 0)
+                {
+                    var head = item.Substring(0, eq);
+                    if (head.IndexOf('\\') < 0 && head.IndexOf('/') < 0)
+                    {
+                        title = head.Trim();
+                        item = item.Substring(eq + 1).Trim();
+                    }
+                }
+
+                if (item.Length == 0)
+                {
+                    continue;
+                }
+
+                if (title.Length == 0)
+                {
+                    title = Path.GetFileName(item.TrimEnd('\\', '/'));
+                }
+
+                var spec = new SavePathSpec
+                {
+                    Title = title,
+                    Type = type,
+                    Path = item,
+                    // 写了占位符就按自适应处理 —— 命令行上再让人多敲一个开关没意义，
+                    // 而 {LocalAppData} 这种写法本身就说明「这条要按机器展开」
+                    AutoAdaptive = SavePathAdapter.HasToken(item),
+                    Enabled = true,
+                    Source = SaveSource.Plugin
+                };
+
+                List<string> unresolved;
+                var resolved = SavePathAdapter.Resolve(spec, installDir, out unresolved);
+                if (unresolved.Count > 0)
+                {
+                    notes.Add("「" + title + "」解析不了：" + string.Join("、", unresolved.ToArray()));
+                    continue;
+                }
+
+                var exists = spec.Type == SaveElementType.File
+                    ? File.Exists(resolved)
+                    : Directory.Exists(resolved);
+
+                notes.Add("「" + title + "」" + (spec.AutoAdaptive ? "自适应 " : "字面量 ")
+                          + resolved + (exists ? "" : "　（本机还不存在）"));
+
+                specs.Add(spec);
+            }
+        }
+
+        private static string RequireGame(string gameId)
+        {
+            if (string.IsNullOrWhiteSpace(gameId))
+            {
+                throw new ArgumentException("这个动作需要 --game <游戏Id>");
+            }
+
+            return SaveSyncEngine.SafeGameKey(gameId);
+        }
+
+        private static int ParseInt(string text, int fallback)
+        {
+            int value;
+            return int.TryParse((text ?? string.Empty).Trim(), out value) ? value : fallback;
+        }
+
+        private static string Clip(string text, int width)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return string.Empty;
+            }
+
+            return text.Length <= width ? text : text.Substring(0, width - 1) + "…";
+        }
+
+        /// <summary>命令行进度：只在阶段变化时打一行，避免刷屏。</summary>
+        private class ConsoleSaveReporter : ISaveSyncReporter
+        {
+            private string lastStage;
+
+            public void Stage(string text)
+            {
+                if (string.Equals(text, lastStage, StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                lastStage = text;
+                Console.WriteLine("  " + text);
+            }
+
+            public void Progress(SyncProgress progress)
+            {
+                // 命令行下不打进度条：结果与计数在最后一次性给出就够了
+            }
+
+            public void Log(string line)
+            {
+                if (!string.IsNullOrWhiteSpace(line))
+                {
+                    Console.WriteLine("  " + line);
+                }
+            }
         }
 
         private static ThemeSyncMode ParseThemeSyncMode(string value)
