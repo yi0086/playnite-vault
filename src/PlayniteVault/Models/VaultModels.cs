@@ -380,7 +380,7 @@ namespace PlayniteVault.Models
     }
 
     /// <summary>
-    /// 「仓库与归档」页卡片墙上的一张卡：本地 Playnite 里的一条应用，
+    /// 「仓库」页卡片墙上的一张卡：本地 Playnite 里的一条应用，
     /// 外加「它在仓库里有没有」这个判定结果。
     /// </summary>
     public class LocalAppCard
@@ -407,6 +407,20 @@ namespace PlayniteVault.Models
 
         /// <summary>仓库里那份的体积。</summary>
         public long RepoBytes { get; set; }
+
+        /// <summary>
+        /// 本机那份的体积。0 = 还没量出来（本机没装，或者后台扫描还没回来）。
+        ///
+        /// <para>刻意**不在建卡片时算** —— 一个 100GB 的游戏要遍历几万个文件，
+        /// 放在 UI 线程上就是一秒起步的卡顿。界面拿到卡片后在后台量，量完只改一个文本块。</para>
+        /// </summary>
+        public long LocalBytes { get; set; }
+
+        /// <summary>本机这份是从仓库拉下来的（本地索引里有记录）→ 可以「卸载」。</summary>
+        public bool Downloaded { get; set; }
+
+        /// <summary>从仓库拉下来时装到的目录（卸载要用；空则回退到默认目录）。</summary>
+        public string DownloadedDir { get; set; }
 
         /// <summary>封面图的绝对路径；解析不出来就是空，卡片会退化成一个占位块。</summary>
         public string CoverPath { get; set; }

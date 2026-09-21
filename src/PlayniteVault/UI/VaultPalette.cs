@@ -143,7 +143,9 @@ namespace PlayniteVault.UI
             p.Border = Frozen("#D3D7E0");
             p.BorderStrong = Frozen("#9CA0B0");
             p.Text = Frozen("#4C4F69");
-            p.TextMuted = Frozen("#7C7F93");
+            // #7C7F93 在浅色底上只有约 3.9:1，正文级的次要文字（字段说明、卡片副标题）
+            // 压线看不清。压到 #5A5E72 后约 5.4:1，跨过 WCAG AA 的 4.5 线。
+            p.TextMuted = Frozen("#5A5E72");
 
             p.Accent = Frozen("#EA76CB");
             p.AccentInk = Frozen("#1E1E2E");

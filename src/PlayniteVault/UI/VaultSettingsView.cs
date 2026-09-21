@@ -377,9 +377,17 @@ namespace PlayniteVault.UI
             RaiseAll();
         }
 
+        /// <summary>
+        /// 落盘。落完之后把**落下去的那份**推回界面。
+        ///
+        /// <para>为什么要 RaiseAll：各字段的 setter 会做范围钳制（并发路数只能 1~16、
+        /// 区块大小 1~512 …）。不推回来的话，用户看到的是自己打的字，
+        /// 而真正生效的是被钳过的值 —— 那看起来就是「保存没生效」。</para>
+        /// </summary>
         public void EndEdit()
         {
             service.SaveSettings(editing);
+            RaiseAll();
 
             var handler = SettingsSaved;
             if (handler != null)
@@ -500,8 +508,11 @@ namespace PlayniteVault.UI
     /// <see cref="VaultPalette"/> 的显式令牌。</item>
     /// <item><b>长说明收进小 ⓘ 图标</b>。原来每个选项下面都挂一段两三行的解释，
     /// 一屏只能放三四个设置项。现在解释挂在标题右侧的小圆点上，悬停才出来。</item>
-    /// <item><b>标题旁显示「当前值」</b>。改了半天的值到底存进去没有，
-    /// 不该靠回忆 —— 每个字段的标签右边直接写着已保存的值。</item>
+    /// <item><b>输入框自带水印，而不是在标签右边写「当前 xxx」</b>。右上角那行小字既占位置
+    /// 又容易被当成两个字段；现在改成：框里有值就显示值（那就是当前值），
+    /// 框被清空时水印把原值顶上来，一个字符也不会丢。</item>
+    /// <item><b>按「用的时候在找什么」分模块</b>：连接 NAS / 传输 / 自动化 / 云存档。
+    /// 四个模块体量刻意不一样大，视觉层级差让入口级设置与调优项一眼分得开。</item>
     /// </list>
     /// </summary>
     public class VaultSettingsView : UserControl
@@ -510,6 +521,15 @@ namespace PlayniteVault.UI
         private readonly VaultService service;
         private readonly VaultPalette p;
 
+        /// <summary>
+        /// 这一份视图是**嵌在侧边栏页里**的吗？
+        ///
+        /// <para>嵌进去时不能自带 <see cref="ScrollViewer"/>：外层（侧边栏页的 bodyScroll）
+        /// 已经有一个了。两层套着时，滚轮事件被里层吃掉、而里层内容不溢出所以不滚动，
+        /// 表现出来的就是「滚轮没反应，只能拖旁边的滚动条」。</para>
+        /// </summary>
+        private readonly bool embedded;
+
         private PasswordBox passBox;
         private TextBlock statusText;
         private Button testButton;
@@ -517,10 +537,12 @@ namespace PlayniteVault.UI
         private TextBlock refreshStatusText;
         private TextBlock skippedText;
 
-        public VaultSettingsView(VaultSettingsViewModel vm, VaultService service)
+        public VaultSettingsView(VaultSettingsViewModel vm, VaultService service,
+            bool embedded = false)
         {
             this.vm = vm;
             this.service = service;
+            this.embedded = embedded;
             this.p = VaultPalette.Resolve(VaultPalette.ParseMode(service.Settings.UiTheme));
 
             Build();
@@ -531,13 +553,13 @@ namespace PlayniteVault.UI
 
         // ================================================================ 配色
 
-        /// <summary>已保存的值——标签右侧那行小字用。</summary>
+        /// <summary>已保存的值——输入框水印用。</summary>
         private static string DescribeSaved(string value)
         {
             return string.IsNullOrWhiteSpace(value) ? "(空)" : value;
         }
 
-        /// <summary>把已保存的触发方式说成一句人话，给标签右边那行小字用。</summary>
+        /// <summary>把已保存的触发方式说成一句人话，给输入框水印用。</summary>
         private static string DescribeSaveTrigger(SaveTriggerMode mode)
         {
             switch (mode)
@@ -620,7 +642,7 @@ namespace PlayniteVault.UI
             row.Children.Add(new TextBlock
             {
                 Text = text,
-                FontSize = 13,
+                FontSize = 13.5,
                 FontWeight = FontWeights.Bold,
                 Foreground = p.Text,
                 VerticalAlignment = VerticalAlignment.Center
@@ -635,59 +657,109 @@ namespace PlayniteVault.UI
         }
 
         /// <summary>
-        /// 字段：标签行（标签 + ⓘ + 右侧「当前 …」）+ 控件。
-        /// <paramref name="saved"/> 是**已落盘**的值，跟正在编辑的值分开展示，
-        /// 这样「改了但没保存」一眼可辨。
+        /// 字段：标签行（标签 + 可选 ⓘ）+ 控件。
+        ///
+        /// <para><paramref name="saved"/> 是**已落盘**的值。它不再占一行小字挂在右上角，
+        /// 而是变成输入框里的**水印**：框空着的时候把原值顶上来，一输入就消失。
+        /// 输入框里本来就是当前值，再在角上写一遍只是噪音（还会把标签行挤窄）。</para>
         /// </summary>
         private StackPanel Field(string label, UIElement control, string help = null, string saved = null)
         {
-            var box = new StackPanel { Margin = new Thickness(0, 0, 0, 12) };
+            var box = new StackPanel { Margin = new Thickness(0, 0, 0, 14) };
 
-            var header = new Grid();
-            header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-
-            var left = new StackPanel { Orientation = Orientation.Horizontal };
-            left.Children.Add(new TextBlock
+            var header = new StackPanel { Orientation = Orientation.Horizontal };
+            header.Children.Add(new TextBlock
             {
                 Text = label,
-                FontSize = 12,
+                FontSize = 12.5,
+                FontWeight = FontWeights.SemiBold,
                 Foreground = p.Text,
                 VerticalAlignment = VerticalAlignment.Center
             });
             if (!string.IsNullOrEmpty(help))
             {
-                left.Children.Add(InfoIcon(help));
-            }
-
-            Grid.SetColumn(left, 0);
-            header.Children.Add(left);
-
-            if (!string.IsNullOrEmpty(saved))
-            {
-                var current = new TextBlock
-                {
-                    Text = "当前 " + saved,
-                    FontSize = 10.5,
-                    Foreground = p.TextMuted,
-                    HorizontalAlignment = HorizontalAlignment.Right,
-                    VerticalAlignment = VerticalAlignment.Center,
-                    TextTrimming = TextTrimming.CharacterEllipsis,
-                    Margin = new Thickness(10, 0, 0, 0)
-                };
-                Grid.SetColumn(current, 1);
-                header.Children.Add(current);
+                header.Children.Add(InfoIcon(help));
             }
 
             box.Children.Add(header);
-            box.Children.Add(control);
+            box.Children.Add(WithWatermark(control, saved));
             return box;
         }
 
         /// <summary>
+        /// 给输入框加水印：**框里没内容时**显示它原来（已保存）的值，一有输入就藏起来。
+        ///
+        /// <para>为什么不直接把提示写进 <c>Text</c>：那样绑定就分不清「用户想看这个名字」
+        /// 与「用户什么都没输入」，保存时会把提示语当成真值写进 settings.json。</para>
+        ///
+        /// <para>不是输入框的（下拉框、带浏览按钮的目录行）没有水印可加 ——
+        /// 当前值本来就直接显示在控件上，这里只把原来的小字改为挂到提示里。</para>
+        /// </summary>
+        private UIElement WithWatermark(UIElement control, string saved)
+        {
+            if (control == null || string.IsNullOrEmpty(saved))
+            {
+                return control;
+            }
+
+            var textBox = control as TextBox;
+            var passwordBox = control as PasswordBox;
+
+            if (textBox == null && passwordBox == null)
+            {
+                // ToolTip 定义在 FrameworkElement 上，UIElement 没有 → 先降一档再挂
+                var fe = control as FrameworkElement;
+                if (fe != null && fe.ToolTip == null)
+                {
+                    fe.ToolTip = "当前：" + saved;
+                }
+
+                return control;
+            }
+
+            var host = new Grid();
+
+            // 不吃点击，否则鼠标落在水印上就选不中那个输入框了
+            var hint = new TextBlock
+            {
+                Text = saved,
+                FontSize = 12,
+                Foreground = p.TextMuted,
+                Margin = new Thickness(7, 0, 7, 0),
+                VerticalAlignment = VerticalAlignment.Center,
+                IsHitTestVisible = false,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            };
+
+            host.Children.Add(control);
+            host.Children.Add(hint);
+
+            Action sync = () =>
+            {
+                var empty = textBox != null
+                    ? string.IsNullOrEmpty(textBox.Text)
+                    : string.IsNullOrEmpty(passwordBox.Password);
+                hint.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
+            };
+
+            if (textBox != null)
+            {
+                textBox.TextChanged += (s, e) => sync();
+            }
+            else
+            {
+                passwordBox.PasswordChanged += (s, e) => sync();
+            }
+
+            // 先按「现在就空」摆一次：绑定是在加载时把源值写进控件的，
+            // 那一刻会触发一次 TextChanged，水印会自己收起来。
+            sync();
+            return host;
+        }
+
+        /// <summary>
         /// 数字输入 + 可选 ⓘ。
-        /// 顺便给一个「空框时的水印」：把当前生效值写进框里当占位提示，
-        /// 用户清空重填时不会忘记原来是多少。
+        /// 空框时把当前生效值当水印顶上来，用户清空重填时不会忘记原来是多少。
         /// </summary>
         private StackPanel NumberField(string label, string path, string help, string saved)
         {
@@ -742,30 +814,107 @@ namespace PlayniteVault.UI
             panel.Children.Add(new TextBlock
             {
                 Text = "Playnite Vault",
-                FontSize = 15,
+                FontSize = 16.5,
                 FontWeight = FontWeights.Bold,
                 Foreground = p.Text
             });
             panel.Children.Add(new TextBlock
             {
                 Text = "连上 NAS 上的 WebDAV 仓库。改完记得保存。",
-                FontSize = 11.5,
+                FontSize = 12,
                 Foreground = p.TextMuted,
-                Margin = new Thickness(0, 3, 0, 0)
+                Margin = new Thickness(0, 4, 0, 16)
             });
 
-            BuildInterfaceSection(panel);
-            BuildConnectionSection(panel);
-            BuildTransferSection(panel);
-            BuildUpdateSection(panel);
-            BuildAutoRefreshSection(panel);
-            BuildSaveSection(panel);
+            // 模块按「用的时候在找什么」分，而不是按对象分。
+            // 四块体量刻意不一样大 —— 视觉层级差能让「连接」这种入口级设置
+            // 一眼就和「传输超时」这种调优项分开。
+            panel.Children.Add(ModuleCard("连接 NAS",
+                "仓库地址与账号。这一块填不对，其他模块都不会生效。",
+                BuildInterfaceSection, BuildConnectionSection));
 
-            Content = new ScrollViewer
+            panel.Children.Add(ModuleCard("传输",
+                "超时、切块与并发、行为开关。传输卡住或速度不理想时来这里。",
+                BuildTransferSection));
+
+            panel.Children.Add(ModuleCard("自动化",
+                "插件自更新与远端库自动刷新。都是后台定时跑的事。",
+                BuildUpdateSection, BuildAutoRefreshSection));
+
+            panel.Children.Add(ModuleCard("云存档",
+                "存档快照、分支与保留策略。",
+                BuildSaveSection));
+
+            UIElement content = panel;
+
+            // 嵌进侧边栏时不套这层 ScrollViewer（外面已经有一个）——
+            // 两层套着时滚轮会被里层吃掉，而里层内容不溢出所以一动不动，
+            // 表现就是「滚轮没反应，只能拖旁边的滚动条」。
+            // Playnite 自己的「扩展设置」页没有外层滚动容器，那边仍然需要它。
+            if (!embedded)
             {
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-                Content = panel
+                content = new ScrollViewer
+                {
+                    VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                    HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                    Content = panel
+                };
+            }
+
+            Content = content;
+        }
+
+        /// <summary>
+        /// 一个设置模块：带标题的卡片，内容由传入的 section 构建器按顺序填进去。
+        ///
+        /// <para>左侧那条强调色竖条是关键 —— 没有它，几个模块之间的边界只能靠空白去猜，
+        /// 而空白在设置页里到处都是。有了一条实心竖线，一眼就知道「这几个字段是一组的」。</para>
+        /// </summary>
+        private UIElement ModuleCard(string title, string help,
+            params Action<StackPanel>[] sections)
+        {
+            var body = new StackPanel();
+
+            var head = new StackPanel { Orientation = Orientation.Horizontal };
+            head.Children.Add(new TextBlock
+            {
+                Text = title,
+                FontSize = 15,
+                FontWeight = FontWeights.Bold,
+                Foreground = p.Text,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            if (!string.IsNullOrEmpty(help))
+            {
+                head.Children.Add(InfoIcon(help));
+            }
+
+            body.Children.Add(head);
+
+            var inner = new StackPanel();
+            foreach (var section in sections)
+            {
+                section(inner);
+            }
+
+            body.Children.Add(new Border
+            {
+                BorderBrush = p.Accent,
+                BorderThickness = new Thickness(3, 0, 0, 0),
+                Background = p.SurfaceAlt,
+                Margin = new Thickness(0, 10, 0, 0),
+                Padding = new Thickness(13, 6, 10, 2),
+                Child = inner
+            });
+
+            return new Border
+            {
+                Background = p.Surface,
+                BorderBrush = p.Border,
+                BorderThickness = new Thickness(2),
+                Padding = new Thickness(14, 12, 14, 12),
+                Margin = new Thickness(0, 0, 0, 16),
+                Child = body
             };
         }
 

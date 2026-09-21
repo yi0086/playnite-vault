@@ -9,6 +9,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using PlayniteVault.Models;
 using PlayniteVault.Services;
 
@@ -21,20 +22,22 @@ namespace PlayniteVault.UI
     /// （<c>SidebarItem.Type = SiderbarItemType.View</c>），所以不用自己开窗口——
     /// 这也让界面自然继承了 Playnite 的主题画刷与缩放。
     ///
-    /// <para><b>版面结构</b>（v1.8 起）：</para>
+    /// <para><b>版面结构</b>（v1.9 起）：</para>
     /// <code>
-    /// ┌──────────┬────────────────────────────────────────┐
-    /// │ 仓库管家  │                                  ●     │ ← 状态点（无标题栏）
-    /// │ Vault@1.8│────────────────────────────────────────│
-    /// │ 概览      │                                        │
-    /// │ 主题同步  │              内容（滚动）               │
-    /// │ 仓库与归档│                                        │
-    /// │ 设置      │                                        │
-    /// └──────────┴────────────────────────────────────────┘
+    /// ┌──────────────┬────────────────────────────────────┐
+    /// │ 仓库管家   ● │                                    │
+    /// │ Vault@1.9.0  │                                    │
+    /// │ 概览         │                                    │
+    /// │ 主题         │            内容（滚动）             │
+    /// │ 仓库         │                                    │
+    /// │ 任务         │                                    │
+    /// │ 设置         │                                    │
+    /// ├──────────────┴────────────────────────────────────┤
+    /// │ ▓▓▓▓▓▓▓░░░  2 个任务 · 归档 节奏医生 62%   [详]    │ ← 只在有任务时出现
+    /// └───────────────────────────────────────────────────┘
     /// </code>
-    /// 顶栏被整个去掉了：标题在左边栏已经有了，仓库地址属于「设置」里的事，
-    /// 而原来贴在顶栏右边的「已连接 / 刷新」正好压在 Playnite 的最小化/最大化/关闭按钮上
-    /// ——点刷新会顺手关掉 Playnite。所以这里只留一个不占版面的状态点。
+    /// 整页顶栏是去掉了的。状态点（●）从「整页右上角」挪到了左栏标题「仓库管家」的右上角 ——
+    /// 原来那个位置正好压在 Playnite 的最小化/最大化/关闭按钮上，点刷新会顺手关掉 Playnite。
     ///
     /// <para><b>配色</b>：全部走 <see cref="VaultPalette"/> 的语义令牌，
     /// 本文件里不再出现任何字面颜色值。</para>
@@ -68,19 +71,36 @@ namespace PlayniteVault.UI
 
         // ---- 概览 ----
         private StackPanel overviewHost;
-        private Button refreshButton;
         private bool statsLoading;
+
+        // ---- 底部传输条 + 下载管理 ----
+        private ScrollViewer bodyScroll;
+        private Border transferBar;
+        private Border transferFill;
+        private ColumnDefinition transferFillCol;
+        private Grid transferTrack;
+        private TextBlock transferCaption;
+        private DispatcherTimer transferTimer;
+        private bool transferHooked;
+        private StackPanel taskListHost;
+
+        /// <summary>
+        /// 每个任务行的「只改数值」回调。
+        ///
+        /// 为什么要这一层：进度每 250 毫秒变一次，若每次都重建整棵列表，
+        /// 用户悬停高亮会闪、「取消」按钮会在鼠标按下与弹起之间被换掉。
+        /// 所以只在**任务集合变了**时重建行，平时的字节数只走这些回调。
+        /// </summary>
+        private readonly List<Action> taskRowUpdaters = new List<Action>();
 
         // ---- 设置页的保存反馈（重建视觉树后要能续上，所以存在字段里） ----
         private TextBlock saveStatus;
         private string saveStatusText;
         private bool? saveStatusOk;
 
-        // ---- 仓库与归档：卡片墙 + 内联删除 ----
+        // ---- 仓库：卡片墙 + 内联删除 / 取回 / 卸载 ----
         private WrapPanel repoWallGrid;
         private TextBlock repoEmpty;
-        private StackPanel repoOrphanHost;
-        private Border repoOrphanCard;
         private TextBlock repoSummary;
         private TextBlock repoStatus;
         private TextBox repoSearch;
@@ -91,15 +111,18 @@ namespace PlayniteVault.UI
         private string repoFilterText = string.Empty;
         private bool repoLoading;
 
-        // ---- 主题同步（这一页还没按 v1.8 改完，先原样留着） ----
-        private TextBlock syncResult;
+        // ---- 主题：卡片勾选 ----
+        private WrapPanel themeWall;
+        private TextBlock themeSummary;
+        private TextBlock themeStatus;
         private TextBlock themeRootText;
         private RadioButton dirUpload;
         private RadioButton dirDownload;
         private RadioButton dirBoth;
         private CheckBox chkDryRun;
         private CheckBox chkForce;
-        private StackPanel conflictList;
+        private readonly List<ThemeCardVisual> themeCards = new List<ThemeCardVisual>();
+        private bool themesLoading;
 
         public VaultPanelView(VaultPlugin plugin, VaultService service,
                               VaultSettingsViewModel settingsVm, string themesRoot)
@@ -183,6 +206,7 @@ namespace PlayniteVault.UI
             sectionBuilders["overview"] = BuildOverview;
             sectionBuilders["themes"] = BuildThemeSync;
             sectionBuilders["repo"] = BuildRepo;
+            sectionBuilders["tasks"] = BuildTasks;
             sectionBuilders["settings"] = BuildSettings;
 
             var grid = new Grid();
@@ -197,14 +221,32 @@ namespace PlayniteVault.UI
                 Padding = new Thickness(14, 18, 14, 14)
             };
 
-            navPanel.Children.Add(new TextBlock
+            // 标题行：「仓库管家」在左，健康状态小点在它右上角。
+            // 小点必须挂在这一行里而不是整页右上角 —— 那里会跟 Playnite 的关闭按钮重叠。
+            var titleRow = new Grid { Margin = new Thickness(2, 0, 0, 3) };
+            titleRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            titleRow.ColumnDefinitions.Add(
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var navTitle = new TextBlock
             {
                 Text = "仓库管家",
                 FontSize = 18,
                 FontWeight = FontWeights.Bold,
                 Foreground = p.Text,
-                Margin = new Thickness(2, 0, 0, 3)
-            });
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(navTitle, 0);
+            titleRow.Children.Add(navTitle);
+
+            var navDot = BuildHealthDot();
+            navDot.HorizontalAlignment = HorizontalAlignment.Right;
+            navDot.VerticalAlignment = VerticalAlignment.Center;
+            navDot.Margin = new Thickness(6, 2, 0, 0);
+            Grid.SetColumn(navDot, 1);
+            titleRow.Children.Add(navDot);
+
+            navPanel.Children.Add(titleRow);
 
             // 「Playnite Vault @1.8.0」——版本号贴在产品名后面，
             // 省掉了原来「关于」页里那行「当前版本 X」。
@@ -232,8 +274,9 @@ namespace PlayniteVault.UI
             navPanel.Children.Add(brand);
 
             AddSection("overview", "概览");
-            AddSection("themes", "主题同步");
-            AddSection("repo", "仓库与归档");
+            AddSection("themes", "主题");
+            AddSection("repo", "仓库");
+            AddSection("tasks", "任务");
             AddSection("settings", "设置");
 
             var navScroll = new ScrollViewer
@@ -244,34 +287,27 @@ namespace PlayniteVault.UI
             };
             Grid.SetColumn(navScroll, 0);
 
-            // 右侧：状态点那一行（透明、无边框）+ 内容
+            // 右侧只剩内容本身 —— 状态点已经搬到左栏标题行上去了。
             var right = new Grid();
+            right.RowDefinitions.Add(
+                new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
             right.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            right.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-
-            var statusRow = new Grid
-            {
-                // 不给底色、不给下边框 —— 它在版面上只是一点留白，
-                // 不是「一条栏」。这样既满足「右上角有个小点」，也不违背「把那一栏去掉」。
-                Margin = new Thickness(0, 12, 20, 0)
-            };
-            var dot = BuildHealthDot();
-            dot.HorizontalAlignment = HorizontalAlignment.Right;
-            dot.VerticalAlignment = VerticalAlignment.Top;
-            statusRow.Children.Add(dot);
-            Grid.SetRow(statusRow, 0);
-            right.Children.Add(statusRow);
 
             body = new ContentControl { HorizontalContentAlignment = HorizontalAlignment.Stretch };
-            var bodyScroll = new ScrollViewer
+            bodyScroll = new ScrollViewer
             {
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
                 HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-                Padding = new Thickness(20, 4, 20, 24),
+                Padding = new Thickness(20, 18, 20, 24),
                 Content = body
             };
-            Grid.SetRow(bodyScroll, 1);
+            Grid.SetRow(bodyScroll, 0);
             right.Children.Add(bodyScroll);
+
+            // 底部：传输任务的聚合进度条（没有任务时整条收起来，不占版面）
+            transferBar = BuildTransferBar();
+            Grid.SetRow(transferBar, 1);
+            right.Children.Add(transferBar);
 
             Grid.SetColumn(right, 1);
             grid.Children.Add(nav);
@@ -279,6 +315,11 @@ namespace PlayniteVault.UI
             grid.Children.Add(right);
 
             Content = grid;
+
+            // 底部传输条与队列挂钩。挂一次就够（重建视觉树不会重建队列）。
+            HookTransfers();
+            RefreshTransferBar();
+
             ShowSection(currentSection);
         }
 
@@ -346,17 +387,409 @@ namespace PlayniteVault.UI
                 pair.Value.Foreground = selected ? p.AccentInk : p.Text;
             }
 
+            if (key == "tasks" && plugin != null && plugin.Transfers != null)
+            {
+                RenderTasks(plugin.Transfers.Snapshot());
+            }
+
             if (key == "overview")
             {
                 RefreshStats();
             }
         }
 
+        // ================================================================ 传输条 / 下载管理
+
+        private void HookTransfers()
+        {
+            if (transferHooked || plugin == null || plugin.Transfers == null)
+            {
+                return;
+            }
+
+            transferHooked = true;
+            plugin.Transfers.Changed += OnTransfersChanged;
+
+            // 字节数不推给界面（会淹掉 UI 线程），改为界面自己轮询；
+            // 没任务的时候定时器是停的，空转不耗时。
+            transferTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(250)
+            };
+            transferTimer.Tick += (s, e) => RefreshTransferBar();
+        }
+
+        private void OnTransfersChanged()
+        {
+            if (transferBar == null || plugin == null || plugin.Transfers == null)
+            {
+                return;
+            }
+
+            RenderTasks(plugin.Transfers.Snapshot());
+            RefreshTransferBar();
+        }
+
+        /// <summary>
+        /// 底部那条聚合进度条：「预估总进度」= 每条任务按体积加权后的平均。
+        /// 体积还没量出来的任务按等权算 —— 否则它会让总进度在开跑前就显示 100%。
+        /// </summary>
+        private Border BuildTransferBar()
+        {
+            transferTrack = MakeBar(6, out transferFill, out transferFillCol);
+            transferTrack.Margin = new Thickness(0, 6, 0, 0);
+
+            transferCaption = new TextBlock
+            {
+                FontSize = 11.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = p.Text,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            };
+
+            var left = new StackPanel();
+            left.Children.Add(transferCaption);
+            left.Children.Add(transferTrack);
+
+            var detail = CardButton("下载管理", null);
+            detail.Margin = new Thickness(12, 0, 0, 0);
+            detail.VerticalAlignment = VerticalAlignment.Center;
+            detail.Click += (s, e) => ShowSection("tasks");
+
+            var row = new DockPanel();
+            DockPanel.SetDock(detail, Dock.Right);
+            row.Children.Add(detail);
+            row.Children.Add(left);
+
+            var bar = new Border
+            {
+                Background = p.Surface,
+                BorderBrush = p.Border,
+                BorderThickness = new Thickness(0, 2, 0, 0),
+                Padding = new Thickness(20, 9, 20, 11),
+                Child = row,
+                Cursor = Cursors.Hand,
+                Visibility = Visibility.Collapsed,
+                ToolTip = "点这里看每个任务的详情"
+            };
+            bar.MouseLeftButtonUp += (s, e) => ShowSection("tasks");
+            return bar;
+        }
+
+        private void RefreshTransferBar()
+        {
+            if (transferBar == null || plugin == null || plugin.Transfers == null)
+            {
+                return;
+            }
+
+            var tasks = plugin.Transfers.Snapshot();
+            transferBar.Visibility = tasks.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+
+            var agg = plugin.Transfers.Aggregate();
+            if (transferCaption != null)
+            {
+                transferCaption.Text = string.IsNullOrEmpty(agg.Caption) ? "传输任务" : agg.Caption;
+            }
+
+            SetBar(transferTrack, transferFillCol, agg.Indeterminate ? 0.12 : agg.Progress);
+            if (transferFill != null)
+            {
+                transferFill.Background = agg.Failed > 0 ? p.Danger : p.Accent;
+            }
+
+            if (transferTimer != null)
+            {
+                if (agg.Active > 0 && !transferTimer.IsEnabled)
+                {
+                    transferTimer.Start();
+                }
+                else if (agg.Active == 0 && transferTimer.IsEnabled)
+                {
+                    transferTimer.Stop();
+                }
+            }
+
+            RefreshTaskRows();
+        }
+
+        private void RefreshTaskRows()
+        {
+            foreach (var update in taskRowUpdaters.ToArray())
+            {
+                try
+                {
+                    update();
+                }
+                catch (Exception ex)
+                {
+                    VaultLog.Warn("刷新任务行失败：" + ex.Message);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 「下载管理」：队列里每条任务的详情。
+        ///
+        /// 为什么要有独立一页而不是弹个窗：一次归档要跑几十分钟，用户会关掉它去干别的，
+        /// 而底部那条进度条随时能把他带回这里。弹窗一关就什么都没了。
+        /// </summary>
+        private UIElement BuildTasks()
+        {
+            var root = new StackPanel();
+
+            var head = new DockPanel { Margin = new Thickness(0, 0, 0, 14) };
+            var back = FlatButton("← 回到仓库", null);
+            back.Click += (s, e) => ShowSection("repo");
+            DockPanel.SetDock(back, Dock.Right);
+            head.Children.Add(back);
+
+            var titleStack = new StackPanel();
+            titleStack.Children.Add(new TextBlock
+            {
+                Text = "下载管理",
+                FontSize = 17,
+                FontWeight = FontWeights.Bold,
+                Foreground = p.Text
+            });
+            titleStack.Children.Add(new TextBlock
+            {
+                Text = "上传与下载串行跑（并发只会互相抢 NAS 的写入带宽）。离开这一页任务照跑。",
+                FontSize = 11.5,
+                Foreground = p.TextMuted,
+                Margin = new Thickness(0, 3, 0, 0)
+            });
+            head.Children.Add(titleStack);
+            root.Children.Add(head);
+
+            var actions = new WrapPanel { Margin = new Thickness(0, 0, 0, 12) };
+
+            var clear = FlatButton("清除已结束", null);
+            clear.Margin = new Thickness(0, 0, 8, 8);
+            clear.Click += (s, e) =>
+            {
+                if (plugin != null && plugin.Transfers != null)
+                {
+                    plugin.Transfers.ClearFinished();
+                }
+
+                OnTransfersChanged();
+            };
+            actions.Children.Add(clear);
+
+            var cancelAll = FlatButton("全部取消", null);
+            cancelAll.Margin = new Thickness(0, 0, 8, 8);
+            cancelAll.Click += (s, e) =>
+            {
+                if (plugin != null && plugin.Transfers != null)
+                {
+                    plugin.Transfers.CancelAll();
+                }
+
+                OnTransfersChanged();
+            };
+            actions.Children.Add(cancelAll);
+            root.Children.Add(actions);
+
+            taskListHost = new StackPanel();
+            root.Children.Add(taskListHost);
+
+            // 队列可能还不存在（插件对象尚未初始化完就被要求建页）—— 那就当空队列显示，
+            // 不要把整页构造打断。
+            RenderTasks(plugin != null && plugin.Transfers != null
+                ? plugin.Transfers.Snapshot()
+                : null);
+            return root;
+        }
+
+        private void RenderTasks(TransferTask[] tasks)
+        {
+            if (taskListHost == null)
+            {
+                return;
+            }
+
+            taskRowUpdaters.Clear();
+            taskListHost.Children.Clear();
+
+            if (tasks == null || tasks.Length == 0)
+            {
+                taskListHost.Children.Add(VaultCharts.Card(p, VaultCharts.Muted(p,
+                    "队列是空的。在「仓库」页点「归档到 NAS」或「取回本机」，任务就会出现在这里。")));
+                return;
+            }
+
+            // 没结束的排前面 —— 用户最关心「现在这条」
+            var ordered = tasks.OrderBy(t => t.IsFinished ? 1 : 0).ToArray();
+            foreach (var task in ordered)
+            {
+                taskListHost.Children.Add(BuildTaskRow(task));
+            }
+        }
+
+        private UIElement BuildTaskRow(TransferTask task)
+        {
+            var box = new StackPanel { Margin = new Thickness(0, 0, 0, 10) };
+
+            var head = new Grid();
+            head.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            head.ColumnDefinitions.Add(
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            head.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var kindBrush = task.Kind == TransferKind.Upload ? p.Info : p.Accent;
+            var chip = new Border
+            {
+                Background = kindBrush,
+                Padding = new Thickness(7, 2, 7, 2),
+                Margin = new Thickness(0, 0, 8, 0),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            chip.Child = new TextBlock
+            {
+                Text = task.KindText,
+                FontSize = 10.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = p.OnStatus(kindBrush)
+            };
+            Grid.SetColumn(chip, 0);
+            head.Children.Add(chip);
+
+            var name = new TextBlock
+            {
+                Text = task.Title,
+                FontSize = 12.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = p.Text,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(name, 1);
+            head.Children.Add(name);
+
+            var state = new TextBlock
+            {
+                FontSize = 11,
+                Foreground = p.TextMuted,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(10, 0, 10, 0)
+            };
+            Grid.SetColumn(state, 2);
+            head.Children.Add(state);
+
+            Button cancel = null;
+            if (!task.IsFinished)
+            {
+                cancel = CardButton("取消", p.Danger);
+                cancel.Click += (s, e) =>
+                {
+                    task.RequestCancel();
+                    if (state != null)
+                    {
+                        state.Text = "正在取消…";
+                    }
+                };
+                Grid.SetColumn(cancel, 2);
+            }
+
+            // 取消按钮与状态字挤在同一列：状态字在左、按钮在右
+            if (cancel != null)
+            {
+                head.Children.Remove(state);
+                var tail = new StackPanel { Orientation = Orientation.Horizontal };
+                state.Margin = new Thickness(10, 0, 10, 0);
+                tail.Children.Add(state);
+                tail.Children.Add(cancel);
+                Grid.SetColumn(tail, 2);
+                head.Children.Add(tail);
+            }
+
+            box.Children.Add(head);
+
+            Border fill;
+            ColumnDefinition fillCol;
+            var track = MakeBar(5, out fill, out fillCol);
+            track.Margin = new Thickness(0, 7, 0, 0);
+            box.Children.Add(track);
+
+            var detail = new TextBlock
+            {
+                FontSize = 11,
+                Foreground = p.TextMuted,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                Margin = new Thickness(0, 5, 0, 0)
+            };
+            box.Children.Add(detail);
+
+            var updater = new Action(() =>
+            {
+                SetBar(track, fillCol, task.Fraction);
+                if (task.State == TransferState.Failed)
+                {
+                    fill.Background = p.Danger;
+                }
+                else if (task.State == TransferState.Done)
+                {
+                    fill.Background = p.Success;
+                }
+
+                var line = task.DescribeProgress();
+                if (detail.Text != line)
+                {
+                    detail.Text = line;
+                }
+            });
+            taskRowUpdaters.Add(updater);
+            updater();
+
+            var card = VaultCharts.Card(p, box);
+            card.Margin = new Thickness(0, 0, 0, 10);
+            return card;
+        }
+
+        /// <summary>一条细进度条。返回轨道，并用 out 交出填充块与它的列 ——
+        /// 之后只改列宽就能更新进度，不用重建控件。</summary>
+        private Grid MakeBar(double height, out Border fill, out ColumnDefinition fillCol)
+        {
+            var track = new Grid
+            {
+                Height = height,
+                Background = p.SurfaceAlt,
+                ClipToBounds = true
+            };
+
+            var f = new Border { Background = p.Accent };
+            var fc = new ColumnDefinition { Width = new GridLength(0, GridUnitType.Star) };
+            var rest = new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) };
+
+            Grid.SetColumn(f, 0);
+            track.ColumnDefinitions.Add(fc);
+            track.ColumnDefinitions.Add(rest);
+            track.Children.Add(f);
+
+            fill = f;
+            fillCol = fc;
+            return track;
+        }
+
+        private static void SetBar(Grid track, ColumnDefinition fillCol, double fraction)
+        {
+            if (track == null || fillCol == null)
+            {
+                return;
+            }
+
+            var f = fraction < 0 ? 0 : (fraction > 1 ? 1 : fraction);
+            fillCol.Width = new GridLength(f, GridUnitType.Star);
+            track.ColumnDefinitions[1].Width = new GridLength(1 - f, GridUnitType.Star);
+        }
+
         // ================================================================ 状态点
 
         /// <summary>
         /// 右上角那个小圆点：外圈是个会呼吸的环，里面是实心点。
-        /// 点它重新探测一次 —— 这是「刷新」的第二入口（主入口在概览页里）。
+        /// 点它重新探测一次 —— v1.9 起它是**唯一**的刷新入口
+        /// （概览页里那个「刷新」按钮已经删掉，一个动作只留一个入口）。
         /// </summary>
         private Grid BuildHealthDot()
         {
@@ -453,29 +886,34 @@ namespace PlayniteVault.UI
                 return;
             }
 
+            // 提示的第一行要能**一句话回答「现在到底是什么状态」**，
+            // 所以带上具体地址 —— 「已连接」三个字看不出连的是哪台 NAS。
+            var url = service.Settings.WebDavUrl;
+            var address = string.IsNullOrWhiteSpace(url) ? "(未配置)" : url.TrimEnd('/');
+
             Brush color;
             string title;
             switch (result.State)
             {
                 case VaultHealthState.Ok:
                     color = p.Success;
-                    title = "已连接";
+                    title = "当前已连接 " + address;
                     break;
                 case VaultHealthState.Timeout:
                     color = p.Warning;
-                    title = "连接超时";
+                    title = "连接 " + address + " 超时";
                     break;
                 case VaultHealthState.Failed:
                     color = p.Danger;
-                    title = "连接失败";
+                    title = "连接 " + address + " 失败";
                     break;
                 case VaultHealthState.NotConfigured:
                     color = p.TextMuted;
-                    title = "未配置仓库";
+                    title = "还没配置仓库地址";
                     break;
                 default:
                     color = p.Info;
-                    title = "正在探测";
+                    title = "正在连接 " + address + "…";
                     break;
             }
 
@@ -629,15 +1067,7 @@ namespace PlayniteVault.UI
         {
             var root = new StackPanel();
 
-            var head = new DockPanel { Margin = new Thickness(0, 0, 0, 14) };
-            refreshButton = FlatButton("刷新", null);
-            refreshButton.Click += (s, e) =>
-            {
-                RefreshHealth();
-                RefreshStats();
-            };
-            DockPanel.SetDock(refreshButton, Dock.Right);
-            head.Children.Add(refreshButton);
+            var head = new StackPanel { Margin = new Thickness(0, 0, 0, 14) };
 
             var titleStack = new StackPanel();
             titleStack.Children.Add(new TextBlock
@@ -649,10 +1079,13 @@ namespace PlayniteVault.UI
             });
             titleStack.Children.Add(new TextBlock
             {
-                Text = "仓库、主题、连通状态一眼看完；上面那个小圆点是同一份数据。",
+                // 刷新按钮已经去掉：入口统一到左栏标题旁那个状态点上，
+                // 「点它重新探测」写在悬停提示里。
+                Text = "仓库、主题、连通状态一眼看完；数据与左栏标题旁那个小圆点是同一份，点它可以重新探测。",
                 FontSize = 11.5,
                 Foreground = p.TextMuted,
-                Margin = new Thickness(0, 3, 0, 0)
+                Margin = new Thickness(0, 3, 0, 0),
+                TextWrapping = TextWrapping.Wrap
             });
             head.Children.Add(titleStack);
             root.Children.Add(head);
@@ -832,12 +1265,12 @@ namespace PlayniteVault.UI
         {
             switch (result.State)
             {
-                case VaultHealthState.Ok:
-                    return "已连接（" + result.CheckedAt.ToString("HH:mm:ss") + "）";
-                case VaultHealthState.Timeout:
-                    return "连接超时 —— 多数是 NAS 没开机或网络不通，可以把鼠标放到右上角小点上看看详情";
-                case VaultHealthState.Failed:
-                    return "连接失败 —— 地址、账号口令或证书有问题，鼠标放到右上角小点上看排查步骤";
+            case VaultHealthState.Ok:
+                return "已连接（" + result.CheckedAt.ToString("HH:mm:ss") + "）";
+            case VaultHealthState.Timeout:
+                return "连接超时 —— 多数是 NAS 没开机或网络不通，把鼠标放到左栏标题旁那个小点上可以看详情";
+            case VaultHealthState.Failed:
+                return "连接失败 —— 地址、账号口令或证书有问题，鼠标放到左栏标题旁那个小点上看排查步骤";
                 case VaultHealthState.NotConfigured:
                     return "还没配置 WebDAV 地址（去「设置」里填）";
                 default:
@@ -845,34 +1278,58 @@ namespace PlayniteVault.UI
             }
         }
 
-        // ================================================================ 主题同步
+        // ================================================================ 主题
 
+        /// <summary>主题卡片在界面上的那一份（勾选框 + 数据）。</summary>
+        private sealed class ThemeCardVisual
+        {
+            public ThemeCatalogItem Item;
+
+            /// <summary>勾选框 —— 卡片整块就是它。</summary>
+            public CheckBox Box;
+
+            /// <summary>要挂进卡片墙的那个元素（带描边的外框）。</summary>
+            public FrameworkElement Element;
+        }
+
+        /// <summary>
+        /// 「主题」页：本地与 NAS 上的主题都做成卡片，勾选哪些就传哪些。
+        ///
+        /// <para><b>为什么改成勾选式</b>：以前只能选方向然后「全传」——
+        /// 用户下了一堆主题但只想备份其中两个时，没有任何表达方式。现在「勾选」是唯一的输入，
+        /// 方向仍要选，两者相乘才是这次要干的事。</para>
+        ///
+        /// <para><b>没勾的主题连比对都不参与</b>（<c>ThemeSyncOptions.Only</c>）——
+        /// 所以「只同步两个主题」是真的快，而不是「全比一遍再把其他的跳过」。</para>
+        /// </summary>
         private UIElement BuildThemeSync()
         {
             var root = new StackPanel();
             root.Children.Add(new TextBlock
             {
-                Text = "主题同步",
+                Text = "主题",
                 FontSize = 17,
                 FontWeight = FontWeights.Bold,
                 Foreground = p.Text,
                 Margin = new Thickness(0, 0, 0, 8)
             });
             root.Children.Add(VaultCharts.Muted(p,
-                "把 Playnite 的 Themes 目录和仓库的 themes/ 目录对齐。"
+                "本机与 NAS 上的主题都在下面，勾选哪些就传哪些。"
                 + "远端是「普通文件镜像」——NAS 上就是一份能直接翻、能直接拷回来的主题目录树。"));
 
+            // ---- 方向 ----
             var dir = new StackPanel { Margin = new Thickness(0, 14, 0, 0) };
             dir.Children.Add(VaultCharts.SectionTitle(p, "方向"));
 
-            dirUpload = DirOption("上传（本地 → NAS）：把本地主题推上去，适合刚下完主题", true);
-            dirDownload = DirOption("下载（NAS → 本地）：从 NAS 取回主题，适合换机器", false);
-            dirBoth = DirOption("双向：两边比对，缺哪补哪（默认只增不减，不会删东西）", false);
+            dirUpload = DirOption("上传（本地 → NAS）：把勾选的主题推上去", true);
+            dirDownload = DirOption("下载（NAS → 本地）：把勾选的主题取回来", false);
+            dirBoth = DirOption("双向：两边比对，缺哪补哪（只增不减，不会删东西）", false);
             dir.Children.Add(dirUpload);
             dir.Children.Add(dirDownload);
             dir.Children.Add(dirBoth);
             root.Children.Add(VaultCharts.Card(p, dir));
 
+            // ---- 选项 ----
             var opts = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
             opts.Children.Add(VaultCharts.SectionTitle(p, "选项"));
 
@@ -895,7 +1352,7 @@ namespace PlayniteVault.UI
             };
             opts.Children.Add(chkForce);
 
-            var syncButton = FlatButton("开始同步", null);
+            var syncButton = FlatButton("同步勾选的主题", p.Accent);
             syncButton.Margin = new Thickness(0, 12, 0, 0);
             syncButton.HorizontalAlignment = HorizontalAlignment.Left;
             syncButton.Click += (s, e) =>
@@ -917,31 +1374,263 @@ namespace PlayniteVault.UI
             opts.Children.Add(themeRootText);
             root.Children.Add(VaultCharts.Card(p, opts));
 
-            var resultBox = new StackPanel();
-            resultBox.Children.Add(VaultCharts.SectionTitle(p, "结果"));
-            syncResult = new TextBlock
+            // ---- 选择工具条 ----
+            var bar = new WrapPanel { Margin = new Thickness(0, 14, 0, 6) };
+
+            var all = CardButton("全选", null);
+            all.Margin = new Thickness(0, 0, 6, 6);
+            all.Click += (s, e) => SetAllThemes(true);
+            bar.Children.Add(all);
+
+            var none = CardButton("全不选", null);
+            none.Margin = new Thickness(0, 0, 6, 6);
+            none.Click += (s, e) => SetAllThemes(false);
+            bar.Children.Add(none);
+
+            var rescan = CardButton("重新扫描", null);
+            rescan.Margin = new Thickness(0, 0, 6, 6);
+            rescan.Click += (s, e) => RefreshThemes();
+            bar.Children.Add(rescan);
+
+            themeSummary = new TextBlock
             {
-                FontSize = 12,
-                Foreground = p.Text,
-                TextWrapping = TextWrapping.Wrap,
-                FontFamily = new FontFamily("Consolas, Microsoft YaHei"),
-                LineHeight = 19,
-                Text = "这一页直接驱动同步引擎，和命令行工具用的是同一段代码。" + Environment.NewLine
-                       + "· 两边都改过的主题按修改时间定胜负，输的那份原地留成 .conflict-* 副本，一个字节都不丢"
-                       + Environment.NewLine
-                       + "· 远端只增不减：本地删掉的主题不会连带删掉 NAS 上那份"
+                FontSize = 11.5,
+                Foreground = p.TextMuted,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(4, 0, 0, 6)
             };
-            resultBox.Children.Add(syncResult);
+            bar.Children.Add(themeSummary);
+            root.Children.Add(bar);
 
-            conflictList = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
-            resultBox.Children.Add(conflictList);
+            themeStatus = new TextBlock
+            {
+                FontSize = 11.5,
+                Foreground = p.TextMuted,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 0, 0, 10)
+            };
+            root.Children.Add(themeStatus);
 
-            var resultCard = VaultCharts.Card(p, resultBox);
-            resultCard.Margin = new Thickness(0, 12, 0, 0);
-            root.Children.Add(resultCard);
+            themeWall = new WrapPanel();
+            root.Children.Add(themeWall);
 
+            RefreshThemes();
             return root;
         }
+
+        // ---------------------------------------------------------------- 主题列表
+
+        private void SetAllThemes(bool value)
+        {
+            foreach (var visual in themeCards)
+            {
+                if (visual.Box != null)
+                {
+                    visual.Box.IsChecked = value;
+                }
+            }
+
+            UpdateThemeSummary();
+        }
+
+        /// <summary>勾选的主题键（与引擎内部的 Key 同一格式）。</summary>
+        private List<string> SelectedThemeKeys()
+        {
+            var keys = new List<string>();
+            foreach (var visual in themeCards)
+            {
+                if (visual.Box != null && visual.Box.IsChecked == true && visual.Item != null)
+                {
+                    keys.Add(visual.Item.Key);
+                }
+            }
+
+            return keys;
+        }
+
+        private void UpdateThemeSummary()
+        {
+            if (themeSummary == null)
+            {
+                return;
+            }
+
+            themeSummary.Text = string.Format("共 {0} 个主题，已勾选 {1} 个",
+                themeCards.Count, SelectedThemeKeys().Count);
+        }
+
+        /// <summary>
+        /// 拉一遍主题清单（本地扫目录 + 远端读 index.json）。网络那半在后台线程，回 UI 线程再画。
+        /// </summary>
+        private void RefreshThemes()
+        {
+            if (themesLoading || themeWall == null)
+            {
+                return;
+            }
+
+            themesLoading = true;
+            themeWall.Children.Clear();
+            themeCards.Clear();
+
+            if (themeSummary != null)
+            {
+                themeSummary.Text = "正在读取主题列表…";
+            }
+
+            if (themeStatus != null)
+            {
+                themeStatus.Text = string.Empty;
+            }
+
+            Task.Run(() =>
+            {
+                List<ThemeCatalogItem> items = null;
+                string error = null;
+
+                try
+                {
+                    items = plugin.LoadThemeCatalog(out error);
+                }
+                catch (Exception ex)
+                {
+                    error = ex.Message;
+                    VaultLog.Error("侧边栏页：读取主题列表失败", ex);
+                }
+
+                Dispatcher.Invoke(() => RenderThemes(items, error));
+            });
+        }
+
+        private void RenderThemes(List<ThemeCatalogItem> items, string error)
+        {
+            themesLoading = false;
+            if (themeWall == null)
+            {
+                return;
+            }
+
+            themeWall.Children.Clear();
+            themeCards.Clear();
+
+            if (items != null)
+            {
+                foreach (var item in items)
+                {
+                    var visual = BuildThemeCard(item);
+                    themeCards.Add(visual);
+                    themeWall.Children.Add(visual.Element);
+                }
+            }
+
+            UpdateThemeSummary();
+
+            if (themeStatus == null)
+            {
+                return;
+            }
+
+            themeStatus.Foreground = p.TextMuted;
+
+            // 远端读不到不算失败：断网时至少还能看到本地有什么、还能只上传
+            if (!string.IsNullOrEmpty(error))
+            {
+                themeStatus.Text = "读不到 NAS 上的主题列表（" + error + "）；下面只是本机有的主题。";
+                themeStatus.Foreground = p.Warning;
+                return;
+            }
+
+            var conflicts = ListConflictCopies();
+            if (conflicts.Count > 0)
+            {
+                themeStatus.Text = "主题目录里有 " + conflicts.Count
+                    + " 份冲突副本（原地保留，没删任何东西）："
+                    + string.Join("、", conflicts.Take(6))
+                    + (conflicts.Count > 6 ? " …" : "");
+                return;
+            }
+
+            themeStatus.Text = items == null || items.Count == 0
+                ? "两边都还没有主题。把主题放进上面的主题目录，再点「重新扫描」。"
+                : "标签颜色：绿=两边都有、橙=只在本机、蓝=只在 NAS。";
+        }
+
+        /// <summary>
+        /// 一张主题卡片。
+        ///
+        /// <para>勾选框直接把「名称 + 副标题」当 <c>Content</c>，而不是另外盖一层点击处理 ——
+        /// 后者在点到复选框本身时会与它自己的切换撞车（连切两次等于没切）。</para>
+        /// </summary>
+        private ThemeCardVisual BuildThemeCard(ThemeCatalogItem item)
+        {
+            var name = new TextBlock
+            {
+                Text = item.DisplayName,
+                FontSize = 12.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = p.Text,
+                TextWrapping = TextWrapping.Wrap,
+                MaxHeight = 36
+            };
+
+            Brush stateBrush;
+            if (item.Local && item.Remote)
+            {
+                stateBrush = p.Success;
+            }
+            else if (item.Local)
+            {
+                stateBrush = p.Warning;
+            }
+            else
+            {
+                stateBrush = p.Info;
+            }
+
+            var describe = new TextBlock
+            {
+                Text = item.Describe() + (string.IsNullOrWhiteSpace(item.Version)
+                    ? string.Empty
+                    : " · v" + item.Version),
+                FontSize = 11,
+                Foreground = stateBrush,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 3, 0, 0)
+            };
+
+            var col = new StackPanel { Margin = new Thickness(7, 0, 0, 0), MaxWidth = 210 };
+            col.Children.Add(name);
+            col.Children.Add(describe);
+
+            var box = new CheckBox
+            {
+                Content = col,
+                IsChecked = false,
+                Foreground = p.Text,
+                HorizontalContentAlignment = HorizontalAlignment.Left,
+                VerticalContentAlignment = VerticalAlignment.Center,
+                Cursor = Cursors.Hand
+            };
+            box.Checked += (s, e) => UpdateThemeSummary();
+            box.Unchecked += (s, e) => UpdateThemeSummary();
+
+            var frame = new Border
+            {
+                Width = 264,
+                Margin = new Thickness(0, 0, 10, 10),
+                Padding = new Thickness(10, 9, 10, 9),
+                Background = p.Surface,
+                BorderBrush = p.Border,
+                BorderThickness = new Thickness(2),
+                Child = box,
+                ToolTip = item.DisplayName + "\n" + item.Key + "\n"
+                          + (item.LocalFiles > 0 ? "本机 " + item.LocalFiles + " 个文件\n" : "")
+                          + (item.RemoteFiles > 0 ? "NAS " + item.RemoteFiles + " 个文件" : "")
+            };
+
+            return new ThemeCardVisual { Item = item, Box = box, Element = frame };
+        }
+
 
         private RadioButton DirOption(string text, bool selected)
         {
@@ -971,58 +1660,43 @@ namespace PlayniteVault.UI
             return ThemeSyncMode.Both;
         }
 
+        /// <summary>
+        /// 只把**勾选的主题**排进队列。
+        ///
+        /// <para>一个都没勾就直接拦下 —— 空集合传给引擎要么被当成「全部」、
+        /// 要么什么都没做，两种都不是用户想要的，不如在这里说清楚。</para>
+        /// </summary>
         private void RunSync(ThemeSyncMode mode, bool dryRun, bool force)
         {
-            ThemeSyncOutcome outcome;
-            try
+            var keys = SelectedThemeKeys();
+            if (keys.Count == 0)
             {
-                outcome = plugin.RunThemeSyncFromPanel(mode, dryRun, force);
-            }
-            catch (Exception ex)
-            {
-                VaultLog.Error("侧边栏页：主题同步失败", ex);
-                if (syncResult != null)
+                if (themeStatus != null)
                 {
-                    syncResult.Text = "同步失败：" + ex.Message;
+                    themeStatus.Text = "先勾选要同步的主题（或点上面的「全选」）。";
+                    themeStatus.Foreground = p.Warning;
                 }
+
                 return;
             }
 
-            if (syncResult == null)
+            var task = plugin.EnqueueThemeSync(mode, dryRun, force, keys);
+            if (task == null)
             {
                 return;
             }
 
-            syncResult.Text = outcome.Describe();
-
-            if (conflictList != null)
+            if (themeStatus != null)
             {
-                conflictList.Children.Clear();
-                var copied = ListConflictCopies();
-                if (copied.Count > 0)
-                {
-                    conflictList.Children.Add(new TextBlock
-                    {
-                        Text = "当前存在 " + copied.Count + " 份冲突副本（原地保留，没删任何东西）：",
-                        FontSize = 11.5,
-                        Foreground = p.Text,
-                        TextWrapping = TextWrapping.Wrap,
-                        Margin = new Thickness(0, 0, 0, 4)
-                    });
-                    foreach (var line in copied)
-                    {
-                        conflictList.Children.Add(new TextBlock
-                        {
-                            Text = "· " + line,
-                            FontSize = 11,
-                            Foreground = p.TextMuted,
-                            TextWrapping = TextWrapping.Wrap
-                        });
-                    }
-                }
+                themeStatus.Text = string.Format("已加入队列：{0} 个主题（{1}{2}）。进度看页面底部。",
+                    keys.Count,
+                    mode == ThemeSyncMode.Upload ? "上传"
+                        : (mode == ThemeSyncMode.Download ? "下载" : "双向"),
+                    dryRun ? "，预演" : string.Empty);
+                themeStatus.Foreground = p.TextMuted;
             }
 
-            RefreshStats();
+            OnTransfersChanged();
         }
 
         /// <summary>列出主题目录下现存的 .conflict-* 副本（只扫两层，足够）。</summary>
@@ -1051,35 +1725,79 @@ namespace PlayniteVault.UI
             return found;
         }
 
-        // ================================================================ 仓库与归档
+        // ================================================================ 仓库
 
         /// <summary>卡片尺寸。宽度固定，封面 3:4 —— Playnite 的封面基本都是竖版，裁切不会吃掉主体。</summary>
         private const double RepoCardWidth = 176;
         private const double RepoCardCoverHeight = 228;
 
-        /// <summary>一张卡片在界面上的那一份视觉对象（过滤时只翻 Visibility，不重建）。</summary>
+        /// <summary>
+        /// 一张卡片在界面上的那一份视觉对象。
+        ///
+        /// <para><b>为什么「只在 NAS 的条目」也做成这个类型</b>：以前它们是页面底部单独一列的
+        /// 文字行，结果是同一个游戏可能既有一张「未上传」的卡片、又在那一列里出现一次
+        /// （老条目没存游戏 ID + 本地已卸载 → 三级命中键全落空）。现在两边合成**同一面墙**，
+        /// 一个游戏只可能对应一张卡片，重复从结构上就不可能出现了。</para>
+        /// </summary>
         private sealed class RepoCardVisual
         {
+            /// <summary>本地 Playnite 库里的那条记录；为 null 表示「只在远端」。</summary>
             public LocalAppCard Card;
+
+            /// <summary>只在远端的仓库条目；Card 非空时为 null。</summary>
+            public AppEntry Remote;
+
             public FrameworkElement Element;
+
+            /// <summary>体积那个文本块 —— 本地体积是后台量出来的，量完回填这里。</summary>
+            public TextBlock SizeLabel;
+
+            public string Name
+            {
+                get
+                {
+                    if (Card != null)
+                    {
+                        return Card.Name ?? string.Empty;
+                    }
+
+                    if (Remote == null)
+                    {
+                        return string.Empty;
+                    }
+
+                    return string.IsNullOrWhiteSpace(Remote.Name) ? Remote.Id : Remote.Name;
+                }
+            }
+
+            public bool RemoteOnly
+            {
+                get { return Card == null; }
+            }
+
+            public bool InRepository
+            {
+                get { return Remote != null || (Card != null && Card.InRepository); }
+            }
         }
 
         /// <summary>
-        /// 「仓库与归档」页：本机 Playnite 库里每个游戏一张卡片（封面 + 传没传过），
-        /// 下面再挂一列「仓库里有、库里已经没有」的条目。
+        /// 「仓库」页：本机 Playnite 库里的游戏 + 只在 NAS 上的条目，**合成同一面卡片墙**。
         ///
-        /// <para><b>这一页取代了仓库管理窗口</b>（v1.8）：删除不再需要另开窗口，
-        /// 卡片上直接点删除，口令闸门还是那一道
-        /// （<c>VaultPlugin.DeleteRepositoryApp</c>，自检有 IL 级断言盯着）。
-        /// 窗口留着，但只剩「改管理口令」这种一次性操作。</para>
+        /// <para><b>一张卡片能做的事</b>：未上传的 → 归档到 NAS；已上传的 → 从 NAS 删除；
+        /// 从 NAS 拉下来装着的 → 卸载（只删本地）；只在 NAS 的 → 取回本机。</para>
         ///
-        /// <para><b>为什么是卡片墙而不是表格</b>：这一页要回答的是「我库里这些游戏，
+        /// <para><b>为什么是同一面墙而不是两块</b>：拆成两块就会出现「同一个游戏两张脸」——
+        /// 一边说未上传、一边说仓库里有。合成一面之后，一个游戏要么占一张本地卡片、
+        /// 要么落在一张「只在 NAS」的卡片里，不可能既此又彼。</para>
+        ///
+        /// <para><b>为什么是卡片而不是表格</b>：这一页要回答的是「我库里这些游戏，
         /// 哪些已经进仓库了」。表格里一列 Id、一列体积，扫过去认不出谁是谁；
         /// 封面才是用户识别游戏的符号，一眼就知道缺哪几个。</para>
         ///
-        /// <para><b>为什么两种状态都有</b>：只看「库里 → 仓库」会漏掉另一半 ——
-        /// 归档完把游戏从库里删掉，条目就成了没人认领的孤儿，
-        /// 而它占着 NAS 的空间。<c>MatchNote</c> 那一行是给「凭什么说他传过了」准备的答案。</para>
+        /// <para><b>上传 / 下载不再弹模态框</b>：点下去只是丢进传输队列，底部会出现一条
+        /// 聚合进度条，想细看就点「下载管理」。归档格式与口令闸门
+        /// （<c>VaultPlugin.DeleteRepositoryApp</c>，自检有 IL 级断言盯着）一个字节都没动。</para>
         /// </summary>
         private UIElement BuildRepo()
         {
@@ -1101,18 +1819,19 @@ namespace PlayniteVault.UI
             var titleStack = new StackPanel();
             titleStack.Children.Add(new TextBlock
             {
-                Text = "仓库与归档",
+                Text = "仓库",
                 FontSize = 17,
                 FontWeight = FontWeights.Bold,
                 Foreground = p.Text
             });
             titleStack.Children.Add(new TextBlock
             {
-                Text = "本机库里的游戏逐个标出「传过没有」；判定按 Playnite 游戏 ID 优先，"
-                     + "并在卡片提示里写明依据。",
+                Text = "本机库里的游戏与 NAS 上的归档在这里对齐；判定按 Playnite 游戏 ID 优先，"
+                     + "依据写在卡片提示里。上传 / 下载丢进队列，不阻塞界面。",
                 FontSize = 11.5,
                 Foreground = p.TextMuted,
-                Margin = new Thickness(0, 3, 0, 0)
+                Margin = new Thickness(0, 3, 0, 0),
+                TextWrapping = TextWrapping.Wrap
             });
             head.Children.Add(titleStack);
             root.Children.Add(head);
@@ -1123,6 +1842,7 @@ namespace PlayniteVault.UI
             bar.Children.Add(BuildFilterChip("all", "全部"));
             bar.Children.Add(BuildFilterChip("in", "已上传"));
             bar.Children.Add(BuildFilterChip("out", "未上传"));
+            bar.Children.Add(BuildFilterChip("remote", "只在 NAS"));
 
             var searchHost = new Grid { Width = 210, Margin = new Thickness(8, 0, 0, 0) };
             repoSearch = new TextBox
@@ -1224,20 +1944,6 @@ namespace PlayniteVault.UI
             wall.Children.Add(repoEmpty);
             root.Children.Add(wall);
 
-            // ---- 孤儿条目（仓库里有、库里没有）----
-            repoOrphanHost = new StackPanel();
-            var orphanStack = new StackPanel();
-            orphanStack.Children.Add(VaultCharts.SectionTitle(p, "仓库里没有本机对应的条目"));
-            orphanStack.Children.Add(VaultCharts.Muted(p,
-                "这些归档在 NAS 上，但本地 Playnite 库里已经找不到对应游戏（换过机器、"
-                + "或者游戏被从库里删掉了）。它们仍然占着仓库空间，可以直接删。"));
-            orphanStack.Children.Add(repoOrphanHost);
-
-            repoOrphanCard = VaultCharts.Card(p, orphanStack);
-            repoOrphanCard.Margin = new Thickness(0, 16, 0, 0);
-            repoOrphanCard.Visibility = Visibility.Collapsed;
-            root.Children.Add(repoOrphanCard);
-
             StyleFilterChips();
             RefreshRepo();
             return root;
@@ -1312,8 +2018,6 @@ namespace PlayniteVault.UI
             repoLoading = true;
             repoCards.Clear();
             repoWallGrid.Children.Clear();
-            repoOrphanHost.Children.Clear();
-            repoOrphanCard.Visibility = Visibility.Collapsed;
             repoEmpty.Visibility = Visibility.Collapsed;
             repoSummary.Text = "正在读取仓库索引…";
             SetRepoStatus(string.Empty, null);
@@ -1347,17 +2051,17 @@ namespace PlayniteVault.UI
             }
 
             List<LocalAppCard> cards;
-            List<AppEntry> orphans;
+            List<AppEntry> remoteOnly;
 
             // 对账要遍历 Playnite 的库 —— 必须回 UI 线程做
             try
             {
                 cards = plugin.BuildLocalAppCards(index);
-                orphans = plugin.FindOrphanRepoApps(index, cards);
+                remoteOnly = plugin.FindOrphanRepoApps(index, cards);
             }
             catch (Exception ex)
             {
-                VaultLog.Error("仓库与归档：对账失败", ex);
+                VaultLog.Error("仓库：对账失败", ex);
                 repoWallGrid.Children.Clear();
                 repoSummary.Text = "读不出本机游戏列表。";
                 repoEmpty.Text = "对账失败：" + ex.Message;
@@ -1368,10 +2072,13 @@ namespace PlayniteVault.UI
 
             // ---- 汇总 ----
             var uploaded = cards.Count(c => c.InRepository);
-            var bytes = cards.Where(c => c.InRepository).Sum(c => c.RepoBytes);
+            var repoCount = index == null ? 0 : index.Apps.Count;
+            var bytes = index == null ? 0 : index.Apps.Sum(a => a.TotalBytes);
             repoSummary.Text = string.Format(
-                "本机库 {0} 个游戏：{1} 个已上传、{2} 个还没传。仓库里这 {1} 个占 {3}。（索引来源：{4}）",
+                "本机库 {0} 个游戏：{1} 个已归档到 NAS、{2} 个还没传。"
+                + "NAS 上共 {3} 个归档（其中 {4} 个本机库里没有对应的游戏），占 {5}。（索引来源：{6}）",
                 cards.Count, uploaded, cards.Count - uploaded,
+                repoCount, remoteOnly.Count,
                 VaultAdminWindow.FormatSize(bytes),
                 string.IsNullOrEmpty(source) ? "未知" : source);
 
@@ -1381,7 +2088,9 @@ namespace PlayniteVault.UI
                 SetRepoStatus("注意：" + error, null);
             }
 
-            // ---- 卡片 ----
+            // ---- 卡片墙：本地游戏 + 只在 NAS 的条目，合成一面 ----
+            // 合成之后「同一个游戏两张脸」从结构上就不可能再出现：
+            // 一个游戏要么落在一张本地卡片上，要么落在一张「只在 NAS」的卡片上。
             repoCards.Clear();
             repoWallGrid.Children.Clear();
 
@@ -1393,20 +2102,138 @@ namespace PlayniteVault.UI
                 repoWallGrid.Children.Add(visual.Element);
             }
 
+            foreach (var app in remoteOnly)
+            {
+                var visual = BuildRemoteCard(app);
+                repoCards.Add(visual);
+                repoWallGrid.Children.Add(visual.Element);
+            }
+
             ApplyRepoFilter();
 
-            // ---- 孤儿 ----
-            repoOrphanHost.Children.Clear();
-            repoOrphanCard.Visibility = orphans.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
-            foreach (var app in orphans)
+            // ---- 本地体积：后台量，量完只改那几个文本块 ----
+            var measure = repoCards
+                .Where(v => v.Card != null && v.Card.IsInstalled
+                            && v.Card.LocalBytes <= 0 && v.SizeLabel != null)
+                .ToList();
+            if (measure.Count > 0)
             {
-                repoOrphanHost.Children.Add(BuildOrphanRow(app));
+                MeasureLocalSizes(measure);
             }
 
             if (pendingCovers.Count > 0)
             {
                 LoadCovers(pendingCovers);
             }
+        }
+
+        /// <summary>
+        /// 后台量本地安装目录的体积。
+        ///
+        /// <para>为什么要异步：一个 100GB 的游戏要遍历几万个文件，放在 UI 线程上就是肉眼可见的卡顿，
+        /// 而用户看这一页主要是为了「谁还没传」—— 体积晚几百毫秒出来完全不影响判断。</para>
+        /// </summary>
+        private void MeasureLocalSizes(List<RepoCardVisual> visuals)
+        {
+            Task.Run(() =>
+            {
+                var measured = new List<KeyValuePair<RepoCardVisual, long>>();
+                foreach (var visual in visuals)
+                {
+                    var dir = visual.Card == null ? null : visual.Card.InstallDir;
+                    if (string.IsNullOrWhiteSpace(dir))
+                    {
+                        continue;
+                    }
+
+                    var size = MeasureDirectory(dir);
+                    if (size > 0)
+                    {
+                        measured.Add(new KeyValuePair<RepoCardVisual, long>(visual, size));
+                    }
+                }
+
+                if (measured.Count == 0)
+                {
+                    return;
+                }
+
+                Dispatcher.Invoke(() =>
+                {
+                    foreach (var pair in measured)
+                    {
+                        if (pair.Key.Card != null)
+                        {
+                            pair.Key.Card.LocalBytes = pair.Value;
+                        }
+
+                        if (pair.Key.SizeLabel != null)
+                        {
+                            pair.Key.SizeLabel.Text = DescribeCardSize(pair.Key);
+                        }
+                    }
+                });
+            });
+        }
+
+        private static long MeasureDirectory(string dir)
+        {
+            long total = 0;
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+                {
+                    try
+                    {
+                        total += new FileInfo(file).Length;
+                    }
+                    catch (IOException)
+                    {
+                    }
+                    catch (UnauthorizedAccessException)
+                    {
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Warn("统计目录体积失败（" + dir + "）：" + ex.Message);
+            }
+
+            return total;
+        }
+
+        /// <summary>
+        /// 卡片上那个体积字的统一出口。
+        ///
+        /// <para>优先级：**本机占用 → 仓库体积 → 状态字**。用户问「这游戏多大」时，
+        /// 他心里想的是占了自己多少磁盘，而不是 NAS 上那份压缩后多大 ——
+        /// 后者放在悬停提示里就够了。</para>
+        /// </summary>
+        private string DescribeCardSize(RepoCardVisual visual)
+        {
+            if (visual == null)
+            {
+                return string.Empty;
+            }
+
+            if (visual.RemoteOnly)
+            {
+                return VaultAdminWindow.FormatSize(visual.Remote.TotalBytes);
+            }
+
+            var card = visual.Card;
+            if (card.LocalBytes > 0)
+            {
+                return VaultAdminWindow.FormatSize(card.LocalBytes);
+            }
+
+            if (card.InRepository)
+            {
+                return VaultAdminWindow.FormatSize(card.RepoBytes);
+            }
+
+            return card.IsInstalled ? "统计中…" : "本机未安装";
         }
 
         /// <summary>封面在后台上解码，解完一次性贴回 UI。</summary>
@@ -1526,7 +2353,7 @@ namespace PlayniteVault.UI
             stateRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             stateRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-            // 状态徽章：绿=已上传、橙=该传了。**这两个都是实心色块**，
+            // 状态徽章：绿=已归档、橙=该归档了。**这两个都是实心色块**，
             // 所以字色必须按底色亮度挑（VaultPalette.OnStatus），
             // 否则浅色档下橙底压深字只有 3:1，糊成一片。
             var statusBrush = card.InRepository
@@ -1544,7 +2371,7 @@ namespace PlayniteVault.UI
                 };
                 chip.Child = new TextBlock
                 {
-                    Text = card.InRepository ? "已上传" : "未上传",
+                    Text = card.InRepository ? "已在 NAS" : "未归档",
                     FontSize = 10.5,
                     FontWeight = FontWeights.SemiBold,
                     Foreground = p.OnStatus(statusBrush)
@@ -1566,11 +2393,11 @@ namespace PlayniteVault.UI
                 stateRow.Children.Add(missing);
             }
 
+            // 体积字先留空，建完 visual 之后统一走 DescribeCardSize 填 ——
+            // 本地体积是后台量出来的，描述规则只能有一处，不能在这里再写一遍。
             var size = new TextBlock
             {
-                Text = card.InRepository
-                    ? VaultAdminWindow.FormatSize(card.RepoBytes)
-                    : (card.IsInstalled ? "待归档" : string.Empty),
+                Text = string.Empty,
                 FontSize = 10.5,
                 Foreground = p.TextMuted,
                 HorizontalAlignment = HorizontalAlignment.Right,
@@ -1587,18 +2414,36 @@ namespace PlayniteVault.UI
             if (card.InRepository)
             {
                 var captured = card;
-                var remove = CardButton("删除", p.Danger);
+
+                var remove = CardButton("从 NAS 删除", p.Danger);
+                remove.Margin = new Thickness(0, 0, 6, 6);
                 remove.ToolTip = "从 NAS 删除这条归档（要管理口令）；本地已下载的文件不动";
                 remove.Click += (s, e) => ConfirmDeleteRepoApp(
                     captured.RepoAppId, captured.Name, captured.RepoBytes);
                 actions.Children.Add(remove);
+
+                // 只有「从仓库拉下来装着的」才给卸载 —— 从 Steam 之类装的原生游戏
+                // 不归我们管，删它的目录是越权。
+                if (captured.Downloaded && captured.IsInstalled)
+                {
+                    var uninstall = CardButton("卸载本地", null);
+                    uninstall.Margin = new Thickness(0, 0, 6, 6);
+                    uninstall.ToolTip = "删掉本地这份腾磁盘；NAS 上的归档不动，之后可以再取回来";
+                    uninstall.Click += (s, e) => ConfirmUninstall(captured);
+                    actions.Children.Add(uninstall);
+                }
             }
             else if (card.IsInstalled)
             {
                 var captured = card;
                 var upload = CardButton("归档到 NAS", p.Accent);
-                upload.ToolTip = "把这个游戏打包上传到 NAS（本地文件不会被删除）";
-                upload.Click += (s, e) => plugin.ArchiveGameById(captured.GameId);
+                upload.Margin = new Thickness(0, 0, 6, 6);
+                upload.ToolTip = "把这个游戏打包上传到 NAS（本地文件不会被删除）；任务会进「下载管理」";
+                upload.Click += (s, e) =>
+                {
+                    plugin.EnqueueArchiveById(captured.GameId);
+                    OnTransfersChanged();
+                };
                 actions.Children.Add(upload);
             }
 
@@ -1620,7 +2465,9 @@ namespace PlayniteVault.UI
                 ToolTip = BuildCardTip(card)
             };
 
-            return new RepoCardVisual { Card = card, Element = frame };
+            var visual = new RepoCardVisual { Card = card, Element = frame, SizeLabel = size };
+            size.Text = DescribeCardSize(visual);
+            return visual;
         }
 
         private string BuildCardTip(LocalAppCard card)
@@ -1635,12 +2482,22 @@ namespace PlayniteVault.UI
             if (card.InRepository)
             {
                 lines.Add("仓库条目：" + card.RepoAppId
-                          + "（" + VaultAdminWindow.FormatSize(card.RepoBytes) + "）");
+                          + "（NAS 上占 " + VaultAdminWindow.FormatSize(card.RepoBytes) + "）");
+            }
+
+            if (card.LocalBytes > 0)
+            {
+                lines.Add("本机占用：" + VaultAdminWindow.FormatSize(card.LocalBytes));
             }
 
             if (!string.IsNullOrEmpty(card.InstallDir))
             {
                 lines.Add("本机目录：" + card.InstallDir);
+            }
+
+            if (card.Downloaded)
+            {
+                lines.Add("这一份是从 NAS 取回的，可以卸载（只删本地）。");
             }
 
             return string.Join("\n", lines);
@@ -1689,21 +2546,25 @@ namespace PlayniteVault.UI
             var visible = 0;
             foreach (var visual in repoCards)
             {
-                var card = visual.Card;
                 var pass = true;
 
-                if (repoFilterMode == "in" && !card.InRepository)
+                if (repoFilterMode == "remote")
                 {
-                    pass = false;
+                    // 「只在 NAS」= 本机库里没有对应游戏的归档
+                    pass = visual.RemoteOnly;
                 }
-                else if (repoFilterMode == "out" && card.InRepository)
+                else if (repoFilterMode == "in")
                 {
-                    pass = false;
+                    pass = visual.InRepository;
+                }
+                else if (repoFilterMode == "out")
+                {
+                    pass = visual.Card != null && !visual.Card.InRepository;
                 }
 
                 if (pass && repoFilterText.Length > 0)
                 {
-                    pass = (card.Name ?? string.Empty).IndexOf(
+                    pass = visual.Name.IndexOf(
                         repoFilterText, StringComparison.CurrentCultureIgnoreCase) >= 0;
                 }
 
@@ -1721,7 +2582,7 @@ namespace PlayniteVault.UI
 
             if (repoCards.Count == 0)
             {
-                repoEmpty.Text = "本机 Playnite 库里还没有游戏。";
+                repoEmpty.Text = "本机 Playnite 库里还没有游戏，NAS 上也没有归档。";
                 repoEmpty.Visibility = Visibility.Visible;
                 return;
             }
@@ -1816,43 +2677,177 @@ namespace PlayniteVault.UI
             });
         }
 
-        // ---------------------------------------------------------------- 孤儿条目
+        // ---------------------------------------------------------------- 卸载
 
-        private UIElement BuildOrphanRow(AppEntry app)
+        /// <summary>
+        /// 卸载：只删本地那份，NAS 上的归档一个字节都不动。
+        ///
+        /// <para><b>为什么不要口令</b>：口令闸门只拦**不可逆**的动作（删远端归档）。
+        /// 卸载本地是可恢复的 —— 归档还在，随时能再取回来，而且「腾磁盘」是日常操作，
+        /// 多一道口令只会在每次清盘时挡一下。（别把这里改成走删除闸门：
+        /// 闸门只有一道，不是「删东西就要口令」。）</para>
+        /// </summary>
+        private void ConfirmUninstall(LocalAppCard card)
         {
-            var row = new DockPanel { Margin = new Thickness(0, 0, 0, 6) };
+            if (card == null || string.IsNullOrWhiteSpace(card.RepoAppId))
+            {
+                return;
+            }
 
-            var remove = CardButton("删除", p.Danger);
-            remove.ToolTip = "从 NAS 删除 apps/" + app.Id + "/（本地已下载的文件不动）";
-            remove.Click += (s, e) => ConfirmDeleteRepoApp(app.Id, app.Name, app.TotalBytes);
-            DockPanel.SetDock(remove, Dock.Right);
-            row.Children.Add(remove);
+            var dir = string.IsNullOrWhiteSpace(card.DownloadedDir)
+                ? card.InstallDir
+                : card.DownloadedDir;
+
+            var confirm = MessageBox.Show(
+                "确定删掉「" + card.Name + "」的本地文件吗？\n\n"
+                + "目录：" + (string.IsNullOrWhiteSpace(dir) ? "(默认安装目录)" : dir) + "\n\n"
+                + "只删本地这份；NAS 上的归档保留，之后随时可以再取回来。\n"
+                + "删完 Playnite 里这个条目会变成「未安装」。",
+                "卸载本地文件",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+
+            if (confirm != MessageBoxResult.Yes)
+            {
+                return;
+            }
+
+            plugin.EnqueueUninstall(card.RepoAppId, card.Name, dir);
+            SetRepoStatus("已加入队列：卸载「" + card.Name + "」的本地文件。", null);
+            OnTransfersChanged();
+        }
+
+        // ---------------------------------------------------------------- 仅在 NAS 的条目
+
+        /// <summary>
+        /// 「只在 NAS」的卡片：本机库里找不到对应游戏（换过机器、或者游戏被从库里删了）。
+        ///
+        /// <para>它长得和本地卡片一样，只是封面退化成首字占位、动作换成「取回本机 / 从 NAS 删除」。
+        /// 做成卡片而不是一行文字，是为了让它和本地卡片**在同一面墙上有同样的分量** ——
+        /// 之前做成下面单独一列时，用户根本注意不到它能下载。</para>
+        /// </summary>
+        private RepoCardVisual BuildRemoteCard(AppEntry app)
+        {
+            var name = string.IsNullOrWhiteSpace(app.Name) ? app.Id : app.Name;
+            var body = new StackPanel();
+
+            // ---- 封面：没有封面就用首字占位 ----
+            var cover = new Grid
+            {
+                Width = RepoCardWidth,
+                Height = RepoCardCoverHeight,
+                Background = p.SurfaceAlt,
+                ClipToBounds = true
+            };
+            cover.Children.Add(new TextBlock
+            {
+                Text = InitialOf(name),
+                FontSize = 42,
+                FontWeight = FontWeights.Bold,
+                Foreground = p.BorderStrong,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+
+            // 角上挂一个「只在 NAS」的标记 —— 它跟「本机有、还没传」是相反的状态，
+            // 光看封面分不出来。
+            var corner = p.Info;
+            var badge = new Border
+            {
+                Background = corner,
+                Padding = new Thickness(7, 2, 7, 2),
+                HorizontalAlignment = HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Top,
+                Margin = new Thickness(8, 8, 0, 0)
+            };
+            badge.Child = new TextBlock
+            {
+                Text = "只在 NAS",
+                FontSize = 10.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = p.OnStatus(corner)
+            };
+            cover.Children.Add(badge);
+            body.Children.Add(cover);
+
+            // ---- 文字区 ----
+            var text = new StackPanel { Margin = new Thickness(10, 9, 10, 10) };
+
+            text.Children.Add(new TextBlock
+            {
+                Text = name,
+                FontSize = 12.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = p.Text,
+                TextWrapping = TextWrapping.Wrap,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                MaxHeight = 34
+            });
+
+            var stateRow = new Grid { Margin = new Thickness(0, 7, 0, 0) };
+            stateRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            stateRow.ColumnDefinitions.Add(
+                new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var missing = new TextBlock
+            {
+                Text = "本机库里没有",
+                FontSize = 10.5,
+                Foreground = p.TextMuted,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(missing, 0);
+            stateRow.Children.Add(missing);
 
             var size = new TextBlock
             {
-                Text = VaultAdminWindow.FormatSize(app.TotalBytes),
-                FontSize = 11.5,
+                FontSize = 10.5,
                 Foreground = p.TextMuted,
-                Width = 80,
-                TextAlignment = TextAlignment.Right,
+                HorizontalAlignment = HorizontalAlignment.Right,
                 VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(8, 0, 10, 0)
+                TextTrimming = TextTrimming.CharacterEllipsis
             };
-            DockPanel.SetDock(size, Dock.Right);
-            row.Children.Add(size);
+            Grid.SetColumn(size, 1);
+            stateRow.Children.Add(size);
+            text.Children.Add(stateRow);
 
-            var name = new TextBlock
+            // ---- 操作 ----
+            var actions = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
+
+            var fetch = CardButton("取回本机", p.Accent);
+            fetch.Margin = new Thickness(0, 0, 6, 6);
+            fetch.ToolTip = "从 NAS 把这份归档解到本地默认目录；任务会进「下载管理」";
+            fetch.Click += (s, e) =>
             {
-                Text = string.IsNullOrEmpty(app.Name) ? app.Id : app.Name,
-                FontSize = 12,
-                Foreground = p.Text,
-                TextTrimming = TextTrimming.CharacterEllipsis,
-                VerticalAlignment = VerticalAlignment.Center,
-                ToolTip = "apps/" + app.Id + "/"
+                plugin.EnqueueInstall(app.Id, name, null);
+                OnTransfersChanged();
             };
-            row.Children.Add(name);
+            actions.Children.Add(fetch);
 
-            return row;
+            var remove = CardButton("从 NAS 删除", p.Danger);
+            remove.Margin = new Thickness(0, 0, 6, 6);
+            remove.ToolTip = "从 NAS 删除 apps/" + app.Id + "/";
+            remove.Click += (s, e) => ConfirmDeleteRepoApp(app.Id, name, app.TotalBytes);
+            actions.Children.Add(remove);
+
+            text.Children.Add(actions);
+            body.Children.Add(text);
+
+            var frame = new Border
+            {
+                Width = RepoCardWidth,
+                Margin = new Thickness(0, 0, 10, 10),
+                Background = p.Surface,
+                BorderBrush = p.Info,
+                BorderThickness = new Thickness(2),
+                Child = body,
+                ToolTip = name + "\n仓库条目：" + app.Id
+                          + "（" + VaultAdminWindow.FormatSize(app.TotalBytes) + "）\napps/" + app.Id + "/"
+            };
+
+            var visual = new RepoCardVisual { Remote = app, Element = frame, SizeLabel = size };
+            size.Text = DescribeCardSize(visual);
+            return visual;
         }
 
         // ================================================================ 设置
@@ -1866,23 +2861,21 @@ namespace PlayniteVault.UI
                 FontSize = 17,
                 FontWeight = FontWeights.Bold,
                 Foreground = p.Text,
-                Margin = new Thickness(0, 0, 0, 8)
+                Margin = new Thickness(0, 0, 0, 10)
             });
-            root.Children.Add(VaultCharts.Muted(p,
-                "和 Playnite 的「扩展设置」里是同一份界面（同一个设置模型和服务对象），改完点下面的保存。"));
 
-            var host = new Border
-            {
-                Background = p.Surface,
-                BorderBrush = p.Border,
-                BorderThickness = new Thickness(2),
-                Margin = new Thickness(0, 14, 0, 0),
-                Padding = new Thickness(2)
-            };
+            // 容器本身不再带一层底色与描边 —— 设置界面内部已经是四个带描边的模块卡片了，
+            // 再套一层就是「卡中卡」，看起来像两层没对齐。
+            var host = new Border { Padding = new Thickness(0) };
 
             try
             {
-                host.Child = new VaultSettingsView(settingsVm, service);
+                // 侧边栏这一页是插件自己嵌的，Playnite 不会替我们跑 ISettings 的
+                // BeginEdit 生命周期（那套只服务于「扩展设置」页）。不显式打快照的话，
+                // 「放弃改动」就没有可回退的基准。
+                settingsVm.BeginEdit();
+
+                host.Child = new VaultSettingsView(settingsVm, service, true);
 
                 // 明暗档位一改就得重建这一页 —— 颜色是建控件时烘进去的。
                 if (!settingsSavedHooked)
@@ -1914,6 +2907,7 @@ namespace PlayniteVault.UI
             reloadButton.Click += (s, e) =>
             {
                 settingsVm.CancelEdit();
+                settingsVm.BeginEdit();
                 RebuildForTheme();
                 saveStatusText = "已放弃未保存的改动";
                 saveStatusOk = null;
@@ -1942,22 +2936,47 @@ namespace PlayniteVault.UI
         }
 
         /// <summary>
-        /// 落盘。注意 <c>SaveSettingsImmediately</c> 会触发 <see cref="RebuildForTheme"/>
-        /// （换色需要重建视觉树），所以这里先把提示语写进字段，重建后新控件会自己带上它。
+        /// 落盘。
+        ///
+        /// <para>三条比原来多做的事：</para>
+        /// <list type="number">
+        /// <item>**先校验**（地址要带协议头、数值要在范围内）—— 校验不过就不落盘，
+        /// 并直接把第一条错误写出来，而不是闷头存下一个永远连不上的地址。</item>
+        /// <item>**拿到真实的成败**（<c>SaveSettingsNow</c>）—— 以前写盘失败只会进日志，
+        /// 界面照样显示「已保存」，用户看到的就是「保存没生效」。</item>
+        /// <item>**存完重打快照** —— <c>EndEdit</c> 之后编辑对象与已保存对象是同一个引用，
+        /// 不重打快照的话「放弃改动」就再也回不去了。</item>
+        /// </list>
+        ///
+        /// <para>保存会触发 <see cref="RebuildForTheme"/>（换色需要重建视觉树），
+        /// 所以提示语先写进字段，重建后新控件会自己带上它。</para>
         /// </summary>
         private void SaveSettings()
         {
-            try
+            List<string> errors;
+            if (!settingsVm.VerifySettings(out errors) && errors.Count > 0)
             {
-                plugin.SaveSettingsImmediately(settingsVm);
-                saveStatusOk = true;
-                saveStatusText = "已保存 " + DateTime.Now.ToString("HH:mm:ss");
-            }
-            catch (Exception ex)
-            {
-                VaultLog.Error("侧边栏页：保存设置失败", ex);
                 saveStatusOk = false;
-                saveStatusText = "保存失败：" + ex.Message;
+                saveStatusText = "还不能保存：" + errors[0]
+                    + (errors.Count > 1 ? "（还有 " + (errors.Count - 1) + " 项要改）" : string.Empty);
+            }
+            else
+            {
+                string error;
+                if (plugin.SaveSettingsNow(settingsVm, out error))
+                {
+                    saveStatusOk = true;
+                    saveStatusText = "已保存并生效 " + DateTime.Now.ToString("HH:mm:ss");
+
+                    // 重新打快照：否则 editing 与 service.Settings 是同一个对象，
+                    // 之后任何一次键入都直接改到「已保存」那份上。
+                    settingsVm.BeginEdit();
+                }
+                else
+                {
+                    saveStatusOk = false;
+                    saveStatusText = "保存失败：" + (error ?? "未知错误");
+                }
             }
 
             if (saveStatus != null)
@@ -2014,10 +3033,6 @@ namespace PlayniteVault.UI
             }
 
             statsLoading = true;
-            if (refreshButton != null)
-            {
-                refreshButton.IsEnabled = false;
-            }
 
             RenderOverview(null);
 
@@ -2059,11 +3074,6 @@ namespace PlayniteVault.UI
                 Dispatcher.Invoke(() =>
                 {
                     statsLoading = false;
-                    if (refreshButton != null)
-                    {
-                        refreshButton.IsEnabled = true;
-                    }
-
                     RenderOverview(stats);
                 });
             });

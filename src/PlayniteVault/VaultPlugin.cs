@@ -39,6 +39,7 @@ namespace PlayniteVault
         private readonly LibraryAutoRefresh autoRefresh;
         private readonly VaultSaveService saves;
         private readonly SaveTriggers saveTriggers;
+        private readonly TransferQueue transfers;
 
         /// <summary>正在进行的传输数（安装 / 归档 / 修复）。自动刷新要避开它们。</summary>
         private int transferCount;
@@ -69,6 +70,12 @@ namespace PlayniteVault
             get { return saves; }
         }
 
+        /// <summary>上传/下载队列（侧边栏「仓库」页与「下载管理」用）。</summary>
+        public TransferQueue Transfers
+        {
+            get { return transfers; }
+        }
+
         public VaultPlugin(IPlayniteAPI api) : base(api)
         {
             Instance = this;
@@ -97,6 +104,11 @@ namespace PlayniteVault
 
             saves = new VaultSaveService(service, api, dataPath);
             saveTriggers = new SaveTriggers(this, saves, api);
+
+            // 上传/下载队列。侧边栏「仓库」页不再用 Playnite 的模态进度框（那会把整个
+            // Playnite 按住），而是把任务排进这里后台跑，进度落在页面底部的聚合进度条上。
+            // 通知一律 Post 回 UI 线程 —— 订阅者是 WPF 控件，在后台线程上碰它们会抛异常。
+            transfers = new TransferQueue(PostToUi);
 
             VaultLog.Info("VaultPlugin 已构造，数据目录=" + service.DataPath
                 + "，版本=" + VaultUpdater.CurrentVersion());
@@ -1237,6 +1249,25 @@ namespace PlayniteVault
             app.Dispatcher.Invoke(action);
         }
 
+        /// <summary>
+        /// 把动作丢回 UI 线程，**不等它跑完**。
+        ///
+        /// <para>传输队列的进度通知用的是这一条：那条通知是从工作线程上发的，
+        /// 而工作线程绝不能在这里等界面 —— 界面随时可能正在等这条传输（比如退出时
+        /// 在等队列收尾），一旦互等就是死锁。Queue 那边只发「结构变了」的通知，
+        /// 丢一两条也不影响正确性。</para>
+        /// </summary>
+        private static void PostToUi(Action action)
+        {
+            var app = System.Windows.Application.Current;
+            if (app == null || app.Dispatcher.CheckAccess())
+            {
+                action();
+                return;
+            }
+            app.Dispatcher.BeginInvoke(action);
+        }
+
         /// <summary>把远端条目的可变字段同步到已有库条目的身上（不动元数据，避免覆盖用户手改内容）。</summary>
         private void UpdateEntry(Game game, AppEntry app, LocalIndex local)
         {
@@ -1466,13 +1497,26 @@ namespace PlayniteVault
                 return cards;
             }
 
-            // 索引建桶：GUID 一个、库内 id 一个、slug 一个，对账时 O(1) 命中。
-            // 命中顺序（GameId → LibraryId → slug）在 LocalAppMatcher 里，
-            // 那边是纯函数，自检能逐个键断言。
+            // 索引建桶：GUID / 库内 id / 条目 Id / 名字各一个，对账时 O(1) 命中。
+            // 命中顺序（GameId → LibraryId → slug → LibraryId 直对 Id → 名字）
+            // 固定在 LocalAppMatcher 里，那边是纯函数，自检能逐个键断言。
             var apps = index == null ? null : index.Apps;
             var byGameId = LocalAppMatcher.BucketByGameId(apps);
             var byLibraryId = LocalAppMatcher.BucketByLibraryId(apps);
             var bySlug = LocalAppMatcher.BucketBySlug(apps);
+            var byName = LocalAppMatcher.BucketByName(apps);
+
+            // 本地索引只读一次：下面每张卡片都要查「这份是不是从仓库拉下来的」，
+            // 逐个去读那个 json 就是 N 次文件 IO。
+            LocalIndex localIndex = null;
+            try
+            {
+                localIndex = service.GetLocalIndex();
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Warn("读本地安装索引失败：" + ex.Message);
+            }
 
             foreach (var game in PlayniteApi.Database.Games)
             {
@@ -1499,7 +1543,9 @@ namespace PlayniteVault
                     continue;
                 }
 
-                // 命中顺序固定在 LocalAppMatcher 里；这里只负责把三个键备齐
+                // 命中顺序固定在 LocalAppMatcher 里；这里只负责把各个键备齐。
+                // 最后那个 nameKey 是给「老条目 + 已卸载 + 手工添加」兜底的，
+                // 归一化必须和 BucketByName 用的完全一样，所以走同一个函数。
                 string note;
                 var hit = LocalAppMatcher.Match(
                     card.GameId,
@@ -1508,7 +1554,9 @@ namespace PlayniteVault
                     byGameId,
                     byLibraryId,
                     bySlug,
-                    out note);
+                    out note,
+                    byName,
+                    LocalAppMatcher.NormalizeName(game.Name));
 
                 card.MatchNote = note;
 
@@ -1517,13 +1565,22 @@ namespace PlayniteVault
                     card.InRepository = true;
                     card.RepoAppId = hit.Id;
                     card.RepoBytes = hit.TotalBytes;
+
+                    var entry = localIndex == null ? null : localIndex.Find(hit.Id);
+                    if (entry != null)
+                    {
+                        card.Downloaded = true;
+                        card.DownloadedDir = string.IsNullOrWhiteSpace(entry.InstallDir)
+                            ? card.InstallDir
+                            : entry.InstallDir;
+                    }
                 }
 
                 cards.Add(card);
             }
 
-            // 已上传的排前面（用户最关心的就是「还有哪些没传」），
-            // 同状态里按名字排，避免每次刷新顺序乱跳
+            // 还没传的排前面 —— 这一页要回答的是「我库里还有哪些没进仓库」，
+            // 已经传过的属于「看过了，放着」。同状态里按名字排，避免每次刷新顺序乱跳。
             cards.Sort((a, b) =>
             {
                 if (a.InRepository != b.InRepository)
@@ -1586,6 +1643,214 @@ namespace PlayniteVault
 
             ArchiveGames(new List<Game> { target });
             return true;
+        }
+
+        // ---------- 传输队列入口（侧边栏「仓库」页用） ----------
+
+        /// <summary>
+        /// 把「归档这个游戏」排进队列，**不弹模态进度框**。
+        ///
+        /// <para>和 <see cref="ArchiveGames"/>（右键菜单那条）的区别只有这一点：
+        /// 那边是「点一下等它跑完」，这边是「丢进队列，界面立刻可用」。
+        /// 真正的打包上传是同一段 <c>service.ArchiveApp</c>，产物完全一样。</para>
+        ///
+        /// <para>元数据必须在**入队前于 UI 线程上**刮好：<c>BuildMetadata</c> 读的是
+        /// Playnite 的库对象，那些对象不保证线程安全，进后台线程再读就是隐患。</para>
+        /// </summary>
+        public TransferTask EnqueueArchive(Game game)
+        {
+            if (game == null || string.IsNullOrWhiteSpace(game.InstallDirectory)
+                || !Directory.Exists(game.InstallDirectory))
+            {
+                return null;
+            }
+
+            if (!service.Settings.IsConfigured)
+            {
+                PlayniteApi.Dialogs.ShowMessage("还没有配置 WebDAV 地址，请先到插件设置里填写。", "Playnite Vault");
+                return null;
+            }
+
+            var appId = game.PluginId == Id
+                ? game.GameId
+                : VaultService.MakeAppId(InstallDirNameOf(game), game.Name);
+            var launchExe = GuessLaunchExe(game);
+            var metadata = BuildMetadata(game);
+            var name = game.Name;
+            var dir = game.InstallDirectory;
+            var playniteGameId = game.Id.ToString();
+            var libraryId = game.GameId;
+
+            return transfers.Enqueue(TransferKind.Upload, "归档 " + name, (task, token) =>
+            {
+                using (BeginTransfer("归档"))
+                {
+                    var sink = new TaskProgressSink(task);
+                    var result = service.ArchiveApp(appId, name, dir, launchExe, "1.0",
+                        metadata, service.BuildSyncOptions(), sink.Apply, token,
+                        playniteGameId, libraryId);
+                    task.Detail = result.Describe();
+                }
+            });
+        }
+
+        /// <summary>
+        /// 卡片墙按 Id 归档。**必须按 Id 重新查一遍游戏**：卡片是异步渲染的，
+        /// 用户点按钮之前那个游戏可能已经从库里删掉了，那时应该「找不到就明说」。
+        /// </summary>
+        public TransferTask EnqueueArchiveById(string gameId)
+        {
+            if (string.IsNullOrWhiteSpace(gameId) || PlayniteApi == null || PlayniteApi.Database == null)
+            {
+                return null;
+            }
+
+            foreach (var game in PlayniteApi.Database.Games)
+            {
+                if (game != null
+                    && string.Equals(game.Id.ToString(), gameId, StringComparison.OrdinalIgnoreCase))
+                {
+                    return EnqueueArchive(game);
+                }
+            }
+
+            VaultLog.Warn("卡片墙归档：游戏已不在库里（" + gameId + "）");
+            PlayniteApi.Dialogs.ShowMessage(
+                "这个游戏已经不在 Playnite 库里了（可能刚被删掉）。\n刷新一下列表再试。",
+                "Playnite Vault");
+            return null;
+        }
+
+        /// <summary>
+        /// 从 NAS 取回一个应用（首次安装 / 补回本地 / 修复）。
+        /// <paramref name="targetDir"/> 为空时按设置里的默认根目录推。
+        /// </summary>
+        public TransferTask EnqueueInstall(string appId, string appName, string targetDir = null)
+        {
+            if (string.IsNullOrWhiteSpace(appId))
+            {
+                return null;
+            }
+
+            if (!service.Settings.IsConfigured)
+            {
+                PlayniteApi.Dialogs.ShowMessage("还没有配置 WebDAV 地址，请先到插件设置里填写。", "Playnite Vault");
+                return null;
+            }
+
+            var title = string.IsNullOrWhiteSpace(appName) ? appId : appName;
+            return transfers.Enqueue(TransferKind.Download, "取回 " + title, (task, token) =>
+            {
+                using (BeginTransfer("安装"))
+                {
+                    var dir = string.IsNullOrWhiteSpace(targetDir)
+                        ? service.GetInstallDir(appId)
+                        : targetDir;
+                    task.Detail = "→ " + dir;
+
+                    var sink = new TaskProgressSink(task);
+                    var result = service.InstallApp(appId, dir, service.BuildSyncOptions(),
+                        sink.Apply, token);
+                    task.Detail = result.Describe();
+
+                    // 装完把库条目同步一次：别的机器带过来的归档可能还没有库条目，
+                    // 不刷新的话 Playnite 里看不到它。走 Post —— 这一步要发网络请求，
+                    // 工作线程不该为了它去等界面。
+                    PostToUi(() => RefreshLibraryEntries(false));
+                }
+            });
+        }
+
+        /// <summary>把本地那份删掉（只删本地文件，NAS 上的归档一个字节都不动）。</summary>
+        public TransferTask EnqueueUninstall(string appId, string appName, string targetDir)
+        {
+            if (string.IsNullOrWhiteSpace(appId))
+            {
+                return null;
+            }
+
+            var title = string.IsNullOrWhiteSpace(appName) ? appId : appName;
+            return transfers.Enqueue(TransferKind.Download, "卸载 " + title, (task, token) =>
+            {
+                task.Detail = "删除本地文件：" + (targetDir ?? "(默认目录)");
+                service.UninstallApp(appId, targetDir);
+                PostToUi(() => RefreshLibraryEntries(false));
+            });
+        }
+
+        /// <summary>主题同步入队。<paramref name="only"/> 为空 / null = 全部主题。</summary>
+        public TransferTask EnqueueThemeSync(ThemeSyncMode mode, bool dryRun, bool force,
+            ICollection<string> only)
+        {
+            string root;
+            string reason;
+            if (!ThemeSyncPreflight(out root, out reason))
+            {
+                PlayniteApi.Dialogs.ShowMessage(reason, "Playnite Vault");
+                return null;
+            }
+
+            var keys = only == null || only.Count == 0
+                ? null
+                : new HashSet<string>(only, StringComparer.OrdinalIgnoreCase);
+
+            return transfers.Enqueue(TransferKind.ThemeSync,
+                dryRun ? "预演主题同步" : "主题同步", (task, token) =>
+            {
+                var outcome = ExecuteThemeSync(root, mode, dryRun, force,
+                    new TaskThemeReporter(task), token, keys);
+                task.Detail = outcome.Describe();
+
+                if (!outcome.Ok && !outcome.Cancelled)
+                {
+                    throw new InvalidOperationException(outcome.Failure ?? "主题同步失败");
+                }
+            });
+        }
+
+        /// <summary>
+        /// 列出「本地 + 远端」的全部主题（卡片墙用）。
+        /// 远端读不到不算失败 —— 断网时至少还能看到本地有什么。
+        /// </summary>
+        public List<ThemeCatalogItem> LoadThemeCatalog(out string remoteError)
+        {
+            remoteError = null;
+            var local = ThemeCatalog.ListLocal(ThemeRootPath());
+
+            List<ThemeCatalogItem> remote = null;
+            if (service.Settings.IsConfigured)
+            {
+                try
+                {
+                    remote = ThemeCatalog.ListRemote(service.CreateClient());
+                }
+                catch (Exception ex)
+                {
+                    remoteError = ex.Message;
+                    VaultLog.Warn("读取远端主题索引失败：" + ex.Message);
+                }
+            }
+
+            return ThemeCatalog.Merge(local, remote);
+        }
+
+        /// <summary>本地那份是从仓库拉下来的吗？是的话才给「卸载」按钮。</summary>
+        public LocalEntry FindDownloadedEntry(string appId)
+        {
+            if (string.IsNullOrWhiteSpace(appId))
+            {
+                return null;
+            }
+
+            try
+            {
+                return service.GetInstalledEntry(appId);
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Warn("查本地安装记录失败（" + appId + "）：" + ex.Message);
+                return null;
+            }
         }
 
         private void TestConnection()
@@ -2324,45 +2589,69 @@ namespace PlayniteVault
             return Path.Combine(PlayniteApi.Paths.ConfigurationPath, "Themes");
         }
 
-        /// <summary>真正的执行体：命令行、主菜单、侧边栏页都走这里。</summary>
+        /// <summary>
+        /// 执行体（模态那条路）：主菜单、命令行走的还是 Playnite 的全局进度窗。
+        /// 侧边栏页走的是队列那条路（<see cref="EnqueueThemeSync"/>），共用下面那个重载。
+        /// </summary>
         private ThemeSyncOutcome ExecuteThemeSync(string root, ThemeSyncMode mode, bool dryRun, bool force)
         {
-            var counters = new ThemeSyncCounters();
-            var cancelled = false;
-            string failure = null;
+            ThemeSyncOutcome outcome = null;
 
             PlayniteApi.Dialogs.ActivateGlobalProgress(progress =>
             {
-                var reporter = new ThemeSyncProgressReporter(progress);
-                try
-                {
-                    var engine = new ThemeSyncEngine(service.CreateClient(), root,
-                        Path.Combine(service.DataPath, "theme-sync-state.json"),
-                        service.BuildSyncOptions(false), reporter, progress.CancelToken);
-
-                    counters = engine.Run(new ThemeSyncOptions
-                    {
-                        Mode = mode,
-                        DryRun = dryRun,
-                        Force = force
-                    }).Counters;
-                }
-                catch (OperationCanceledException)
-                {
-                    cancelled = true;
-                    VaultLog.Info("主题同步被用户取消");
-                }
-                catch (Exception ex)
-                {
-                    VaultLog.Error("主题同步失败", ex);
-                    failure = ex.Message;
-                }
+                outcome = ExecuteThemeSync(root, mode, dryRun, force,
+                    new ThemeSyncProgressReporter(progress), progress.CancelToken, null);
             },
             new GlobalProgressOptions(dryRun ? "正在预演主题同步" : "正在同步主题")
             {
                 IsIndeterminate = false,
                 Cancelable = true
             });
+
+            return outcome ?? ThemeSyncOutcome.Fail("主题同步没有返回结果。");
+        }
+
+        /// <summary>
+        /// 真正的执行体：命令行、主菜单、侧边栏页、传输队列都走这里。
+        ///
+        /// <para><paramref name="reporter"/> 与 <paramref name="token"/> 由调用方给 ——
+        /// 模态那条路接 Playnite 的全局进度窗，队列那条路接队列任务里的进度字段。
+        /// 两边共用同一段引擎调用，所以「预演」的结果、冲突判定、写盘时机完全一致。</para>
+        /// </summary>
+        private ThemeSyncOutcome ExecuteThemeSync(string root, ThemeSyncMode mode, bool dryRun,
+            bool force, IThemeSyncReporter reporter, CancellationToken token,
+            ICollection<string> only)
+        {
+            var counters = new ThemeSyncCounters();
+            var cancelled = false;
+            string failure = null;
+
+            try
+            {
+                var engine = new ThemeSyncEngine(service.CreateClient(), root,
+                    Path.Combine(service.DataPath, "theme-sync-state.json"),
+                    service.BuildSyncOptions(false), reporter, token);
+
+                counters = engine.Run(new ThemeSyncOptions
+                {
+                    Mode = mode,
+                    DryRun = dryRun,
+                    Force = force,
+                    Only = only == null
+                        ? null
+                        : new HashSet<string>(only, StringComparer.OrdinalIgnoreCase)
+                }).Counters;
+            }
+            catch (OperationCanceledException)
+            {
+                cancelled = true;
+                VaultLog.Info("主题同步被用户取消");
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Error("主题同步失败", ex);
+                failure = ex.Message;
+            }
 
             return new ThemeSyncOutcome
             {
@@ -2374,6 +2663,40 @@ namespace PlayniteVault
                 DryRun = dryRun,
                 Counters = counters
             };
+        }
+
+        /// <summary>队列那条路用的进度接收器：把引擎的阶段与进度写进队列任务。</summary>
+        private class TaskThemeReporter : IThemeSyncReporter
+        {
+            private readonly TransferTask task;
+            private readonly TaskProgressSink sink;
+
+            public TaskThemeReporter(TransferTask task)
+            {
+                this.task = task;
+                sink = new TaskProgressSink(task);
+            }
+
+            public void Stage(string text)
+            {
+                if (!string.IsNullOrEmpty(text))
+                {
+                    task.Detail = text;
+                }
+            }
+
+            public void Progress(SyncProgress progress)
+            {
+                sink.Apply(progress);
+            }
+
+            public void Log(string line)
+            {
+                if (!string.IsNullOrWhiteSpace(line))
+                {
+                    VaultLog.Info("主题同步：" + line);
+                }
+            }
         }
 
         /// <summary>把主题同步的进度接到 Playnite 的全局进度窗上。</summary>
@@ -2590,18 +2913,37 @@ namespace PlayniteVault
         /// <summary>设置页的小按钮用：立刻把 VM 里的编辑结果落盘。</summary>
         public void SaveSettingsImmediately(VaultSettingsViewModel viewModel)
         {
+            string error;
+            SaveSettingsNow(viewModel, out error);
+        }
+
+        /// <summary>
+        /// 立即保存设置，并**把成败交回给调用方**。
+        ///
+        /// <para>为什么要有这个版本：老的那条路把异常整个吃掉了，只写日志。
+        /// 于是磁盘写失败（文件被占、磁盘满、权限不够）时设置页照样显示「已保存」——
+        /// 用户看到的就是「保存没生效」，而且连个错都没有。写盘的结果必须让界面知道。</para>
+        /// </summary>
+        public bool SaveSettingsNow(VaultSettingsViewModel viewModel, out string error)
+        {
+            error = null;
+
             if (viewModel == null)
             {
-                return;
+                error = "设置对象为空。";
+                return false;
             }
 
             try
             {
                 viewModel.EndEdit();
+                return true;
             }
             catch (Exception ex)
             {
                 VaultLog.Error("立即保存设置失败", ex);
+                error = ex.Message;
+                return false;
             }
         }
 

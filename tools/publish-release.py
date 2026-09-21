@@ -21,14 +21,19 @@
   * **标题 = 正文首行，且必须是 ``Vault X.Y.Z``**（后面不接任何说明）。首行写成
     ``# Vault X.Y.Z`` 也行，脚本会把 ``#`` 去掉 —— 历史上 v1.7.0/v1.8.0 就是把 ``#``
     连同说明一起带进了标题字段。
-  * **发布正文只写两样**：逐条要点 + 指向 ``CHANGELOG.md`` 的引导。要点**不要**再套一个
+  * **发布正文只写两样**：逐条要点 + 一段引导（注意事项 / 适用边界）。要点**不要**再套一个
     「要点」标题，直接列；**每条以 ``[类型]`` 开头**（``[bugfix]`` / ``[feature]`` /
-    ``[ui]`` / ``[perf]`` / ``[docs]`` / ``[breaking]`` …），别再另起一行写「更新类型」。
+    ``[ui]`` / ``[perf]`` / ``[docs]`` / ``[breaking]`` …）。类型名旁边的 emoji、
+    以及「同一类型有多条就做成二级列表」，都由 ``_render_updates`` 生成 ——
+    作者不要自己打 emoji，也别自己起小标题。
     **别重复 README 里已有的项目介绍 / 适用边界 / 许可**。只有当用户升级时必须自己动手
     （破坏性变更）才写一段「注意事项」，达不到就不写。
-  * **下载区由脚本拼**（``release_body_for``）：按平台生成直链、默认折叠、**放在正文最上**；
-    不再有「下载」标题。正文里写的 GitHub 链接会自动改写成目标平台的域名，
-    所以正文里只写 GitHub 那份就够。
+  * **正文别再写页脚**。``---`` 之后的「完整改动见 CHANGELOG」「装好之后怎么用见…」
+    由脚本生成：作者手写的那两行会被丢掉，脚本自己拼出
+    ``使用说明见 docs/plugin-usage.md``（域名按平台换）。CHANGELOG 那行已彻底去掉。
+  * **下载区由脚本拼**（``release_body_for``）：加 ``## 下载`` 标题、**不折叠**、放正文最上；
+    紧随其后是 ``## 更新`` + 分组后的要点。正文里写的 GitHub 链接会自动改写成目标平台的
+    域名，所以正文里只写 GitHub 那份就够。
   * ``--retitle`` 只改标题（修正历史 release 的命名），``--delete`` 撤掉整条 release 与 tag。
   * 令牌：``%USERPROFILE%\\.playnite-vault\\github-token.txt`` / ``gitee-token.txt``。
     git push 走 SSH，但 Release / 资产上传只认 token。
@@ -652,20 +657,122 @@ def asset_hint(name: str) -> str:
     return ""
 
 
+# 要点类型标记 → （emoji, 中文名）。作者写 `[bugfix]`，脚本渲染成 `[🐛 修复]`。
+# 为什么由脚本翻译而不是让作者直接打 emoji：emoji 手打容易漏、容易前后不一致，
+# 而类型词是稳定的枚举；把「好看」交给代码，作者只管写「这条是什么类型」。
+TYPE_STYLE = {
+    "feature":  ("✨", "新增"),
+    "feat":     ("✨", "新增"),
+    "new":      ("✨", "新增"),
+    "bugfix":   ("🐛", "修复"),
+    "fix":      ("🐛", "修复"),
+    "hotfix":   ("🚑", "紧急修复"),
+    "perf":     ("⚡", "性能"),
+    "ui":       ("🎨", "界面"),
+    "ux":       ("🎨", "界面"),
+    "docs":     ("📄", "文档"),
+    "refactor": ("🔧", "重构"),
+    "security": ("🔒", "安全"),
+    "breaking": ("💥", "破坏性变更"),
+    "note":     ("📌", "说明"),
+}
+
+# `- [bugfix] 正文` / `- [fix] 正文`
+BULLET_RE = re.compile(r"^-\s*\[([A-Za-z][A-Za-z0-9_-]*)\]\s*(.*)$")
+
+# 脚本自己生成的页脚行 —— 作者正文里若重复写了，丢掉，避免出现两份。
+FOOTER_NOISE_RE = re.compile(
+    r"^\s*(完整改动见|完整变更见|更新日志见|使用说明见|装好之后怎么用见)\b")
+
+USAGE_PATH = "docs/plugin-usage.md"
+
+
+def _strip_notes_footer(body: str) -> str:
+    """丢掉作者手写的页脚段（`---` 之后的 CHANGELOG / 使用说明引导）。
+
+    这两行现在由脚本生成：平台域名要按 GitHub/Gitee 分别拼，手写迟早写错一个。
+    """
+    lines = body.splitlines()
+    kept, dropping = [], False
+    for line in lines:
+        if line.strip() == "---":
+            dropping = True            # 从这里往后的引导段交给脚本
+            continue
+        if dropping and (FOOTER_NOISE_RE.match(line) or not line.strip()):
+            continue
+        if dropping and line.strip() and not FOOTER_NOISE_RE.match(line):
+            dropping = False           # `---` 之后还有正经内容，照收
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _parse_notes(body: str):
+    """把作者正文拆成 (要点分组, 其余段落)。
+
+    要点 = ``- [类型] 文字``；紧跟其后、以空白开头的行算它的续行（用 ``<br>`` 接回去）。
+    其余非空行按原顺序收进段落，输出时放在要点之后。
+    """
+    order, grouped = [], {}
+    prose = []
+    current_key = None
+
+    for raw in _strip_notes_footer(body).splitlines():
+        hit = BULLET_RE.match(raw.strip())
+        if hit:
+            key = hit.group(1).lower()
+            if key not in grouped:
+                grouped[key] = []
+                order.append(key)
+            grouped[key].append(hit.group(2).strip())
+            current_key = key
+            continue
+
+        if current_key and raw[:1] in (" ", "\t") and raw.strip():
+            grouped[current_key][-1] = grouped[current_key][-1] + "<br>" + raw.strip()
+            continue
+
+        current_key = None
+        if raw.strip():
+            prose.append(raw.rstrip())
+
+    return [(k, grouped[k]) for k in order], prose
+
+
+def _render_updates(items) -> list[str]:
+    """按类型分组渲染要点：单条并排，多条做成二级列表。"""
+    lines = []
+    for key, texts in items:
+        emoji, label = TYPE_STYLE.get(key, ("•", key))
+        head = f"- [{emoji} {label}]"
+        if len(texts) == 1:
+            lines.append(f"{head} {texts[0]}")
+        else:
+            # 同一类型有多条 → 类型行只写类型，条目缩进成二级列表，
+            # 扫一眼就能看出「这次修了几个 bug / 加了几个功能」。
+            lines.append(head)
+            lines.extend(f"  - {t}" for t in texts)
+    return lines
+
+
 def release_body_for(platform: str, version: str, body: str,
                      assets: list[str]) -> str:
     """把作者写的正文改成**这个平台**的版本。
 
-    有两件事必须由脚本做，不能靠手写：
+    版面（自上而下，四段）：
 
-    1. **平台链接**。正文里写的 `https://github.com/...`（比如指向 `CHANGELOG.md`）
-       在 Gitee 上点开就是另一个站点，得换成同路径的 Gitee 地址。
-    2. **下载区**。资产名和下载直链都是现成的，手写迟早写成另一个平台的；
-       而两边的直链格式其实一样（`<repo>/releases/download/<tag>/<文件名>`），
-       按平台拼就行。默认**折叠**（`<details>`），并且**放在正文最上面** ——
-       打开页面第一眼就要能看到「下哪个」，所以**不加「下载」标题**。
+        1. `## 下载` —— 资产直链，**不折叠**，第一眼就能看到下哪个；
+        2. `## 更新` —— 要点，按类型分组、类型名带 emoji，同类型多条做二级列表；
+        3. 作者写的引导段（注意事项 / 适用边界）；
+        4. 页脚：`使用说明见 docs/plugin-usage.md`（按平台拼域名）。
 
-    作者只写逐条要点（每条以 `[类型]` 开头）与引导，说清「怎么用」的部分交给脚本。
+    三件事必须由脚本做，不能靠手写：
+
+    1. **平台链接**：正文里的 `https://github.com/...` 在 Gitee 上点开是另一个站点。
+    2. **资产直链**：两边格式一样（`<repo>/releases/download/<tag>/<文件名>`），
+       但按平台拼才不会写错。
+    3. **类型 emoji 与分组**：`[bugfix]` → `[🐛 修复]`，反复起标题容易写歪。
+
+    作者只写逐条要点（每条以 `[类型]` 开头）与正文引导。
     正文写法约定见 `docs/dev-notes.md` 第 6 节。
     """
     tag = f"v{version}"
@@ -675,14 +782,24 @@ def release_body_for(platform: str, version: str, body: str,
         if other != platform:
             out = out.replace(url, base)
 
-    lines = ["<details>", "<summary>该下哪个？（点开）</summary>", ""]
+    lines = ["## 下载", ""]
     for path in assets:
         name = os.path.basename(path)
         hint = asset_hint(name)
         link = f"{base}/releases/download/{tag}/{name}"
         lines.append(f"- **[{name}]({link})**" + (f" —— {hint}" if hint else ""))
-    lines += ["", "</details>"]
-    return "\n".join(lines) + "\n\n" + out.lstrip("\n")
+
+    items, prose = _parse_notes(out)
+    if items:
+        lines += ["", "## 更新", ""]
+        lines += _render_updates(items)
+
+    if prose:
+        lines += [""] + prose
+
+    lines += ["", "---", "",
+              f"使用说明见 [{USAGE_PATH}]({base}/blob/main/{USAGE_PATH})"]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 # --------------------------------------------------- 改标题 / 撤版本

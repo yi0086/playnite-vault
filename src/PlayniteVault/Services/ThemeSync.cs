@@ -253,6 +253,13 @@ namespace PlayniteVault.Services
                 var key = Key(manifest.Mode, manifest.Id);
                 localKeys.Add(key);
 
+                // 没勾选的主题直接忽略：它既不上传也不下载，
+                // 但仍然记进 localKeys（「本地是有的」，只是这次不参与）。
+                if (!opt.Wants(manifest.Mode, manifest.Id))
+                {
+                    continue;
+                }
+
                 var item = new PlanItem
                 {
                     Mode = manifest.Mode,
@@ -359,6 +366,12 @@ namespace PlayniteVault.Services
             foreach (var pair in remoteEntries)
             {
                 if (localKeys.Contains(pair.Key))
+                {
+                    continue;
+                }
+
+                // 勾选过滤在这里同样生效：没勾的主题不会被悄悄拉下来。
+                if (!opt.Wants(pair.Value.Mode, pair.Value.Id))
                 {
                     continue;
                 }
@@ -1196,7 +1209,8 @@ namespace PlayniteVault.Services
             return full;
         }
 
-        private static bool IsNotFound(Exception ex)
+        /// <summary>404/410 都算「远端还没有这份东西」——不是错误，是空。</summary>
+        internal static bool IsNotFound(Exception ex)
         {
             for (var e = ex; e != null; e = e.InnerException)
             {

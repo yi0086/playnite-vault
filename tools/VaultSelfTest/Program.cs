@@ -2037,17 +2037,50 @@ namespace VaultSelfTest
                     throw new InvalidOperationException("ShowSection 不在了（整页构造这条路要跟着改）");
                 }
 
-                foreach (var key in new[] { "overview", "themes", "settings" })
+                foreach (var key in new[] { "overview", "themes", "tasks", "settings" })
                 {
                     show.Invoke(panel, new object[] { key });
+                }
+
+                // 左栏必须给**每一个**注册过的分栏都留一个入口。
+                // 「段落建得出来、却没有导航项」是个静默的坑 —— v1.9 真踩过一次：
+                // 任务页的 sectionBuilder 注册了，AddSection 却漏了，用户只能从底部
+                // 进度条那个「详情」绕进去。
+                var navField = typeof(VaultPanelView).GetField("navButtons",
+                    BindingFlags.NonPublic | BindingFlags.Instance);
+                var nav = navField == null
+                    ? null
+                    : navField.GetValue(panel) as System.Collections.IDictionary;
+
+                var expected = new[] { "overview", "themes", "repo", "tasks", "settings" };
+                var missing = expected.Where(k => nav == null || !nav.Contains(k)).ToArray();
+                if (missing.Length > 0)
+                {
+                    throw new InvalidOperationException(
+                        "左栏缺导航项：" + string.Join("、", missing));
+                }
+
+                // 每个导航项都要有非空的中文标题（空按钮等于没有入口）
+                foreach (var key in expected)
+                {
+                    var button = nav[key] as System.Windows.Controls.Button;
+                    var label = button == null ? null : button.Content as string;
+                    if (string.IsNullOrWhiteSpace(label))
+                    {
+                        throw new InvalidOperationException("导航项 \"" + key + "\" 没有标题");
+                    }
                 }
             });
 
             Check(panelError == null,
-                "侧边栏页能在 STA 线程上整页构造（概览含指标块与三张图；主题 / 设置页也建得出来）",
+                "侧边栏页能在 STA 线程上整页构造（概览含指标块与三张图；主题 / 任务 / 设置页也建得出来，"
+                + "且左栏五个分栏都有带标题的入口）",
                 panelError == null ? null : panelError.Message);
 
             RunUiV180RepoTests();
+            RunUiV190MatchTests();
+            RunThemeCatalogTests();
+            RunTransferQueueTests();
         }
 
         /// <summary>
@@ -2211,11 +2244,369 @@ namespace VaultSelfTest
                 "侧边栏页确实调用了 DeleteRepositoryApp（内联删除走的是同一道闸门）",
                 "实际：" + (deleteSites.Count == 0 ? "没有" : string.Join("、", deleteSites)));
 
-            var archiveSites = CallSitesOf(typeof(PlayniteVault.VaultPlugin).GetMethod("ArchiveGameById",
+            // 卡片上的「归档到 NAS」：v1.9 起不再走模态的 ArchiveGames，而是排进传输队列。
+            // 这条链必须完整 —— 断了就是「按钮点了没反应」。
+            var enqueueById = CallSitesOf(typeof(PlayniteVault.VaultPlugin).GetMethod("EnqueueArchiveById",
                 BindingFlags.Public | BindingFlags.Instance));
-            Check(archiveSites.Any(s => s.StartsWith("PlayniteVault.UI.VaultPanelView")),
-                "卡片上的「归档到 NAS」接到了插件入口 ArchiveGameById",
-                "实际：" + (archiveSites.Count == 0 ? "没有" : string.Join("、", archiveSites)));
+            Check(enqueueById.Any(s => s.StartsWith("PlayniteVault.UI.VaultPanelView")),
+                "卡片上的「归档到 NAS」接到了队列入口 EnqueueArchiveById（而非模态的 ArchiveGames）",
+                "实际：" + (enqueueById.Count == 0 ? "没有" : string.Join("、", enqueueById)));
+
+            var enqueueSites = CallSitesOf(typeof(PlayniteVault.VaultPlugin).GetMethod("EnqueueArchive",
+                BindingFlags.Public | BindingFlags.Instance));
+            Check(enqueueSites.Any(s => s.EndsWith("EnqueueArchiveById")),
+                "EnqueueArchiveById 转交给 EnqueueArchive —— 入队只有一处，不会两条路各写一遍",
+                "实际：" + (enqueueSites.Count == 0 ? "没有" : string.Join("、", enqueueSites)));
+
+            var modalSites = CallSitesOf(typeof(PlayniteVault.VaultPlugin).GetMethod("ArchiveGameById",
+                BindingFlags.Public | BindingFlags.Instance));
+            Check(!modalSites.Any(s => s.StartsWith("PlayniteVault.UI.VaultPanelView")),
+                "侧边栏页里已经没有对模态那条路（ArchiveGameById）的调用了",
+                "实际：" + (modalSites.Count == 0 ? "没有" : string.Join("、", modalSites)));
+
+            // 取回 / 卸载 / 主题同步也都要走队列（否则又变回模态阻塞）
+            var installSites = CallSitesOf(typeof(PlayniteVault.VaultPlugin).GetMethod("EnqueueInstall",
+                BindingFlags.Public | BindingFlags.Instance));
+            Check(installSites.Any(s => s.StartsWith("PlayniteVault.UI.VaultPanelView")),
+                "「取回本机」接到了 EnqueueInstall",
+                "实际：" + (installSites.Count == 0 ? "没有" : string.Join("、", installSites)));
+
+            var uninstallSites = CallSitesOf(typeof(PlayniteVault.VaultPlugin).GetMethod("EnqueueUninstall",
+                BindingFlags.Public | BindingFlags.Instance));
+            Check(uninstallSites.Any(s => s.StartsWith("PlayniteVault.UI.VaultPanelView")),
+                "「卸载本地」接到了 EnqueueUninstall",
+                "实际：" + (uninstallSites.Count == 0 ? "没有" : string.Join("、", uninstallSites)));
+
+            var themeSites = CallSitesOf(typeof(PlayniteVault.VaultPlugin).GetMethod("EnqueueThemeSync",
+                BindingFlags.Public | BindingFlags.Instance));
+            Check(themeSites.Any(s => s.StartsWith("PlayniteVault.UI.VaultPanelView")),
+                "「主题」页的同步按钮接到了 EnqueueThemeSync",
+                "实际：" + (themeSites.Count == 0 ? "没有" : string.Join("、", themeSites)));
+        }
+
+        /// <summary>
+        /// v1.9 第一组：卡片墙「同一游戏出现两次」的修复 —— 命中键从三级扩到五级。
+        ///
+        /// <para>触发这个 bug 的局面很具体：v1.8 之前归档的条目**两把钥匙都没存**，
+        /// 而本地那份已经被卸载（安装目录没了 → 推不出 slug）。前三档全落空，
+        /// 于是它既显示成「未上传」，又作为孤儿在列表里再出现一次。</para>
+        /// </summary>
+        private static void RunUiV190MatchTests()
+        {
+            Group("v1.9 界面 · 五级命中键（重复条目修复）");
+
+            // 老条目：v1.8 之前归档 —— 两把钥匙一个都没存
+            var oldUninstalled = new AppEntry { Id = "mizhu", Name = "米塔 MiSide" };
+            var only = new[] { oldUninstalled };
+
+            var byGameId = LocalAppMatcher.BucketByGameId(only);
+            var byLibraryId = LocalAppMatcher.BucketByLibraryId(only);
+            var bySlug = LocalAppMatcher.BucketBySlug(only);
+            var byName = LocalAppMatcher.BucketByName(only);
+
+            string note;
+
+            // 第 4 档：本插件导入的游戏 Game.GameId == app.Id；卸载后目录没了 →
+            // 第 3 档的 slug 推不出来，但「库内标识」与「条目 Id」其实是同一个值。
+            var hit = LocalAppMatcher.Match(null, "mizhu", "推不出来的-slug",
+                byGameId, byLibraryId, bySlug, out note, byName, "米塔miside");
+            Check(ReferenceEquals(hit, oldUninstalled) && note == LocalAppMatcher.NoteByIdentity,
+                "老条目 + 已卸载：库内标识 == 条目 Id 时命中，并写明依据是「本插件导入的」",
+                note == LocalAppMatcher.NoteByIdentity ? null : "实际依据：" + note);
+
+            // 第 5 档：手工添加、没有任何库标识的条目 → 只能靠名字
+            hit = LocalAppMatcher.Match(null, null, "推不出来的-slug",
+                byGameId, byLibraryId, bySlug, out note, byName, "米塔miside");
+            Check(ReferenceEquals(hit, oldUninstalled) && note == LocalAppMatcher.NoteByName,
+                "两把钥匙都没有、slug 也对不上时，按归一化名字兜底并如实写明依据",
+                note == LocalAppMatcher.NoteByName ? null : "实际依据：" + note);
+
+            // 第 4 档必须排在第 5 档之前：两档都能命中时，优先用更可靠的「库内标识直对」
+            var byIdEntry = new AppEntry { Id = "rhythm-doctor", Name = "节奏医生" };
+            var byNameOnly = new AppEntry { Id = "other-slug", Name = "节奏医生" };
+            var pair = new[] { byIdEntry, byNameOnly };
+            hit = LocalAppMatcher.Match(null, "rhythm-doctor", "x",
+                LocalAppMatcher.BucketByGameId(pair), LocalAppMatcher.BucketByLibraryId(pair),
+                LocalAppMatcher.BucketBySlug(pair), out note,
+                LocalAppMatcher.BucketByName(pair), "节奏医生");
+            Check(ReferenceEquals(hit, byIdEntry) && note == LocalAppMatcher.NoteByIdentity,
+                "第 4 档（库内标识直对 Id）优先于第 5 档（名字）",
+                note == LocalAppMatcher.NoteByIdentity ? null : "实际依据：" + note);
+
+            // 不传 byName/nameKey 时，行为与 v1.8 完全一致（新档只往后加，不改老行为）
+            hit = LocalAppMatcher.Match(null, null, "推不出来的-slug",
+                byGameId, byLibraryId, bySlug, out note);
+            Check(hit == null && note == LocalAppMatcher.NoteMiss,
+                "不给名字桶时，前三级落空仍然是「没传过」（老调用方行为不变）",
+                note == LocalAppMatcher.NoteMiss ? null : "实际依据：" + note);
+
+            // slug（第 3 档）仍要压过第 4/5 档 —— 顺序不能乱
+            var slugEntry = new AppEntry { Id = "slug-hit", Name = "别的名字" };
+            var slugOnly = new[] { slugEntry };
+            hit = LocalAppMatcher.Match(null, "slug-hit", "slug-hit",
+                LocalAppMatcher.BucketByGameId(slugOnly), LocalAppMatcher.BucketByLibraryId(slugOnly),
+                LocalAppMatcher.BucketBySlug(slugOnly), out note,
+                LocalAppMatcher.BucketByName(slugOnly), "别的名字");
+            Check(ReferenceEquals(hit, slugEntry) && note == LocalAppMatcher.NoteBySlugOld,
+                "slug（第 3 档）仍压过第 4/5 档，且老条目措辞不变",
+                note == LocalAppMatcher.NoteBySlugOld ? null : "实际依据：" + note);
+
+            // ---- 名字归一化本身 ----
+            Group("v1.9 界面 · 名字归一化");
+
+            Check(LocalAppMatcher.NormalizeName("米塔 MiSide") == "米塔miside",
+                "归一化：去空白、去标点、统一小写，**中文保留**",
+                "实际 " + LocalAppMatcher.NormalizeName("米塔 MiSide"));
+            Check(LocalAppMatcher.NormalizeName("Plants vs. Zombies") == "plantsvszombies",
+                "归一化：英文里的点号与空格都吃掉",
+                "实际 " + LocalAppMatcher.NormalizeName("Plants vs. Zombies"));
+            Check(LocalAppMatcher.NormalizeName(null) == string.Empty
+                  && LocalAppMatcher.NormalizeName("   ") == string.Empty,
+                "空名字归一化成空串（不会在桶里占一个键）");
+
+            var nameBucket = LocalAppMatcher.BucketByName(new[]
+            {
+                new AppEntry { Id = "a", Name = null },
+                new AppEntry { Id = "b", Name = "   " },
+                new AppEntry { Id = "c", Name = "节奏医生" }
+            });
+            Check(nameBucket.Count == 1 && nameBucket["节奏医生"].Id == "c",
+                "建名字桶时跳过空名字 —— 否则所有无名条目会互相认成同一个",
+                "实际桶里有 " + nameBucket.Count + " 条");
+
+            var dupBucket = LocalAppMatcher.BucketByName(new[]
+            {
+                new AppEntry { Id = "first", Name = "同名游戏" },
+                new AppEntry { Id = "second", Name = "同名 游戏" }
+            });
+            Check(dupBucket.Count == 1 && dupBucket["同名游戏"].Id == "first",
+                "归一化后同名的条目只保留第一条（不抛异常、不覆盖）",
+                "实际桶里有 " + dupBucket.Count + " 条");
+        }
+
+        /// <summary>
+        /// v1.9 第二组：「主题」页的卡片数据 —— 本地与远端两份列表怎么并成一张。
+        ///
+        /// <para>并错的后果是同一主题在墙上出现两张卡（一张「只在本机」、一张「只在 NAS」），
+        /// 用户不知道该勾哪一个 —— 和仓库那边的重复是同一类错。</para>
+        /// </summary>
+        private static void RunThemeCatalogTests()
+        {
+            Group("v1.9 主题页 · 本地/远端合并与勾选");
+
+            var local = new List<ThemeCatalogItem>
+            {
+                new ThemeCatalogItem
+                {
+                    Mode = "Desktop", Id = "mita-theme", Name = "米塔主题",
+                    Local = true, LocalBytes = 2048, LocalFiles = 3
+                },
+                new ThemeCatalogItem
+                {
+                    Mode = "Fullscreen", Id = "only-local", Name = "只在本机",
+                    Local = true, LocalBytes = 512, LocalFiles = 1
+                }
+            };
+            var remote = new List<ThemeCatalogItem>
+            {
+                new ThemeCatalogItem
+                {
+                    Mode = "Desktop", Id = "mita-theme", Name = "米塔主题",
+                    Remote = true, RemoteBytes = 4096, RemoteFiles = 5
+                },
+                new ThemeCatalogItem
+                {
+                    Mode = "Desktop", Id = "only-remote", Name = "只在 NAS",
+                    Remote = true, RemoteBytes = 999, RemoteFiles = 2
+                }
+            };
+
+            var merged = ThemeCatalog.Merge(local, remote);
+            Check(merged.Count == 3, "合并：同主题不会出现两次（本地 2 条 + 远端独有 1 条）",
+                "实际 " + merged.Count + " 条");
+
+            var both = merged.FirstOrDefault(m => m.Id == "mita-theme");
+            Check(both != null && both.Local && both.Remote,
+                "两边都有的主题：一张卡片，同时带 Local 与 Remote",
+                both == null ? "没找到 mita-theme" : null);
+            Check(both != null && both.EffectiveBytes == 2048,
+                "两边都有时体积优先显示本地那份（用户关心的是自己磁盘占用）",
+                "实际 " + (both == null ? "null" : both.EffectiveBytes.ToString("0")));
+            Check(both != null && both.StateText == "两边都有", "状态字：两边都有",
+                both == null ? null : "实际 " + both.StateText);
+
+            var remoteOnly = merged.FirstOrDefault(m => m.Id == "only-remote");
+            Check(remoteOnly != null && !remoteOnly.Local && remoteOnly.Remote
+                  && remoteOnly.StateText == "只在 NAS",
+                "远端独有 → 状态「只在 NAS」（可以下载回来）",
+                remoteOnly == null ? "没找到 only-remote" : "实际 " + remoteOnly.StateText);
+
+            Check(merged[0].Id == "mita-theme" && merged[1].Id == "only-local" && merged[2].Id == "only-remote",
+                "顺序：先本地（保持原序），远端独有的接在后面",
+                "实际 " + string.Join(",", merged.Select(m => m.Id)));
+
+            Check(both != null && both.Key == "Desktop/mita-theme",
+                "卡片键必须与同步引擎内部的 Key() 是同一个字符串（Mode/Id）",
+                "实际 " + (both == null ? "null" : both.Key));
+
+            Check(ThemeCatalog.Merge(null, null).Count == 0
+                  && ThemeCatalog.Merge(local, null).Count == 2,
+                "远端读不到时不抛异常：本地那份照样列出来（不因为 NAS 没索引就空一页）");
+
+            // 勾选过滤：Only 里没有的键连扫描结果都不该参与比对
+            var opt = new ThemeSyncOptions();
+            Check(opt.Wants("Desktop", "mita-theme"), "Only 为空 = 全都要");
+            opt.Only.Add("Fullscreen/only-local");
+            Check(opt.Wants("Fullscreen", "only-local") && !opt.Wants("Desktop", "mita-theme"),
+                "进了 Only 之后，只有勾上的键会被处理（其余一个字节都不搬）");
+        }
+
+        /// <summary>
+        /// v1.9 第三组：传输队列 —— 「上传/下载不再模态阻塞」的地基。
+        ///
+        /// <para>这一组盯的是「用户点了归档之后还能不能继续用 Playnite」。
+        /// 串行、顺序、失败不带崩、能取消，四条缺一条都会让用户觉得卡死或丢任务。</para>
+        /// </summary>
+        private static void RunTransferQueueTests()
+        {
+            Group("v1.9 传输队列 · 串行执行与非阻塞");
+
+            var marshalCount = 0;
+            var changedCount = 0;
+            var queue = new TransferQueue(a =>
+            {
+                Interlocked.Increment(ref marshalCount);
+                a();
+            });
+            queue.Changed += () => { Interlocked.Increment(ref changedCount); };
+
+            var order = new List<string>();
+            var concurrent = 0;
+            var maxConcurrent = 0;
+
+            for (var i = 0; i < 3; i++)
+            {
+                var tag = "T" + i;
+                queue.Enqueue(TransferKind.Upload, "归档 " + tag, (task, token) =>
+                {
+                    InterlockedMax(ref maxConcurrent, Interlocked.Increment(ref concurrent));
+                    lock (order)
+                    {
+                        order.Add(tag);
+                    }
+
+                    Thread.Sleep(30);
+                    Interlocked.Decrement(ref concurrent);
+                });
+            }
+
+            Check(WaitUntil(() => queue.Snapshot().All(t => t.IsFinished), 5000),
+                "三条任务在 5 秒内全部跑完");
+            Check(maxConcurrent == 1,
+                "串行执行：任何时刻最多只有一条在跑（否则两条进度条都不准）",
+                "实际最多 " + maxConcurrent + " 条同时在跑");
+            Check(string.Join(",", order) == "T0,T1,T2",
+                "按入队顺序执行",
+                "实际顺序 " + string.Join(",", order));
+
+            var agg = queue.Aggregate();
+            Check(agg.Finished == 3 && agg.Active == 0 && agg.Failed == 0,
+                "聚合视图：3 条完成 / 0 在跑 / 0 失败",
+                "实际 完成 " + agg.Finished + "，在跑 " + agg.Active + "，失败 " + agg.Failed);
+            Check(!queue.HasActive, "全部结束后 HasActive 为 false");
+            Check(marshalCount > 0 && changedCount == marshalCount,
+                "结构变化经 marshalToUi 送到界面线程，且订阅者确实收到了每一条通知",
+                "实际 marshal=" + marshalCount + "，订阅者收到 " + changedCount);
+
+            // 失败不该把队列带崩
+            var boom = queue.Enqueue(TransferKind.Download, "会抛的任务",
+                (t, tok) => { throw new InvalidOperationException("炸了"); });
+            var after = queue.Enqueue(TransferKind.Download, "失败之后还得跑", (t, tok) => { });
+
+            Check(WaitUntil(() => boom.IsFinished && after.IsFinished, 5000),
+                "一条任务抛异常后，后面排队的仍然会执行（队列不被带崩）");
+            Check(boom.State == TransferState.Failed && boom.Error == "炸了",
+                "失败的任务记下状态与原因",
+                "实际 " + boom.StateText + " / " + boom.Error);
+            Check(after.State == TransferState.Done,
+                "紧随其后的任务正常完成",
+                "实际 " + after.StateText);
+
+            // 取消：任务体自己看 token 才会真的停
+            var slow = queue.Enqueue(TransferKind.Upload, "可取消的任务", (t, tok) =>
+            {
+                while (!tok.IsCancellationRequested)
+                {
+                    Thread.Sleep(10);
+                }
+
+                tok.ThrowIfCancellationRequested();
+            });
+            Check(WaitUntil(() => slow.State == TransferState.Running, 3000),
+                "慢任务能进入「进行中」");
+            slow.RequestCancel();
+            Check(WaitUntil(() => slow.IsFinished, 3000), "取消请求后 3 秒内结束");
+            Check(slow.State == TransferState.Canceled,
+                "任务体观察到取消 → 状态是「已取消」",
+                "实际 " + slow.StateText);
+
+            var removedCount = queue.ClearFinished();
+            Check(removedCount == 6 && queue.Snapshot().Length == 0,
+                "ClearFinished 只清已结束的条目（6 条全结束 → 清空）",
+                "清了 " + removedCount + " 条，剩 " + queue.Snapshot().Length + " 条");
+
+            // 聚合进度条：量出体积之后不能还是「不确定」态
+            var q2 = new TransferQueue(a => a());
+            var sized = q2.Enqueue(TransferKind.Download, "带体积的任务", (t, tok) =>
+            {
+                t.BytesTotal = 100;
+                t.BytesDone = 40;
+                Thread.Sleep(60);
+                t.BytesDone = 100;
+            });
+            var snapAgg = q2.Aggregate();
+            Check(snapAgg.HasAny && snapAgg.Active == 1 && snapAgg.Progress <= 1.0,
+                "入队瞬间的聚合视图：1 条在跑，进度在 0~1 之间",
+                "实际 在跑 " + snapAgg.Active + "，进度 " + snapAgg.Progress.ToString("0.000"));
+
+            Check(WaitUntil(() => sized.IsFinished, 3000), "带体积的任务跑完");
+            Check(sized.BytesDone == 100 && Math.Abs(sized.Fraction - 1.0) < 0.0001,
+                "结束时进度补齐到 100%（哪怕任务体自己没写完）",
+                "实际 " + sized.BytesDone + " / " + sized.Fraction.ToString("0.000"));
+            var doneAgg = q2.Aggregate();
+            Check(!doneAgg.Indeterminate && doneAgg.Finished == 1 && doneAgg.Active == 0,
+                "量出体积后聚合条不是「不确定」态（不确定态就是让用户干等的元凶）",
+                "实际 Indeterminate=" + doneAgg.Indeterminate + "，完成 " + doneAgg.Finished);
+        }
+
+        /// <summary>轮询等待某个条件成立，超时返回 false（自检里绝不能无限等）。</summary>
+        private static bool WaitUntil(Func<bool> condition, int timeoutMs)
+        {
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            while (watch.ElapsedMilliseconds < timeoutMs)
+            {
+                if (condition())
+                {
+                    return true;
+                }
+
+                Thread.Sleep(15);
+            }
+
+            return condition();
+        }
+
+        /// <summary>原子的「取较大值」—— 用来记并发峰值。</summary>
+        private static void InterlockedMax(ref int target, int value)
+        {
+            int current;
+            while (value > (current = Volatile.Read(ref target)))
+            {
+                if (Interlocked.CompareExchange(ref target, value, current) == current)
+                {
+                    return;
+                }
+            }
         }
 
         /// <summary>

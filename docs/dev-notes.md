@@ -217,7 +217,7 @@ Vault 1.8.1
   **判定「已有数据」时目录也算**（只有 `meta-cache` 也算已有），否则会把用户的旧配置盖掉。
 - 日志文件随之改名：`playnite-vault.log`（原 `vault-demo.log`）。
 
-## 10. 主题同步（v1.6.0 起）
+## 10. 主题同步（v1.6.0 起；v1.9 起侧边栏那一栏改叫「主题」，卡片勾选式）
 
 - 远端 = **普通文件镜像，与本地同构**：`themes/{Desktop|Fullscreen}/{主题Id}/…`
   \+ `themes/index.json`（每主题指纹）+ `themes/{Mode}/{Id}/manifest.json`（路径→sha1）。
@@ -250,7 +250,7 @@ Vault 1.8.1
 
 | 工具 | 规模 | 说明 |
 |---|---|---|
-| `tools/VaultSelfTest/` | C# 303 项 | `TcpListener` 起本地假 GitHub/Gitee，**断言全实跑**，不联网、不碰真实仓库 |
+| `tools/VaultSelfTest/` | C# 345 项 | `TcpListener` 起本地假 GitHub/Gitee，**断言全实跑**，不联网、不碰真实仓库 |
 | `tools/python-selftest/` | Python 109 项 | `python tools/python-selftest/run_all.py`；**设 `VAULT_TK_PYTHON` 指向带 tkinter 的解释器**，否则 GUI 与「真实 WM_CLOSE」两段会被跳过 |
 | `tools/fetch-playnite-themes.py --selftest` | Python 25 项 | 离线；专盯「认主题 / 定目录名 / 解包防穿越」那套判断 |
 
@@ -290,6 +290,8 @@ zip 路径穿越都是它或同类检查抓出来的。**改动对应模块后�
 - **v1.8 起顶栏被整个去掉**。原因不是审美：原来贴在右上角的「已连接 / 刷新」在窗口控制区
   （最小化/最大化/关闭）上方，两者位置重合，点刷新会顺手关掉 Playnite。
   现在只留一个不占版面、无底无框的状态点（`BuildHealthDot`），版本号挪到左栏产品名后面。
+  **v1.9 起这个点挪到左栏「仓库管家」标题右侧**（页内右上角仍与窗口控制区重合），
+  点它立刻重测（探测期间转圈）；概览页那个「刷新」按钮随之删掉 —— 一个动作只留一个入口。
 - 连通性状态必须**分档**：绿=通、黄=超时/不可达（NAS 没开机这类，等一会儿可能就好）、
   红=服务端明确拒绝或配置写错（401/403/域名解析/证书）、灰=还没配置。
   分档规则只有一处 `VaultPlugin.ClassifyHealthFailure`，自检逐档断言。
@@ -312,12 +314,30 @@ zip 路径穿越都是它或同类检查抓出来的。**改动对应模块后�
      所以建桶时空键直接跳过（自检有专门一条）。
   2. “老条目”的判据是**两把钥匙都没存**（v1.8 之前归档的），不是“没有 GUID” ——
      一个只存了库内 ID 的条目不是老条目，提示语不能张冠李戴。
+  **v1.9 起扩到五级**：第 4 级「库内标识 == 条目 Id」、第 5 级「归一化名字」。
+  这两级专治「老条目 + 本地已卸载 + 目录改过名」—— 前三档全落空时，同一个游戏会既显示
+  「未上传」、又作为孤儿再出现一张卡。第 4 级成立的依据：本插件导入的游戏就是
+  `Game.GameId = app.Id`（Steam 那种数字 appid 撞不上 slug，不会误判）。
+  第 5 级是最后一根稻草，**命中时会明说依据是名字**（改名/重名时它确实会错）；
+  归一化只去空白与非字母数字并转小写，**中文必须保留**。
+  新档一律**只往后加**：不传名字桶时行为与 v1.8 完全一致（自检有这条回归断言）。
 - **封面加载三个必须**：`CacheOption=OnLoad`（默认的延迟加载会握着文件句柄，
   而游戏正在跑的时候那个文件是活的）；`DecodePixelWidth` 缩到卡片宽度
   （一屏两百张按原图解码要吃掉几百 MB）；解完 `Freeze()` 才能跨线程交给 UI。
 - `VaultPanelView` 的构造签名 `(plugin, service, settingsVm, themesRoot)` 也是被自检钉住的契约
   （要加参数得同步改自检）。换配色需要**重建整棵视觉树**（颜色是建控件时烘进去的），
   所以 `VaultSettingsViewModel.SettingsSaved` 会触发 `RebuildForTheme()`。
+- **设置页嵌进侧边栏时不能再套一层 `ScrollViewer`**：它自带一个，外面 `bodyScroll` 又是一个，
+  内层先把滚轮事件吃掉 → 鼠标不管指哪儿都在滚。修法是 `VaultSettingsView(…, embedded: true)`
+  在嵌入时**不建**内层滚动区（独立窗口那条路仍然要）。
+- 输入框的「当前值」提示改用**水印**（`WithWatermark`：叠一个 `IsHitTestVisible=false`
+  的灰字，一有输入就藏）。**不写进 `Text`** —— 那样绑定分不清「用户想看这个名字」
+  与「用户什么都没输入」，保存时会把提示语当成真值落盘。不是输入框的（下拉框、目录行）
+  挂 `ToolTip`（注意 `ToolTip` 定义在 `FrameworkElement` 上，`UIElement` 没有）。
+- 保存必须**回报真实结果**：`VaultPlugin.SaveSettingsNow(vm, out error)` 而不是 `void` 的
+  `SaveSettingsImmediately`；存完再 `BeginEdit()` 重新快照一次（`EndEdit` 里 `RaiseAll()`），
+  否则被夹到范围外的值在界面上看不出被改了 —— 「保存没生效」有一半是这种
+  「其实生效了、但界面没跟上」。
 
 ## 13. 云存档（v1.7.0 起）
 
@@ -444,3 +464,37 @@ zip 路径穿越都是它或同类检查抓出来的。**改动对应模块后�
   另有一个只读的 `DatabaseReference`（指向 `IGameDatabase`），不是 id。
   → 想多一层对账就存 `Id` + `GameId`，别再去找 `DatabaseId` 了
   （Vault 的 `AppEntry.PlayniteGameId` / `PlayniteLibraryId` 就是这两个）。
+
+## 16. 传输队列（v1.9 起）
+
+原来归档 / 安装走的是 Playnite 的 `ActivateGlobalProgress` —— **模态**对话框，跑着的时候
+整个 Playnite 被按住。v1.9 换成自持的串行队列（`Services/TransferQueue.cs`）。
+
+- **串行，不是并发**。瓶颈在 NAS 写入侧（实测下载 88 MB/s、上传只有 20~40 MB/s），
+  两条并发只会互相抢带宽、还让两条进度条都不准。串行 → 每条百分比是真速率
+  （自检有一条「任何时刻最多只有一条在跑」的断言，实测并发峰值计数器）。
+- **通知只分两种**：这个类只在**结构变化**（入队 / 结束 / 清除）时发 `Changed`，
+  并且**必须经 `marshalToUi` 送回界面线程**（订阅者是 WPF 控件，后台线程碰会直接抛跨线程
+  访问异常）。字节数每 100 ms 都在变 → 让界面用它自己的 `DispatcherTimer`（250 ms）轮询
+  `Snapshot()`；反过来把每次字节变化都推给界面，会把 UI 线程淹掉。
+  `Raise()` 在**没有订阅者时直接返回** —— 所以「通知真的发出去了」这件事只有先订阅才测得到
+  （自检在这里踩过一次：断言跑在订阅之前，永远看不到通知）。
+- **任务体自己看 token**：`RequestCancel()` 只置取消位，不杀线程。任务体不检查 `Token`
+  就不会停。状态落 `Canceled` 而不是 `Failed` —— 用户主动取消不该显示成一堆红字。
+- **失败不带崩队列**：`Loop()` 里 `catch` 住异常写进 `task.Error`，接着跑下一条。
+  这是「丢了一整队任务」与「有一条失败」的区别。
+- **聚合条按体积加权**，量不出体积的按 1 算 —— 否则未开始的任务会让整条进度条一开始就
+  显示 100%（`TransferAggregate.Indeterminate` 就是给这种情况留的）。
+- 界面侧：`VaultPanelView` 底部常驻一条 `transferBar`（**不进 `bodyScroll`**，翻页也在），
+  另有「任务」一栏逐条列。卡片按钮一律走 `Enqueue*`
+  （`EnqueueArchiveById` → `EnqueueArchive` → 队列体 → `service.ArchiveApp`），
+  **入队只有一处**；自检从 IL 里断言「侧边栏页里已经没有对 `ArchiveGameById`
+  （模态那条路）的调用」。
+- **元数据必须在入队前、于 UI 线程上刮好**：`BuildMetadata` 读的是 Playnite 的库对象，
+  那些对象不保证线程安全，进后台线程再读就是隐患。
+
+「主题」页的数据在 `Services/ThemeCatalog.cs`：只读远端 `themes/index.json`，
+**不去列远端目录**（那会是 N+1 次请求）；`Merge` 按 `模式/Id` 合并，本地为主、
+远端独有的接在后面 —— 并错的后果是同一主题在墙上出现两张卡。
+勾选过滤走 `ThemeSyncOptions.Only`（键就是 `模式/Id`，`Wants()` 为空视为全都要），
+引擎在 `BuildPlan` 里对没勾的主题**连扫描结果都不参与比对**。

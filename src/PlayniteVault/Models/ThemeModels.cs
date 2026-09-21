@@ -136,6 +136,28 @@ namespace PlayniteVault.Models
 
         /// <summary>强制整树上传（跳过指纹相同的快路径），用于修「指纹对但文件坏了」。</summary>
         public bool Force { get; set; } = false;
+
+        /// <summary>
+        /// 只处理这些主题（键是「模式/Id」，例如 <c>Desktop/Aniki</c>）。
+        ///
+        /// <para>空 / null = 全部。（v1.9 的「主题」页是卡片勾选式的：用户勾了哪几个
+        /// 就只搬哪几个，没勾的连扫描结果都不参与比对。）</para>
+        /// </summary>
+        public HashSet<string> Only { get; set; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>这一条要不要处理（<see cref="Only"/> 为空视为「全都要」）。</summary>
+        public bool Wants(string mode, string id)
+        {
+            return Only == null || Only.Count == 0
+                || Only.Contains(ThemeSyncEngineKey(mode, id));
+        }
+
+        /// <summary>主题的稳定键。**必须与引擎内部的 <c>Key()</c> 一致** ——
+        /// 这里拼成公开方法，是因为界面要拿同一个字符串去构造 <see cref="Only"/>。</summary>
+        public static string ThemeSyncEngineKey(string mode, string id)
+        {
+            return (mode ?? string.Empty) + "/" + (id ?? string.Empty);
+        }
     }
 
     public class ThemeSyncCounters
