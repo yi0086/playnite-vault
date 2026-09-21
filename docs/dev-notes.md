@@ -178,7 +178,7 @@ Release 只认 token（SSH 推不了 release）。
 
 | 工具 | 规模 | 说明 |
 |---|---|---|
-| `tools/VaultSelfTest/` | C# 143 项 | `TcpListener` 起本地假 GitHub/Gitee，**断言全实跑**，不联网、不碰真实仓库 |
+| `tools/VaultSelfTest/` | C# 160 项 | `TcpListener` 起本地假 GitHub/Gitee，**断言全实跑**，不联网、不碰真实仓库 |
 | `tools/python-selftest/` | Python 85 项 | `python tools/python-selftest/run_all.py`；GUI 那项需 tkinter，可设 `VAULT_TK_PYTHON` |
 | `tools/fetch-playnite-themes.py --selftest` | Python 25 项 | 离线；专盯「认主题 / 定目录名 / 解包防穿越」那套判断 |
 
@@ -188,7 +188,29 @@ zip 路径穿越都是它或同类检查抓出来的。**改动对应模块后�
 跑 C# 自检前先建：
 `dotnet build tools/VaultSelfTest/VaultSelfTest.csproj -c Release -p:PlayniteDir=…`
 
-## 12. 环境坑（本机特有）
+## 12. 侧边栏页（v1.6.0 起）
+
+- 用 `Plugin.GetSidebarItems()` + `SidebarItem.Type = SiderbarItemType.View`。
+  Type 为 View 时，Playnite 会把 `Opened()` 返回的控件**直接嵌进主窗口当一页**
+  （`DesktopAppViewModel_Sidebar.cs` 里 `model.ActiveView = view`），所以不用自己开窗口，
+  界面也自动继承主窗口的主题与缩放。SidebarItem 在桌面端是个 `Button`，
+  模板里的 `ContentPresenter` 绑的是 `SidebarWrapperItem.IconObject`。
+- **图标必须是 UIElement**。`IconObject => SdkHelpers.ResolveUiItemIcon(SideItem.Icon)`；
+  只有**字符串**会被当成主题资源键去查（Playnite 自己的库/统计图标就是
+  `Media.xaml` 里的 `SidebarLibraryIcon` 这种 TextBlock 资源），其余对象原样透传。
+  所以图标用 `Path` 画矢量，**不用字体字形** —— 换机器、换主题都不会变成方框。
+- **`FrameworkElement` 只能在 STA 线程上构造**。Playnite 是在 UI 线程上调
+  `GetSidebarItems()` 的，所以生产侧没问题；但自检主线程是 MTA，
+  碰这段必须转到一个 STA 线程上（`Program.RunSta`）。这个坑是被自检抓出来的。
+- 配色：正文色优先取主题的 `TextBrush`（对比度最稳），明暗按窗口背景亮度判断；
+  取不到就用内置调色板兜底。**任何取不到主题资源的地方都必须有非 null 的兜底**，
+  否则会出现「深色主题下黑字看不见」。
+- **口令闸门只能有一道**：仓库管理里有不可逆删除，`VaultAdminWindow` 必须经由
+  `VaultPlugin.OpenRepositoryManager()`（里面验管理口令）打开。
+  侧边栏页直接 `new VaultAdminWindow` 就等于开后门 —— 自检 §11 有一条从 IL 里
+  搜 `newobj` 令牌的断言盯着它，并且带**正对照**（同一个检测器能在插件里找到那句 new）。
+
+## 13. 环境坑（本机特有）
 
 - **Bash 工具缺基础命令**：先 `export PATH="/usr/bin:/bin:/usr/local/bin:$PATH"`，
   否则 `ls` / `head` / `dirname` / `rm` 全报 command not found（`rm` 挂了还会连累整条命令 exit 127）。

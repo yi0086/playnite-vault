@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using PlayniteVault.Models;
@@ -88,6 +89,7 @@ namespace VaultSelfTest
                 RunPendingStagedTests(root, updater, dataPath);
                 RunDataMigrationTests(root);
                 RunThemeSyncTests(root);
+                RunSidebarPanelTests();
             }
             catch (Exception ex)
             {
@@ -971,7 +973,6 @@ namespace VaultSelfTest
         {
             WriteLocalAt(path, text, null);
         }
-
         private static void WriteLocalAt(string path, string text, DateTime? modifiedUtc)
         {
             var dir = Path.GetDirectoryName(path);
@@ -989,6 +990,267 @@ namespace VaultSelfTest
         private static string ReadLocal(string path)
         {
             return File.Exists(path) ? File.ReadAllText(path, Encoding.UTF8) : null;
+        }
+
+        /// <summary>
+        /// 侧边栏「仓库管家」那一页。界面本身没法在无头环境里点，但它的**契约**可以验：
+        ///  · 结果对象（ThemeSyncOutcome / ThemeLibraryStats）的说法与算术；
+        ///  · 页面类型确实挂在 VaultPlugin.GetSidebarItems 上，且构造签名没被改坏；
+        ///  · 侧边栏图标真能造出来、几何路径能解析（图省事写错一串坐标就会在这里炸）。
+        /// 这些正是「页面变成空白」和「图标变成方框」之前会先出错的地方。
+        /// </summary>
+        private static void RunSidebarPanelTests()
+        {
+            Group("侧边栏「仓库管家」页");
+
+            // --- 1. 结果对象：三种收场各有各的说法，别把「取消」说成「失败」 ---
+            Check(ThemeSyncOutcome.Fail("配置不全").Describe().StartsWith("同步失败：配置不全"),
+                "失败时 Describe() 以「同步失败：」开头");
+
+            var cancelled = ThemeSyncOutcome.Fail(null);
+            cancelled.Failure = null;
+            cancelled.Cancelled = true;
+            Check(cancelled.Describe().StartsWith("已取消"),
+                "取消时 Describe() 说「已取消」，不冒充失败");
+
+            var dry = new ThemeSyncOutcome
+            {
+                Ok = true,
+                DryRun = true,
+                Counters = new ThemeSyncCounters { ThemesUploaded = 3, FilesUploaded = 5 }
+            };
+            Check(dry.Describe().StartsWith("【预演，没有落盘】"),
+                "预演的结果会被显式标注（免得以为真传了）");
+            Check(dry.Describe().Contains("上传 3 个主题"),
+                "预演也照样把计数说清楚");
+
+            var withRemote = new ThemeSyncOutcome
+            {
+                Ok = true,
+                Counters = new ThemeSyncCounters
+                {
+                    ThemesDownloaded = 1,
+                    RemoteOnly = new List<string> { "Desktop/Only-On-Nas" }
+                }
+            };
+            Check(withRemote.Describe().Contains("远端独有 1 个")
+                  && withRemote.Describe().Contains("Desktop/Only-On-Nas"),
+                "远端独有条目会列出来（并说明不会删除）");
+
+            // --- 2. 统计快照：总数就是两个模式之和 ---
+            var stats = new ThemeLibraryStats { DesktopThemes = 76, FullscreenThemes = 2 };
+            Check(stats.TotalThemes == 78, "主题总数 = 桌面 + 全屏",
+                "实际 " + stats.TotalThemes);
+
+            // --- 3. 页面确实挂在侧边栏上，且构造签名没被改坏 ---
+            var pluginType = typeof(PlayniteVault.VaultPlugin);
+            var sidebarMethod = pluginType.GetMethod("GetSidebarItems",
+                BindingFlags.Public | BindingFlags.Instance);
+
+            Check(sidebarMethod != null && sidebarMethod.DeclaringType == pluginType,
+                "VaultPlugin 自己覆写了 GetSidebarItems（不是继承基类的空实现）");
+
+            var panelType = typeof(PlayniteVault.UI.VaultPanelView);
+            var ctor = panelType.GetConstructor(new[]
+            {
+                pluginType,
+                typeof(VaultService),
+                typeof(PlayniteVault.UI.VaultSettingsViewModel),
+                typeof(string)
+            });
+            Check(ctor != null, "VaultPanelView 的构造签名 (plugin, service, settingsVm, themesRoot) 没变");
+
+            // --- 4. 图标：能造出来、路径能解析、笔画不是空的 ---
+            // 注意：Path 是 FrameworkElement，只能在 STA 线程上 new ——
+            // 自检主线程是 MTA，直接 Invoke 会抛「调用线程必须为 STA」。
+            // 这本身也是一条有用的信息：Playnite 是在 UI 线程上调 GetSidebarItems 的。
+            var iconMethod = pluginType.GetMethod("BuildSidebarIcon",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            Check(iconMethod != null, "BuildSidebarIcon 还在（侧边栏图标的生产者）");
+
+            if (iconMethod != null)
+            {
+                object icon = null;
+                var isVector = false;
+                var hasData = false;
+                var hasStroke = false;
+                string iconType = null;
+
+                var staError = RunSta(() =>
+                {
+                    icon = iconMethod.Invoke(null, null);
+                    var shape = icon as System.Windows.Shapes.Path;
+                    isVector = shape != null;
+                    if (shape != null)
+                    {
+                        hasData = shape.Data != null && !shape.Data.IsEmpty();
+                        hasStroke = shape.Stroke != null;
+                    }
+                });
+
+                Check(staError == null, "侧边栏图标能在 STA 线程上造出来（Playnite 调它时就是这种情况）",
+                    staError == null ? null : staError.Message);
+
+                if (icon != null)
+                {
+                    iconType = icon.GetType().FullName;
+                }
+
+                Check(isVector,
+                    "图标是矢量 Path（不是字体字形，换机器不会变方框）",
+                    icon == null ? "返回了 null" : iconType);
+
+                if (isVector)
+                {
+                    // 只对矢量那条分支断言：返回 null 时上面那条已经报过了
+                    var ok = hasData && hasStroke;
+                    if (ok)
+                    {
+                        Check(true, "图标几何数据非空，且描边有色（坐标写错 Geometry.Parse 会直接抛）");
+                    }
+                    else
+                    {
+                        Check(false, "图标几何数据非空，且描边有色",
+                            hasData ? "描边是空的（深色主题里等于看不见）" : "几何数据为空");
+                    }
+                }
+            }
+
+            // --- 5. 取不到主题画刷时必须退回兜底，不能返回 null ---
+            var fallback = System.Windows.Media.Brushes.Magenta;
+            System.Windows.Media.Brush resolved = null;
+            var brushError = RunSta(() =>
+            {
+                resolved = PlayniteVault.UI.VaultPanelView.ThemedBrush(
+                    "这个资源键肯定不存在-VaultSelfTest", fallback);
+            });
+            Check(brushError == null && ReferenceEquals(resolved, fallback),
+                "主题里没有这个画刷时，ThemedBrush 返回兜底而不是 null",
+                brushError != null ? brushError.Message : null);
+
+            // --- 6. 口令闸门不能被侧边栏绕开 ---
+            // 仓库管理里是**不可逆的删除**，主菜单那条路会先验管理口令。
+            // 侧边栏页如果自己 new VaultAdminWindow，就等于开后门了 ——
+            // 这条断言直接从 IL 里查「有没有 newobj 到 VaultAdminWindow」。
+            var openManager = pluginType.GetMethod("OpenRepositoryManager",
+                BindingFlags.Public | BindingFlags.Instance);
+            Check(openManager != null, "VaultPlugin 公开了 OpenRepositoryManager（口令闸门的唯一入口）");
+
+            var adminCtor = typeof(PlayniteVault.UI.VaultAdminWindow)
+                .GetConstructor(new[] { typeof(VaultService) });
+            Check(adminCtor != null, "VaultAdminWindow(VaultService) 这个构造还在");
+
+            if (adminCtor != null)
+            {
+                Check(!InstantiatesAdminWindow(panelType),
+                    "侧边栏页没有直接 new 仓库管理窗口（否则绕开管理口令）");
+
+                // 正对照：同一个检测器去查插件自己 —— 那里**确实**有这句 new。
+                // 没有这一条，「没找到」和「检测器坏了」就分不出来。
+                Check(InstantiatesAdminWindow(pluginType),
+                    "（正对照）检测器能在插件里找到这句 new，说明上面那条不是空过");
+            }
+        }
+
+        /// <summary>
+        /// 在某个类型（含它自己生成的闭包类）的所有方法 IL 里找「有没有 newobj 到仓库管理窗口」。
+        /// 直接搜 4 字节元数据令牌：newobj 的操作数就是它，误命中概率可以忽略。
+        /// </summary>
+        private static bool InstantiatesAdminWindow(Type owner)
+        {
+            var ctor = typeof(PlayniteVault.UI.VaultAdminWindow)
+                .GetConstructor(new[] { typeof(VaultService) });
+            if (ctor == null)
+            {
+                return false;
+            }
+
+            var token = BitConverter.GetBytes(ctor.MetadataToken);
+            var types = new List<Type> { owner };
+            types.AddRange(owner.GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic));
+
+            foreach (var type in types)
+            {
+                const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
+                                           | BindingFlags.Instance | BindingFlags.Static
+                                           | BindingFlags.DeclaredOnly;
+
+                var methods = type.GetMethods(flags);
+                foreach (var method in methods)
+                {
+                    MethodBody body;
+                    try
+                    {
+                        body = method.GetMethodBody();
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (body != null && ContainsToken(body.GetILAsByteArray(), token))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static bool ContainsToken(byte[] il, byte[] token)
+        {
+            if (il == null || token == null || il.Length < token.Length)
+            {
+                return false;
+            }
+
+            for (var i = 0; i <= il.Length - token.Length; i++)
+            {
+                var hit = true;
+                for (var j = 0; j < token.Length; j++)
+                {
+                    if (il[i + j] != token[j])
+                    {
+                        hit = false;
+                        break;
+                    }
+                }
+
+                if (hit)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 在 STA 线程上跑一段动作并把异常带回来。
+        /// WPF 的 FrameworkElement 只能在 STA 上构造，而自检主线程是 MTA —— 这一层必须转一下。
+        /// </summary>
+        private static Exception RunSta(Action action)
+        {
+            Exception error = null;
+            var thread = new Thread(() =>
+            {
+                try
+                {
+                    action();
+                }
+                catch (Exception ex)
+                {
+                    error = ex is TargetInvocationException && ex.InnerException != null
+                        ? ex.InnerException
+                        : ex;
+                }
+            });
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.IsBackground = true;
+            thread.Start();
+            thread.Join();
+            return error;
         }
 
         private static void RunDataMigrationTests(string root)

@@ -27,6 +27,12 @@ namespace PlayniteVault
 
         public static VaultPlugin Instance { get; private set; }
 
+        /// <summary>有「已下载、等重启才装上」的更新包时置位（侧边栏页用它点亮徽章）。</summary>
+        public bool HasPendingUpdate
+        {
+            get { return updater != null && updater.PendingStaged() != null; }
+        }
+
         private readonly VaultService service;
         private readonly VaultSettingsViewModel settingsVm;
         private readonly VaultUpdater updater;
@@ -635,7 +641,7 @@ namespace PlayniteVault
             {
                 MenuSection = "Vault",
                 Description = "管理仓库应用（删除，需管理口令）",
-                Action = a => ManageRepository()
+                Action = a => OpenRepositoryManager()
             });
 
             items.Add(new GameMenuItem
@@ -662,8 +668,11 @@ namespace PlayniteVault
         ///
         /// 口令只是**防误触闸门**：派生值明文存在仓库根的 vault-admin.json，
         /// 真正拦住外人的是 WebDAV 账号。别把它当权限系统用。
+        ///
+        /// 公开是为了让侧边栏页也走同一条路 —— 里面是**不可逆的删除**，
+        /// 多一个入口就多一次绕开口令的机会，所以入口可以多、闸门只能一道。
         /// </summary>
-        private void ManageRepository()
+        public void OpenRepositoryManager()
         {
             if (!service.Settings.IsConfigured)
             {
@@ -1700,16 +1709,11 @@ namespace PlayniteVault
         /// </summary>
         private void SyncThemes(ThemeSyncMode mode)
         {
-            if (!service.Settings.IsConfigured)
+            string root;
+            string reason;
+            if (!ThemeSyncPreflight(out root, out reason))
             {
-                PlayniteApi.Dialogs.ShowMessage("还没有配置 WebDAV 地址，请先到插件设置里填写。", "Playnite Vault");
-                return;
-            }
-
-            var root = Path.Combine(PlayniteApi.Paths.ConfigurationPath, "Themes");
-            if (!Directory.Exists(root))
-            {
-                PlayniteApi.Dialogs.ShowMessage("找不到主题目录：\n" + root, "同步主题");
+                PlayniteApi.Dialogs.ShowMessage(reason, "Playnite Vault");
                 return;
             }
 
@@ -1731,6 +1735,57 @@ namespace PlayniteVault
                 return;
             }
 
+            var outcome = ExecuteThemeSync(root, mode, false, false);
+            PlayniteApi.Dialogs.ShowMessage(outcome.Describe(), "同步主题");
+        }
+
+        /// <summary>
+        /// 侧边栏页入口：页面上已经有方向与选项了，所以不弹确认框；
+        /// 结果直接返回给界面自己显示（主菜单那条仍然走弹窗）。
+        /// </summary>
+        public ThemeSyncOutcome RunThemeSyncFromPanel(ThemeSyncMode mode, bool dryRun, bool force)
+        {
+            string root;
+            string reason;
+            if (!ThemeSyncPreflight(out root, out reason))
+            {
+                return ThemeSyncOutcome.Fail(reason);
+            }
+
+            return ExecuteThemeSync(root, mode, dryRun, force);
+        }
+
+        /// <summary>两条入口共用的前置检查：配置齐了、主题目录在。</summary>
+        private bool ThemeSyncPreflight(out string root, out string reason)
+        {
+            root = null;
+            reason = null;
+
+            if (!service.Settings.IsConfigured)
+            {
+                reason = "还没有配置 WebDAV 地址，请先到插件设置里填写。";
+                return false;
+            }
+
+            root = ThemeRootPath();
+            if (!Directory.Exists(root))
+            {
+                reason = "找不到主题目录：\n" + root;
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>本地主题目录（Playnite 配置路径下的 Themes）。</summary>
+        public string ThemeRootPath()
+        {
+            return Path.Combine(PlayniteApi.Paths.ConfigurationPath, "Themes");
+        }
+
+        /// <summary>真正的执行体：命令行、主菜单、侧边栏页都走这里。</summary>
+        private ThemeSyncOutcome ExecuteThemeSync(string root, ThemeSyncMode mode, bool dryRun, bool force)
+        {
             var counters = new ThemeSyncCounters();
             var cancelled = false;
             string failure = null;
@@ -1744,7 +1799,12 @@ namespace PlayniteVault
                         Path.Combine(service.DataPath, "theme-sync-state.json"),
                         service.BuildSyncOptions(false), reporter, progress.CancelToken);
 
-                    counters = engine.Run(new ThemeSyncOptions { Mode = mode }).Counters;
+                    counters = engine.Run(new ThemeSyncOptions
+                    {
+                        Mode = mode,
+                        DryRun = dryRun,
+                        Force = force
+                    }).Counters;
                 }
                 catch (OperationCanceledException)
                 {
@@ -1757,29 +1817,22 @@ namespace PlayniteVault
                     failure = ex.Message;
                 }
             },
-            new GlobalProgressOptions("正在同步主题") { IsIndeterminate = false, Cancelable = true });
-
-            if (cancelled)
+            new GlobalProgressOptions(dryRun ? "正在预演主题同步" : "正在同步主题")
             {
-                PlayniteApi.Dialogs.ShowMessage("已取消。下一次同步会从当前状态继续。", "同步主题");
-                return;
-            }
+                IsIndeterminate = false,
+                Cancelable = true
+            });
 
-            if (failure != null)
+            return new ThemeSyncOutcome
             {
-                PlayniteApi.Dialogs.ShowMessage("同步失败：\n\n" + failure, "同步主题");
-                return;
-            }
-
-            var report = counters.Describe();
-            if (counters.RemoteOnly.Count > 0)
-            {
-                report += "\n\n远端独有 " + counters.RemoteOnly.Count
-                    + " 个（只提示，不会删除）：\n"
-                    + string.Join("\n", counters.RemoteOnly.ToArray());
-            }
-
-            PlayniteApi.Dialogs.ShowMessage(report, "同步主题");
+                Ok = !cancelled && failure == null,
+                Cancelled = cancelled,
+                Failure = failure,
+                ThemeRoot = root,
+                Mode = mode,
+                DryRun = dryRun,
+                Counters = counters
+            };
         }
 
         /// <summary>把主题同步的进度接到 Playnite 的全局进度窗上。</summary>
@@ -1810,6 +1863,51 @@ namespace PlayniteVault
             {
                 VaultLog.Info("[主题同步] " + line);
             }
+        }
+
+        // ---------- 侧边栏 ----------
+
+        /// <summary>
+        /// 侧边栏那一页。Type = View 时，Opened 返回的控件会被 Playnite 直接嵌进主窗口当页面用，
+        /// 所以不用自己开窗口，界面也自动继承 Playnite 的主题与缩放。
+        /// 每次点开都新建一个实例：页面里存着统计与表单状态，复用同一个会串味。
+        /// </summary>
+        public override IEnumerable<SidebarItem> GetSidebarItems()
+        {
+            return new List<SidebarItem>
+            {
+                new SidebarItem
+                {
+                    Title = "仓库管家",
+                    Type = SiderbarItemType.View,
+                    Visible = true,
+                    Icon = BuildSidebarIcon(),
+                    Opened = () => new VaultPanelView(this, service, settingsVm, ThemeRootPath())
+                }
+            };
+        }
+
+        /// <summary>
+        /// 侧边栏图标画成矢量，不依赖系统字体里有没有那个字形
+        /// （Segoe MDL2 的码位记错就会显示成一个方框）。
+        ///
+        /// 返回 object 是因为 <c>SidebarItem.Icon</c> 就是 object：
+        /// Playnite 那边走 <c>SdkHelpers.ResolveUiItemIcon</c>，
+        /// 只有字符串才被当成主题资源键去查，其余 UIElement 原样透传渲染。
+        /// </summary>
+        private static object BuildSidebarIcon()
+        {
+            return new System.Windows.Shapes.Path
+            {
+                Data = System.Windows.Media.Geometry.Parse(
+                    "M 2.5,4.5 L 11.5,4.5 L 11.5,15 L 2.5,15 Z "
+                    + "M 2.5,8.2 L 11.5,8.2 M 5.4,4.5 L 5.4,1.6 L 8.6,1.6 L 8.6,4.5"),
+                StrokeThickness = 1.3,
+                Stretch = System.Windows.Media.Stretch.Uniform,
+                Width = 16,
+                Height = 16,
+                Stroke = VaultPanelView.ThemedBrush("TextBrush", System.Windows.Media.Brushes.Gray)
+            };
         }
 
         public override IEnumerable<MainMenuItem> GetMainMenuItems(GetMainMenuItemsArgs args)

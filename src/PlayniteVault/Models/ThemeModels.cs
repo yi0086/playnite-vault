@@ -168,6 +168,75 @@ namespace PlayniteVault.Models
     }
 
     /// <summary>
+    /// 一次主题同步的结果。之所以要有这个对象而不是直接弹窗：
+    /// 命令行、主菜单、侧边栏页三条入口都要用同一条执行路径，
+    /// 但只有「主菜单」那条适合自己弹窗，另外两条要把结果写进自己的界面里。
+    /// </summary>
+    public class ThemeSyncOutcome
+    {
+        public bool Ok { get; set; }
+        public bool Cancelled { get; set; }
+        public string Failure { get; set; }
+        public string ThemeRoot { get; set; }
+        public ThemeSyncMode Mode { get; set; }
+        public bool DryRun { get; set; }
+        public ThemeSyncCounters Counters { get; set; }
+
+        public static ThemeSyncOutcome Fail(string reason)
+        {
+            return new ThemeSyncOutcome { Ok = false, Failure = reason };
+        }
+
+        /// <summary>给人看的摘要（失败/取消各自一句话）。</summary>
+        public string Describe()
+        {
+            if (!string.IsNullOrEmpty(Failure))
+            {
+                return "同步失败：" + Failure;
+            }
+
+            if (Cancelled)
+            {
+                return "已取消。下一次同步会从当前状态继续。";
+            }
+
+            var counters = Counters ?? new ThemeSyncCounters();
+            var text = counters.Describe();
+
+            if (DryRun)
+            {
+                text = "【预演，没有落盘】" + text;
+            }
+
+            if (counters.RemoteOnly != null && counters.RemoteOnly.Count > 0)
+            {
+                text += Environment.NewLine + Environment.NewLine
+                        + "远端独有 " + counters.RemoteOnly.Count
+                        + " 个（只提示，不会删除）：" + Environment.NewLine
+                        + string.Join(Environment.NewLine, counters.RemoteOnly.ToArray());
+            }
+
+            return text;
+        }
+    }
+
+    /// <summary>
+    /// 侧边栏「概览/统计」用的本地主题库快照。纯本地统计，不发网络请求。
+    /// </summary>
+    public class ThemeLibraryStats
+    {
+        public int DesktopThemes { get; set; }
+        public int FullscreenThemes { get; set; }
+        public int TotalThemes { get { return DesktopThemes + FullscreenThemes; } }
+        public long TotalBytes { get; set; }
+        public int ConflictCopies { get; set; }
+        public DateTime? LastSyncUtc { get; set; }
+
+        /// <summary>主题目录本身不存在时置位（比如还没装过任何主题）。</summary>
+        public bool RootMissing { get; set; }
+    }
+
+    /// <summary>
     /// 同步过程的汇报口。刻意不依赖 Playnite 的进度 API ——
     /// 这样同一个引擎既能给插件界面用，也能给命令行工具和无头自检用。
     /// </summary>
