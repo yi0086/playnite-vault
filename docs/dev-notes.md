@@ -86,7 +86,9 @@ Release 只认 token（SSH 推不了 release）。
   含中文名的 zip 必须用 Python `zipfile`（PowerShell `Compress-Archive` 不设 UTF-8 flag 0x800）。
 - **只复制明确列出的文件，绝不整目录拷贝** —— `tools/dist/` 里躺着带真实 NAS 地址与账号的 `config.json`。
 
-`python tools/publish-release.py <版本> --verify-download` —— 已固化，**别再写临时脚本发 release**。
+`python tools/publish-release.py <版本> --notes-file ../release/release-notes-v<版本>.md --verify-download`
+—— 已固化，**别再写临时脚本发 release**。另有两条小命令：`--retitle "Vault X.Y.Z"` 只改标题、
+不动正文资产（用来统一历史 release 的命名）；`--delete` 撤掉整条 release 与 tag（两端 + 本地）。
 
 - GitHub 建/更新 release + 传资产（可 `PATCH` 正文）；Gitee 建 release 后**逐个** `attach_files`。
 - 回验四层：资产在不在 → 同名项出现几次 → API 记的大小 → **真下载比 sha256**。
@@ -104,29 +106,34 @@ Release 只认 token（SSH 推不了 release）。
 ```
 README.md      只写**当前版本**的功能与用法。历史一律不放这儿。
 CHANGELOG.md   每一版改了什么（类型标记 + 要点），最新在前。
-release/v<x>/RELEASE_NOTES.md   只写「本次注意事项 + 要点 + 引导」，别赘述 README 已有的东西。
+release/release-notes-v<x>.md   只写「逐条要点 + 引导」（**首行是标题**），别赘述 README 已有的东西。
 docs/dev-notes.md   工程取舍、踩坑（给改代码的人看）。
 ```
 
-`RELEASE_NOTES.md` 的骨架（`--notes-file` 指向它）：
+`release-notes-v<x>.md` 的骨架（`--notes-file` 指向它）。**首行是标题**，必须是
+`Vault X.Y.Z`（写成 `# Vault X.Y.Z` 也行，脚本会把 `#` 去掉）：
 
 ```markdown
-# Playnite Vault 1.8.0
+Vault 1.8.1
 
-<本次要用户留意的注意事项；没有就整段不写>
-
-## 要点
-
-- ...
+- [bugfix] ...
+- [feature] ...
+- [ui] ...
 
 细节见 [CHANGELOG](https://github.com/yi0086/playnite-vault/blob/main/CHANGELOG.md)。
 ```
 
+- **标题 = 首行，`Vault X.Y.Z`，后面不接任何说明**。历史上 v1.6.0 写成了
+  「Playnite Vault 1.6.0」、v1.7.0/v1.8.0 把 markdown 的 `#` 连整句说明一起带进了标题字段 ——
+  1.8.1 期间已用 `--retitle` 全部改回，以后就按这个写。
 - **不要**在发布正文里重复项目介绍 / 适用边界 / 许可 / 目录结构 ——
   那些 README 里有，重复一遍就是两处要同步。
-- **不写下载区**。资产名与下载直链由 `publish-release.py` 按平台拼好
-  （`release_body_for`，默认 `<details>` 折叠），手写必写成另一个平台的链接。
-- 「更新类型」用 `--kind feature,ui,fix,...`（脚本渲染成中文行）。
+- **不要「要点」这种小标题**，直接列点；**每条以 `[类型]` 开头**（`[bugfix]` / `[feature]` /
+  `[ui]` / `[perf]` / `[docs]` / `[breaking]` / `[note]`）。**不要**再另起一行写「更新类型」
+  （`--kind` 已经删掉了）。
+- **「注意事项」只写「升级时必须用户自己动手」的事**（破坏性变更之类）；达不到就整段不写。
+- **不写下载区、也不要「下载」这个小标题**。资产名与直链由 `publish-release.py` 拼好，
+  以 `<details>` 折叠**放在正文最上面**（`release_body_for`），手写必写成另一个平台的链接。
 - 正文里指向 `CHANGELOG.md` 的链接**只写 GitHub 那份**，脚本会把域名改写成目标平台。
 
 ### 6.2 tag：一律用附注 tag，且由脚本建
@@ -243,7 +250,7 @@ docs/dev-notes.md   工程取舍、踩坑（给改代码的人看）。
 
 | 工具 | 规模 | 说明 |
 |---|---|---|
-| `tools/VaultSelfTest/` | C# 299 项 | `TcpListener` 起本地假 GitHub/Gitee，**断言全实跑**，不联网、不碰真实仓库 |
+| `tools/VaultSelfTest/` | C# 303 项 | `TcpListener` 起本地假 GitHub/Gitee，**断言全实跑**，不联网、不碰真实仓库 |
 | `tools/python-selftest/` | Python 109 项 | `python tools/python-selftest/run_all.py`；**设 `VAULT_TK_PYTHON` 指向带 tkinter 的解释器**，否则 GUI 与「真实 WM_CLOSE」两段会被跳过 |
 | `tools/fetch-playnite-themes.py --selftest` | Python 25 项 | 离线；专盯「认主题 / 定目录名 / 解包防穿越」那套判断 |
 

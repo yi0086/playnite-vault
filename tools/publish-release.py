@@ -3,11 +3,13 @@
 """把 ../release/v<版本>/ 里的产物发布成 GitHub + Gitee 的 Release。
 
 用法：
-    python tools/publish-release.py 1.8.0 --kind feature,ui --verify-download
-    python tools/publish-release.py 1.8.0 --dry-run
-    python tools/publish-release.py 1.8.0 --notes-file notes.md --only github
-    python tools/publish-release.py 1.8.0 --tag-message "一句话摘要"
-    python tools/publish-release.py 1.8.0 --force          # 同名资产删掉重传 + 重建 tag
+    python tools/publish-release.py 1.8.1 --notes-file notes.md --verify-download
+    python tools/publish-release.py 1.8.1 --dry-run
+    python tools/publish-release.py 1.8.1 --notes-file notes.md --only github
+    python tools/publish-release.py 1.8.1 --tag-message "一句话摘要"
+    python tools/publish-release.py 1.8.1 --force          # 同名资产删掉重传 + 重建 tag
+    python tools/publish-release.py 1.6.0 --retitle "Vault 1.6.0"   # 只改标题，不动正文
+    python tools/publish-release.py 1.8.0 --delete                  # 删 release + tag
 
 约定（与仓库历史一致）：
   * 产物目录：仓库外的 ``../release/v<版本>/``，只取**顶层**文件，跳过 ``stage/``。
@@ -16,11 +18,18 @@
     所以先在本地建好附注 tag 再推上去，API 看到同名 tag 就直接复用。``--tag-message``
     给一句摘要（正式 tag 的说明就一句话，别把整篇发布说明塞进去）；``--force`` 会重建
     tag（挪到 HEAD / 修正 tagger 与说明）；``--skip-tag`` 则完全不碰 git。
-  * **发布正文只写三样**：本次要用户留意的注意事项（没有就整段不写）、要点、以及指向
-    ``CHANGELOG.md`` 的引导。**别重复 README 里已有的项目介绍 / 适用边界 / 许可**。
-    「更新类型」用 ``--kind`` 给（feature/ui/fix/perf/docs/refactor/breaking）。
-  * **下载区由脚本拼**（``release_body_for``）：按平台生成直链、默认折叠；正文里写的
-    GitHub 链接会自动改写成目标平台的域名，所以正文里只写 GitHub 那份就够。
+  * **标题 = 正文首行，且必须是 ``Vault X.Y.Z``**（后面不接任何说明）。首行写成
+    ``# Vault X.Y.Z`` 也行，脚本会把 ``#`` 去掉 —— 历史上 v1.7.0/v1.8.0 就是把 ``#``
+    连同说明一起带进了标题字段。
+  * **发布正文只写两样**：逐条要点 + 指向 ``CHANGELOG.md`` 的引导。要点**不要**再套一个
+    「要点」标题，直接列；**每条以 ``[类型]`` 开头**（``[bugfix]`` / ``[feature]`` /
+    ``[ui]`` / ``[perf]`` / ``[docs]`` / ``[breaking]`` …），别再另起一行写「更新类型」。
+    **别重复 README 里已有的项目介绍 / 适用边界 / 许可**。只有当用户升级时必须自己动手
+    （破坏性变更）才写一段「注意事项」，达不到就不写。
+  * **下载区由脚本拼**（``release_body_for``）：按平台生成直链、默认折叠、**放在正文最上**；
+    不再有「下载」标题。正文里写的 GitHub 链接会自动改写成目标平台的域名，
+    所以正文里只写 GitHub 那份就够。
+  * ``--retitle`` 只改标题（修正历史 release 的命名），``--delete`` 撤掉整条 release 与 tag。
   * 令牌：``%USERPROFILE%\\.playnite-vault\\github-token.txt`` / ``gitee-token.txt``。
     git push 走 SSH，但 Release / 资产上传只认 token。
   * Gitee 建 release 时带 ``attach_files`` 已失效（返回 201 但资产不挂），
@@ -257,6 +266,12 @@ def auto_changelog(version: str) -> str:
 
 
 def read_notes(args, version: str) -> tuple[str, str]:
+    """返回 (标题, 正文)。**首行是标题**，正文从第二行起 —— 标题不会再在正文里重复一遍。
+
+    标题会被去掉前导的 ``#``：写成 ``# Vault 1.8.1`` 是允许的，但贴进 release 的「标题」
+    字段时不能带 ``#``。历史上 v1.7.0（``# Vault 1.7.0``）与 v1.8.0（``# v1.8.0 —— …``）
+    就是没去掉才走样的。
+    """
     if args.notes_file:
         with open(args.notes_file, "r", encoding="utf-8") as fh:
             text = fh.read()
@@ -265,8 +280,10 @@ def read_notes(args, version: str) -> tuple[str, str]:
     else:
         text = auto_changelog(version)
     lines = text.splitlines()
-    title = lines[0].strip() if lines else f"Playnite Vault {version}"
-    return title, text
+    raw_title = lines[0].strip() if lines else ""
+    title = re.sub(r"^#+\s*", "", raw_title).strip() or f"Playnite Vault {version}"
+    body = "\n".join(lines[1:]).strip("\n")
+    return title, body
 
 
 # ---------------------------------------------------------------- GitHub
@@ -616,9 +633,6 @@ def ensure_annotated_tag(tag: str, version: str, only: str, force: bool,
 REPO_URLS = {"github": f"https://github.com/{OWNER}/{REPO}",
              "gitee": f"https://gitee.com/{OWNER}/{REPO}"}
 
-KIND_LABEL = {"feature": "新功能", "ui": "界面", "fix": "修 bug", "perf": "性能",
-              "docs": "文档", "refactor": "重构", "breaking": "需要用户动手"}
-
 # 资产名 → 「该下哪个」。这段**由脚本写**：手写必然写成另一个平台的链接。
 ASSET_HINT = (
     ("PlayniteVault-",
@@ -639,7 +653,7 @@ def asset_hint(name: str) -> str:
 
 
 def release_body_for(platform: str, version: str, body: str,
-                     assets: list[str], kind: str | None) -> str:
+                     assets: list[str]) -> str:
     """把作者写的正文改成**这个平台**的版本。
 
     有两件事必须由脚本做，不能靠手写：
@@ -648,9 +662,10 @@ def release_body_for(platform: str, version: str, body: str,
        在 Gitee 上点开就是另一个站点，得换成同路径的 Gitee 地址。
     2. **下载区**。资产名和下载直链都是现成的，手写迟早写成另一个平台的；
        而两边的直链格式其实一样（`<repo>/releases/download/<tag>/<文件名>`），
-       按平台拼就行。默认**折叠**（`<details>`），不占版面。
+       按平台拼就行。默认**折叠**（`<details>`），并且**放在正文最上面** ——
+       打开页面第一眼就要能看到「下哪个」，所以**不加「下载」标题**。
 
-    作者只需要写「注意事项 / 要点 / 引导」，说清「怎么用」的部分交给脚本。
+    作者只写逐条要点（每条以 `[类型]` 开头）与引导，说清「怎么用」的部分交给脚本。
     正文写法约定见 `docs/dev-notes.md` 第 6 节。
     """
     tag = f"v{version}"
@@ -660,21 +675,89 @@ def release_body_for(platform: str, version: str, body: str,
         if other != platform:
             out = out.replace(url, base)
 
-    if kind:
-        labels = [KIND_LABEL.get(k.strip(), k.strip())
-                  for k in kind.split(",") if k.strip()]
-        if labels:
-            out = out.rstrip() + "\n\n**更新类型**：" + " · ".join(labels) + "\n"
-
-    lines = ["## 下载", "", "<details>", "<summary>该下哪个？（点开）</summary>", ""]
+    lines = ["<details>", "<summary>该下哪个？（点开）</summary>", ""]
     for path in assets:
         name = os.path.basename(path)
         hint = asset_hint(name)
         link = f"{base}/releases/download/{tag}/{name}"
-        lines.append(f"- **[{name}]({link})** —— {hint}" if hint
-                     else f"- **[{name}]({link})**")
+        lines.append(f"- **[{name}]({link})**" + (f" —— {hint}" if hint else ""))
     lines += ["", "</details>"]
-    return out.rstrip() + "\n\n" + "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n\n" + out.lstrip("\n")
+
+
+# --------------------------------------------------- 改标题 / 撤版本
+
+def retitle_release(args, title: str, tag: str) -> int:
+    """只改 release 的标题，正文与资产一概不碰（用来统一历史 release 的命名）。"""
+    title = title.strip()
+    log(f"改标题：{tag} → {title!r}（不动正文、不动资产）")
+    if args.only in ("github", "both"):
+        tok = read_token("github", None)
+        rel = github_find_release(tok, tag)
+        if rel is None:
+            log(f"  ! GitHub 上没有 {tag}")
+        elif rel.get("name") == title:
+            log("  · GitHub 标题已是目标值")
+        else:
+            api("PATCH", f"{GITHUB_API}/repos/{OWNER}/{REPO}/releases/{rel['id']}",
+                token=tok, json_body={"name": title}, expect=(200,),
+                label="GitHub 改标题")
+            log(f"  · GitHub：{rel.get('name')!r} → {title!r}")
+    if args.only in ("gitee", "both"):
+        tok = read_token("gitee", None)
+        rel = gitee_find_release(tok, tag)
+        if rel is None:
+            log(f"  ! Gitee 上没有 {tag}")
+        elif rel.get("name") == title:
+            log("  · Gitee 标题已是目标值")
+        else:
+            # Gitee 的 release 更新接口**强制要求 body**（只传 name 会 400
+            # "body is missing"），所以把原正文原样带回去 —— 只改标题、不动内容。
+            api("PATCH", gitee_url(f"/releases/{rel['id']}", tok), token="",
+                json_body={"tag_name": tag, "name": title,
+                           "body": rel.get("body") or ""}, expect=(200,),
+                label="Gitee 改标题")
+            log(f"  · Gitee：{rel.get('name')!r} → {title!r}")
+    return 0
+
+
+def drop_release(args, tag: str) -> int:
+    """撤掉一整条 release 与 tag —— release 走 API，tag 走 ``git push --delete``。"""
+    log(f"删除 release 与 tag：{tag}")
+    remotes = {"github": ["github"], "gitee": ["gitee"],
+               "both": ["github", "gitee"]}[args.only]
+
+    if "github" in remotes:
+        tok = read_token("github", None)
+        rel = github_find_release(tok, tag)
+        if rel is None:
+            log("  · GitHub 上没有该 release")
+        else:
+            api("DELETE", f"{GITHUB_API}/repos/{OWNER}/{REPO}/releases/{rel['id']}",
+                token=tok, expect=(204,), label="GitHub 删 release")
+            log(f"  · GitHub release {tag} 已删（id={rel['id']}）")
+    if "gitee" in remotes:
+        tok = read_token("gitee", None)
+        rel = gitee_find_release(tok, tag)
+        if rel is None:
+            log("  · Gitee 上没有该 release")
+        else:
+            api("DELETE", gitee_url(f"/releases/{rel['id']}", tok), token="",
+                expect=(200, 204), label="Gitee 删 release")
+            log(f"  · Gitee release {tag} 已删（id={rel['id']}）")
+
+    if tag_kind(tag) is None:
+        log("  · 本地没有这个 tag")
+    else:
+        rc, out = git_out("tag", "-d", tag)
+        log(f"  · 本地 tag {'已删' if rc == 0 else '删除失败：' + out}")
+
+    for remote in remotes:
+        rc, out = git_out("push", remote, "--delete", f"refs/tags/{tag}")
+        log(f"  · 远端 {remote} tag：{'已删' if rc == 0 else out + '（可能本来就没有）'}")
+        _, ls = git_out("ls-remote", "--tags", remote, f"refs/tags/{tag}")
+        log(f"  · 回验 {remote}：{'仍在（要手动处理）' if ls.strip() else '已无此 tag'}")
+    return 0
 
 
 # ---------------------------------------------------------------- main
@@ -695,14 +778,25 @@ def main(argv=None) -> int:
                     help="不碰 git tag（默认会先建/校正附注 tag 并推到发布平台）")
     ap.add_argument("--tag-message", default=None,
                     help="附注 tag 的说明（一句话摘要）。不填就用「Playnite Vault <版本>」")
-    ap.add_argument("--kind", default=None,
-                    help="更新类型，逗号分隔：feature,ui,fix,perf,docs,refactor,breaking")
+    ap.add_argument("--retitle", default=None,
+                    help="只把两个平台的 release 标题改成这个值（不动正文 / 资产）")
+    ap.add_argument("--delete", action="store_true",
+                    help="删掉两个平台的 release 以及 tag（本地 + 远端），撤掉一个不该发的版本")
     ap.add_argument("--verify-download", action="store_true",
                     help="额外把资产从两个平台真下回来比 sha256（Gitee 不回传大小，只有这个算数）")
     args = ap.parse_args(argv)
 
     version = args.version.lstrip("v")
     tag = f"v{version}"
+
+    if args.retitle is not None or args.delete:
+        for key in PROXY_ENV_KEYS:
+            if os.environ.pop(key, None):
+                log(f"（已清除环境变量 {key}，改用内置代理兜底）")
+        if args.delete:
+            return drop_release(args, tag)
+        return retitle_release(args, args.retitle, tag)
+
     patterns = [p.strip() for p in args.patterns.split(",") if p.strip()]
 
     assets = collect_assets(version, patterns)
@@ -737,7 +831,7 @@ def main(argv=None) -> int:
         log("\n== GitHub ==")
         gh_token = read_token("github", None)
         github_publish(gh_token, tag, title,
-                       release_body_for("github", version, body, assets, args.kind),
+                       release_body_for("github", version, body, assets),
                        assets, args.draft, args.force)
         if not args.skip_verify:
             problems += verify_github(gh_token, tag, assets)
@@ -746,7 +840,7 @@ def main(argv=None) -> int:
         log("\n== Gitee ==")
         gi_token = read_token("gitee", None)
         gitee_publish(gi_token, tag, title,
-                      release_body_for("gitee", version, body, assets, args.kind),
+                      release_body_for("gitee", version, body, assets),
                       assets, args.draft, args.force)
         if not args.skip_verify:
             problems += verify_gitee(gi_token, tag, assets)

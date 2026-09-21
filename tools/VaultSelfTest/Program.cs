@@ -1870,42 +1870,182 @@ namespace VaultSelfTest
                 }
             }
 
-            // --- 6. 图表遇到退化输入不能抛 ---
-            Group("v1.8 界面 · 图表退化输入");
+            // --- 6. 图表部件：每个公开工厂都要真的构造一遍 ---
+            //
+            // 1.8.0 崩就崩在这一组漏了 StatTile：它在运行时才被调用（概览页一建就喊它），
+            // 而自检只碰了 BarList / StackedBar / Donut / Legend，于是
+            // 「同一个元素被挂了两个父」这种一眼能看出的错误直接溜到用户机器上 ——
+            // 结局是点一下侧边栏就弹扩展崩溃窗口。所以这里除了退化输入，
+            // 还要**按反射核对覆盖率**：新加一个公开工厂却忘了构造它，这条断言会失败。
+            Group("v1.8 界面 · 图表部件");
+
+            var called = new HashSet<string>();
+            var tileHasBar = false;
+            var tilePlainOk = false;
 
             var chartError = RunSta(() =>
             {
-                var p = VaultPalette.Resolve(VaultUiThemeMode.Dark);
+                foreach (var isDark in new[] { false, true })
+                {
+                    var p = VaultPalette.Resolve(isDark ? VaultUiThemeMode.Dark : VaultUiThemeMode.Light);
 
-                // 空列表
-                VaultCharts.BarList(p, new List<BarItem>(), "空的");
-                VaultCharts.BarList(p, null, "空的");
-                VaultCharts.Legend(p, new List<BarItem>());
-                VaultCharts.Legend(p, null);
+                    // 容器三件
+                    var card = VaultCharts.Card(p, new System.Windows.Controls.TextBlock());
+                    called.Add("Card");
+                    if (card.Child == null)
+                    {
+                        throw new InvalidOperationException("Card 没把内容挂上");
+                    }
+
+                    if (VaultCharts.SectionTitle(p, "标题") == null)
+                    {
+                        throw new InvalidOperationException("SectionTitle 返回 null");
+                    }
+                    called.Add("SectionTitle");
+
+                    if (VaultCharts.Muted(p, "说明") == null)
+                    {
+                        throw new InvalidOperationException("Muted 返回 null");
+                    }
+                    called.Add("Muted");
+
+                    // 指标块：带强调色走「色条 + 文字」两格的 Grid —— 1.8.0 崩的就是这一支
+                    var tile = VaultCharts.StatTile(p, "指标", "12", p.Accent);
+                    called.Add("StatTile");
+
+                    var tileGrid = tile.Child as System.Windows.Controls.Grid;
+                    if (tileGrid == null || tileGrid.Children.Count != 2)
+                    {
+                        throw new InvalidOperationException(
+                            "带强调色的指标块应当是「色条 + 文字」两格的 Grid");
+                    }
+                    if (tileGrid.ColumnDefinitions.Count != 2
+                        || tileGrid.ColumnDefinitions[0].Width.Value != 4)
+                    {
+                        throw new InvalidOperationException("强调色条应当是 Grid 的第一列、宽 4px");
+                    }
+                    tileHasBar = true;
+
+                    var plain = VaultCharts.StatTile(p, "指标", "12", null);
+                    if (plain.Child == null)
+                    {
+                        throw new InvalidOperationException("不带强调色的指标块没有内容");
+                    }
+                    tilePlainOk = true;
+
+                    // 条形：空列表 / null / 正常
+                    VaultCharts.BarList(p, new List<BarItem> { new BarItem("a", 1, "1") }, "空的");
+                    VaultCharts.BarList(p, new List<BarItem>(), "空的");
+                    VaultCharts.BarList(p, null, "空的");
+                    called.Add("BarList");
+
+                    // 堆叠条：有值 / 全 0 / null
+                    VaultCharts.StackedBar(p, new List<BarItem> { new BarItem("a", 1, "1") }, 14);
+                    VaultCharts.StackedBar(p, new List<BarItem> { new BarItem("a", 0, "0") }, 14);
+                    VaultCharts.StackedBar(p, null, 14);
+                    called.Add("StackedBar");
+
+                    VaultCharts.Legend(p, new List<BarItem> { new BarItem("a", 1, "1") });
+                    VaultCharts.Legend(p, null);
+                    called.Add("Legend");
+
+                    VaultCharts.Donut(p, new List<BarItem> { new BarItem("a", 1, "1") }, 120, "1", "合计");
+                    VaultCharts.Donut(p, null, 120, "0 B", "合计");
+                    called.Add("Donut");
+                }
+
+                // 退化输入（原来那组，一条都不能删）
+                var d = VaultPalette.Resolve(VaultUiThemeMode.Dark);
 
                 // 全 0：环形和堆叠条都要走「没有数据」那条分支，而不是除零
                 var zeros = new List<BarItem> { new BarItem("a", 0, "0"), new BarItem("b", 0, "0") };
-                VaultCharts.StackedBar(p, zeros, 14);
-                VaultCharts.Donut(p, zeros, 120, "0 B", "合计");
-                VaultCharts.BarList(p, zeros, "空的");
+                VaultCharts.StackedBar(d, zeros, 14);
+                VaultCharts.Donut(d, zeros, 120, "0 B", "合计");
+                VaultCharts.BarList(d, zeros, "空的");
 
                 // 单段占满 360°：ArcSegment 画不出整圆，必须走 Ellipse 那条特例
-                VaultCharts.Donut(p, new List<BarItem> { new BarItem("only", 10, "10") }, 120, "10", "只有一个");
+                VaultCharts.Donut(d, new List<BarItem> { new BarItem("only", 10, "10") }, 120, "10", "只有一个");
 
                 // 极小值：占比接近 0 但仍要留一丝可见宽度
-                VaultCharts.BarList(p, new List<BarItem>
+                VaultCharts.BarList(d, new List<BarItem>
                 {
                     new BarItem("巨大", 1e12, "1 TB"),
                     new BarItem("极小", 1, "1 B")
                 }, "空的");
 
                 // 负数（理论上传不进来，但预算算错时会出现）
-                VaultCharts.StackedBar(p, new List<BarItem> { new BarItem("负", -5, "-5") }, 14);
-                VaultCharts.BarList(p, new List<BarItem> { new BarItem("负", -5, "-5") }, "空的");
+                VaultCharts.StackedBar(d, new List<BarItem> { new BarItem("负", -5, "-5") }, 14);
+                VaultCharts.BarList(d, new List<BarItem> { new BarItem("负", -5, "-5") }, "空的");
             });
 
-            Check(chartError == null, "空列表 / 全 0 / 满圈 / 极小值 / 负数，图表都不抛异常",
+            Check(chartError == null,
+                "图表部件都能构造出来，退化输入（空表 / 全 0 / 满圈 / 极小值 / 负数）也不抛",
                 chartError == null ? null : chartError.Message);
+            Check(tileHasBar, "指标块确实带上了左侧强调色条");
+            Check(tilePlainOk, "不传强调色的指标块也能构造");
+
+            // 覆盖率断言：公开工厂漏测 = 1.8.0 那个崩溃的形状，必须挡在自检里
+            var factories = typeof(VaultCharts)
+                .GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly)
+                .Where(m => !m.IsSpecialName)
+                .Select(m => m.Name)
+                .Distinct()
+                .OrderBy(n => n)
+                .ToList();
+            var untested = factories.Where(n => !called.Contains(n)).ToList();
+            Check(untested.Count == 0,
+                "VaultCharts 的每个公开工厂都在本组自检里真的构造过（共 " + factories.Count + " 个）",
+                untested.Count == 0 ? null : "没被构造过：" + string.Join("、", untested));
+
+            // --- 7. 整页真的构造一遍 ---
+            //
+            // 为什么非要造整页：1.8.0 崩在「概览页里第一个指标块」上，而单测部件时
+            // StatTile 是被直接调用的、元素各挂各的，看不出问题 —— 只有从
+            // VaultPanelView 的构造函数一路走下来，才会踩到「同一个元素挂了两个父」。
+            // 这一页是用户点一下侧边栏就必然经过的路径，必须由自检造一遍。
+            Group("v1.8 界面 · 侧边栏整页构造");
+
+            var panelError = RunSta(() =>
+            {
+                var dataPath = Path.Combine(Path.GetTempPath(),
+                    "vault-panel-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+                var themesRoot = Path.Combine(dataPath, "Themes");
+                Directory.CreateDirectory(themesRoot);
+
+                // VaultService 的构造只读文件（LoadSettings 是纯文件操作），不碰 api —— 所以能塞 null。
+                // 插件对象用「未初始化实例」：构造这一页不会调插件的任何方法，
+                // 按钮回调只有真去点才会跑（这里不点）。
+                var service = new VaultService(null, dataPath);
+                var vm = new VaultSettingsViewModel(service);
+                var plugin = (PlayniteVault.VaultPlugin)
+                    System.Runtime.Serialization.FormatterServices
+                        .GetUninitializedObject(typeof(PlayniteVault.VaultPlugin));
+
+                var panel = new VaultPanelView(plugin, service, vm, themesRoot);
+                if (panel.Content == null)
+                {
+                    throw new InvalidOperationException("侧边栏页构造出来没有内容");
+                }
+
+                // 默认停在概览页（构造函数里就会走一次 RenderOverview）。
+                // 另外两页也建一遍：它们都不联网，只是把控件拼出来。
+                // **仓库与归档页故意不建** —— 它会去读仓库索引，那要联网。
+                var show = typeof(VaultPanelView).GetMethod("ShowSection",
+                    BindingFlags.NonPublic | BindingFlags.Instance);
+                if (show == null)
+                {
+                    throw new InvalidOperationException("ShowSection 不在了（整页构造这条路要跟着改）");
+                }
+
+                foreach (var key in new[] { "overview", "themes", "settings" })
+                {
+                    show.Invoke(panel, new object[] { key });
+                }
+            });
+
+            Check(panelError == null,
+                "侧边栏页能在 STA 线程上整页构造（概览含指标块与三张图；主题 / 设置页也建得出来）",
+                panelError == null ? null : panelError.Message);
 
             RunUiV180RepoTests();
         }

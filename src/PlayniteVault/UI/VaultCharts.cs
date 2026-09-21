@@ -109,23 +109,27 @@ namespace PlayniteVault.UI
                 Margin = new Thickness(0, 3, 0, 0)
             });
 
-            var body = new Border
-            {
-                Background = p.Surface,
-                BorderBrush = p.Border,
-                BorderThickness = new Thickness(2),
-                Padding = new Thickness(13, 10, 13, 10),
-                Margin = new Thickness(0, 0, 10, 10),
-                MinWidth = 132,
-                Child = stack
-            };
-
+            // 没强调色：光秃秃一块，直接包上就是
             if (accent == null)
             {
-                return body;
+                return new Border
+                {
+                    Background = p.Surface,
+                    BorderBrush = p.Border,
+                    BorderThickness = new Thickness(2),
+                    Padding = new Thickness(13, 10, 13, 10),
+                    Margin = new Thickness(0, 0, 10, 10),
+                    MinWidth = 132,
+                    Child = stack
+                };
             }
 
-            // 左侧色条：用 Grid 而不是往 Border 上再套一层，省一层视觉树
+            // 有强调色：左边加一条 4px 竖线，省一层视觉树用 Grid 拼。
+            //
+            // ⚠️ 顺序不能颠倒：**先把 stack 挂进 grid，最后才把 grid 交给 Border**。
+            // v1.8.0 就是栽在这里 —— 当时先写了 body.Child = stack，再往 grid 里加同一个
+            // stack，于是 WPF 抛「指定的元素已经是另一个元素的逻辑子元素」。
+            // 那是侧边栏页构造路径上的第一个控件，所以整页一点就崩。
             var grid = new Grid();
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(4) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -137,9 +141,16 @@ namespace PlayniteVault.UI
             Grid.SetColumn(stack, 1);
             grid.Children.Add(stack);
 
-            body.Padding = new Thickness(0, 10, 13, 10);
-            body.Child = grid;
-            return body;
+            return new Border
+            {
+                Background = p.Surface,
+                BorderBrush = p.Border,
+                BorderThickness = new Thickness(2),
+                Padding = new Thickness(0, 10, 13, 10),
+                Margin = new Thickness(0, 0, 10, 10),
+                MinWidth = 132,
+                Child = grid
+            };
         }
 
         // ================================================================ 条形

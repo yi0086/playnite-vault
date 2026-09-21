@@ -20,7 +20,7 @@ upload it, and install it back on any machine with metadata included.
 | **主题同步** | 本地 `Themes` 目录与 NAS 互传：上传 / 下载 / 双向，带预演与冲突留档 |
 | **自更新** | 打开 Playnite 自动检查插件更新，国内 / 国外自动换源，慢网络有兜底 |
 | **侧边栏控制台** | 左侧边栏一格管完：概览统计 / 主题同步 / 仓库与归档 / 设置。明暗三档（跟随 Playnite / 常亮 / 常暗），右上角一个小圆点报连通状态 |
-| **仓库与归档**（v1.8.0） | 本机库里的游戏铺成卡片墙，每个游戏标出「传过没有」，未传的可直接归档；判定按 Playnite 游戏 ID → 库内 ID → 安装目录名三级 |
+| **仓库与归档**（v1.8.1） | 本机库里的游戏铺成卡片墙，每个游戏标出「传过没有」，未传的可直接归档；判定按 Playnite 游戏 ID → 库内 ID → 安装目录名三级 |
 | **删归档** | 卡片上直接删（不用再单开窗口），删前要输管理口令；仓库里有、本地库里已经没有的条目也列在同一页 |
 
 配套还有一个**免 Python 环境的单文件解包器**（图形界面 + 命令行，也能把插件装进 Playnite）。
@@ -59,7 +59,7 @@ Vault 的做法是把 NAS 当成一个**自建的软件仓库**：
 | `tools/`（Python 部分） | 独立解包器：tkinter 图形界面 + 命令行，可打包成免 Python 环境的单文件 exe；解完可选登记回 Playnite；**还能把插件本身注入进 Playnite 并优雅重启它** | Python 3（标准库 + tkinter） |
 | `tools/webdav_mock.py` | 极简本地 WebDAV 服务，用来离线跑端到端验证 | Python 3 |
 | `tools/e2e-v3-test.py` | v3 端到端验证：造测试目录 → 打包上传 → 查仓库结构 → 解包还原 → 逐字节比对 → 中断续传 | Python 3 |
-| `tools/VaultSelfTest/` | **v1.7.0 自检**：本地假 GitHub / 假 Gitee，把自动更新与自动刷新整条链路真跑一遍，外加改名迁移、主题同步、云存档引擎与嗅探（**239 项断言**） | C# / .NET Framework 4.6.2 |
+| `tools/VaultSelfTest/` | **插件侧自检**：本地假 GitHub / 假 Gitee，把自动更新与自动刷新整条链路真跑一遍，外加改名迁移、主题同步、云存档引擎与嗅探，以及 v1.8 的界面部件 / 整页构造 / 卡片对账 / 删除入口唯一（**303 项断言**） | C# / .NET Framework 4.6.2 |
 | `tools/python-selftest/` | **Python 侧自检**：注入插件 / 真实 WM_CLOSE 优雅关闭 / GUI 真建窗口（**109 项断言**），`python tools/python-selftest/run_all.py` 一把跑完（设 `VAULT_TK_PYTHON` 指向带 tkinter 的解释器，GUI 与「真实关闭」两段才会跑） | Python 3 |
 | `tools/speedtest.py` | WebDAV 吞吐排查：把「链路 / 服务端 / 客户端」三层分开量 | Python 3 |
 
