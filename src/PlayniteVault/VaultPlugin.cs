@@ -1268,6 +1268,326 @@ namespace PlayniteVault
             game.GameActions = new System.Collections.ObjectModel.ObservableCollection<GameAction> { play };
         }
 
+        /// <summary>
+        /// 探测仓库连通性，喂给侧边栏右上角那个小圆点。
+        ///
+        /// <para>和 <see cref="TestConnection"/> 的区别：那个是弹窗给人看的，这个是**静默**跑的，
+        /// 所以一不能弹东西，二要用比常规更短的超时 —— 点一次要等 15 秒才变色，
+        /// 用户只会以为它坏了。这里把建连超时压到 8 秒以内。</para>
+        ///
+        /// <para>失败时**必须分档**：超时（黄）和拒绝（红）对用户意味着完全不同的下一步动作。
+        /// 分档规则见 <see cref="ClassifyHealthFailure"/>。</para>
+        /// </summary>
+        public RepositoryHealth CheckRepositoryHealth()
+        {
+            var settings = service.Settings;
+            var url = settings.WebDavUrl;
+
+            if (!settings.IsConfigured)
+            {
+                return RepositoryHealth.NotConfigured(url);
+            }
+
+            var health = new RepositoryHealth { Url = url };
+
+            try
+            {
+                var client = service.CreateClient(Math.Min(settings.TimeoutSeconds, 8));
+                var count = client.TestConnection();
+                var hasIndex = client.Exists("index.json");
+
+                health.State = VaultHealthState.Ok;
+                health.Summary = "已连接";
+                health.Detail = "仓库根目录可见 " + count + " 个条目；index.json "
+                                + (hasIndex ? "存在。" : "还不存在（第一次归档时会自动创建）。");
+            }
+            catch (Exception ex)
+            {
+                health.State = ClassifyHealthFailure(ex);
+                health.Summary = health.State == VaultHealthState.Timeout ? "连接超时" : "连接失败";
+                health.Detail = WebDavDiagnostics.Describe(ex, url, settings.Username);
+                VaultLog.Warn("仓库探测：" + health.Summary + " —— " + ex.Message);
+            }
+
+            return health;
+        }
+
+        /// <summary>
+        /// 把一个网络异常判成「超时（可能只是暂时不通）」还是「失败（配置/凭据问题）」。
+        ///
+        /// 判据分三层，顺序不能颠倒：
+        /// <list type="number">
+        /// <item><b>拿到了 HTTP 响应</b> → 服务端活着并且明确答复了，所以是「失败」
+        /// （401 口令错、403 没权限、404 地址错、5xx 服务端自己出错）——
+        /// 这一类等多久都不会自己好。</item>
+        /// <item><b>连 TCP 都没连上</b>（超时 / 连接被拒 / 半路断开）→ 「超时」。
+        /// NAS 关机、网线拔了、服务没启动都落在这一档，用户重试一下往往就好了。</item>
+        /// <item><b>域名解析失败 / 证书不受信</b> → 「失败」。这两个是配置本身写错了，
+        /// 不是「暂时不通」，归到黄色会让人一直干等。</item>
+        /// </list>
+        /// </summary>
+        private static VaultHealthState ClassifyHealthFailure(Exception ex)
+        {
+            var inner = ex;
+            while (inner is AggregateException && inner.InnerException != null)
+            {
+                inner = inner.InnerException;
+            }
+
+            if (inner is TimeoutException || inner is OperationCanceledException)
+            {
+                return VaultHealthState.Timeout;
+            }
+
+            var web = inner as System.Net.WebException;
+            if (web == null)
+            {
+                return VaultHealthState.Failed;
+            }
+
+            // 服务端给了回应：说明链路是通的，问题在「它不接受你」
+            if (web.Response is System.Net.HttpWebResponse)
+            {
+                return VaultHealthState.Failed;
+            }
+
+            switch (web.Status)
+            {
+                case System.Net.WebExceptionStatus.Timeout:
+                case System.Net.WebExceptionStatus.ConnectFailure:
+                case System.Net.WebExceptionStatus.ConnectionClosed:
+                case System.Net.WebExceptionStatus.ReceiveFailure:
+                case System.Net.WebExceptionStatus.SendFailure:
+                case System.Net.WebExceptionStatus.PipelineFailure:
+                    return VaultHealthState.Timeout;
+
+                default:
+                    return VaultHealthState.Failed;
+            }
+        }
+
+        /// <summary>
+        /// 「打开日志文件」的公开入口。设置页要用 —— 原来那个按钮挂在侧边栏左栏底部，
+        /// v1.8 起收纳进设置页（见 docs/dev-notes.md §6.3）。
+        /// </summary>
+        public void OpenLogFile()
+        {
+            VaultLog.Info("用户打开了日志");
+            OpenPath(VaultLog.LogPath);
+        }
+
+        // ---------- 仓库应用的删除（唯一闸门） ----------
+
+        /// <summary>
+        /// **删掉仓库里一个应用 —— 全工程唯一的删除入口。**
+        ///
+        /// <para>v1.8 起仓库管理的删除从「独占窗口」改成「侧边栏里的一行」，入口从一处变成两处
+        /// （侧边栏列表、游戏右键菜单打开的仓库管理窗口）。入口可以多，但**口令校验只能有一份**，
+        /// 否则迟早有一天两个入口的判据会漂移，而这里删掉的东西不可逆。</para>
+        ///
+        /// <para>所以把「验口令 + 删」钉在同一个方法里，调用方拿不到「不验就删」的机会 ——
+        /// 自检里有一条断言直接查 `VaultService.RemoveApp` 的调用方只有本方法一处
+        /// （见 VaultSelfTest 的调用点断言，带正对照）。</para>
+        /// </summary>
+        /// <returns>
+        /// 三态结果：成功 / 口令错 / 没设过口令 / 网络出错。
+        /// 不返回 bool 是因为这几种情况对用户意味着完全不同的下一步动作。
+        /// </returns>
+        public RepositoryDeleteResult DeleteRepositoryApp(string appId, string password)
+        {
+            if (string.IsNullOrWhiteSpace(appId))
+            {
+                return RepositoryDeleteResult.Fail("没给出要删的应用 Id。");
+            }
+
+            if (!service.Settings.IsConfigured)
+            {
+                return RepositoryDeleteResult.Fail("还没有配置 WebDAV 地址。");
+            }
+
+            bool isSet;
+            bool ok;
+            try
+            {
+                ok = service.VerifyAdminPassword(password, out isSet);
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Error("删除仓库应用：校验口令失败", ex);
+                return RepositoryDeleteResult.Fail("校验口令时连不上仓库：" + ex.Message);
+            }
+
+            if (!isSet)
+            {
+                return new RepositoryDeleteResult { PasswordNotSet = true };
+            }
+
+            if (!ok)
+            {
+                VaultLog.Warn("删除仓库应用：口令不正确（" + appId + "）");
+                return new RepositoryDeleteResult { PasswordWrong = true };
+            }
+
+            try
+            {
+                var removed = service.RemoveApp(appId);
+                VaultLog.Info(string.Format("已从仓库删除 {0}，清理远端文件 {1} 个。", appId, removed));
+                return new RepositoryDeleteResult { Ok = true, RemovedFiles = removed };
+            }
+            catch (Exception ex)
+            {
+                VaultLog.Error("删除仓库应用失败：" + appId, ex);
+                return RepositoryDeleteResult.Fail("删除失败：" + ex.Message);
+            }
+        }
+
+        // ---------- 本地应用 ↔ 仓库条目的对账（v1.8 卡片墙） ----------
+
+        /// <summary>
+        /// 把「本地 Playnite 库里的应用」和「仓库索引里的条目」对起来，给卡片墙用。
+        ///
+        /// <para><b>为什么按 GameId 而不是按仓库条目 Id 对</b>：仓库的 <c>AppEntry.Id</c> 是从
+        /// 安装目录名压出来的 slug，只保证「同一台机器同一次归档稳定」。目录改名、
+        /// 手工改过显示名、或者中文名走哈希兜底，都会让它和当前推导结果对不上 ——
+        /// 于是明明传过的东西会显示成「没上传」。`Game.Id` 是 Playnite 给的不变量，才是钥匙。</para>
+        ///
+        /// <para><b>老条目怎么办</b>：v1.8 之前归档的条目没有 <c>PlayniteGameId</c>。
+        /// 这时退回按 slug 比对（和归档时用的是同一个 <see cref="VaultService.MakeAppId"/>），
+        /// 让升级上来的人不至于看到满屏「未上传」。命中时会把依据写在
+        /// <see cref="LocalAppCard.MatchNote"/> 里，用户能看出是「靠 ID 认的」还是「靠猜的」。</para>
+        /// </summary>
+        /// <param name="index">仓库索引；传 null 就只列本地应用、全部标成未上传。</param>
+        public List<LocalAppCard> BuildLocalAppCards(RepositoryIndex index)
+        {
+            var cards = new List<LocalAppCard>();
+
+            if (PlayniteApi == null || PlayniteApi.Database == null)
+            {
+                return cards;
+            }
+
+            // 索引建桶：GUID 一个、库内 id 一个、slug 一个，对账时 O(1) 命中。
+            // 命中顺序（GameId → LibraryId → slug）在 LocalAppMatcher 里，
+            // 那边是纯函数，自检能逐个键断言。
+            var apps = index == null ? null : index.Apps;
+            var byGameId = LocalAppMatcher.BucketByGameId(apps);
+            var byLibraryId = LocalAppMatcher.BucketByLibraryId(apps);
+            var bySlug = LocalAppMatcher.BucketBySlug(apps);
+
+            foreach (var game in PlayniteApi.Database.Games)
+            {
+                if (game == null)
+                {
+                    continue;
+                }
+
+                var card = new LocalAppCard
+                {
+                    GameId = game.Id.ToString(),
+                    LibraryId = game.GameId,
+                    Name = string.IsNullOrWhiteSpace(game.Name) ? "(未命名)" : game.Name,
+                    InstallDir = game.InstallDirectory,
+                    IsInstalled = !string.IsNullOrWhiteSpace(game.InstallDirectory)
+                                  && Directory.Exists(game.InstallDirectory),
+                    CoverPath = ResolveImagePath(game.CoverImage)
+                };
+
+                if (index == null)
+                {
+                    card.MatchNote = LocalAppMatcher.NoteIndexUnavailable;
+                    cards.Add(card);
+                    continue;
+                }
+
+                // 命中顺序固定在 LocalAppMatcher 里；这里只负责把三个键备齐
+                string note;
+                var hit = LocalAppMatcher.Match(
+                    card.GameId,
+                    card.LibraryId,
+                    VaultService.MakeAppId(InstallDirNameOf(game), game.Name),
+                    byGameId,
+                    byLibraryId,
+                    bySlug,
+                    out note);
+
+                card.MatchNote = note;
+
+                if (hit != null)
+                {
+                    card.InRepository = true;
+                    card.RepoAppId = hit.Id;
+                    card.RepoBytes = hit.TotalBytes;
+                }
+
+                cards.Add(card);
+            }
+
+            // 已上传的排前面（用户最关心的就是「还有哪些没传」），
+            // 同状态里按名字排，避免每次刷新顺序乱跳
+            cards.Sort((a, b) =>
+            {
+                if (a.InRepository != b.InRepository)
+                {
+                    return a.InRepository ? 1 : -1;
+                }
+
+                return string.Compare(a.Name, b.Name, StringComparison.CurrentCulture);
+            });
+
+            return cards;
+        }
+
+        /// <summary>
+        /// 仓库里存在、本地 Playnite 库里已经没有对应游戏的条目。
+        ///
+        /// <para>卡片墙只能表现「库里有、仓库里有没有」；反过来那一半（仓库里有、库里没有）
+        /// 如果不管，那些条目就再也删不掉了 —— 而删除本来就是要收到这一页里的。</para>
+        /// </summary>
+        public List<AppEntry> FindOrphanRepoApps(RepositoryIndex index, List<LocalAppCard> cards)
+        {
+            return LocalAppMatcher.Orphans(index == null ? null : index.Apps, cards);
+        }
+
+        /// <summary>
+        /// 从侧边栏卡片墙归档单个游戏。就是右键菜单那条路的薄包装 ——
+        /// 确认弹窗、进度条、取消、日志全都在 <see cref="ArchiveGames"/> 里，这里不重复实现。
+        ///
+        /// <para>为什么按 Id 找而不是直接收一个 <c>Game</c> 对象：卡片墙是异步渲染的，
+        /// 拿到的 <c>Game</c> 引用可能在用户点按钮之前就已经从库里删掉了 ——
+        /// 那种情况下应该「找不到就明说」，而不是对着一个失效对象做归档。</para>
+        /// </summary>
+        /// <returns>找到了并走完归档流程返回 true；游戏已不在库里返回 false。</returns>
+        public bool ArchiveGameById(string gameId)
+        {
+            if (string.IsNullOrWhiteSpace(gameId) || PlayniteApi == null || PlayniteApi.Database == null)
+            {
+                return false;
+            }
+
+            Game target = null;
+            foreach (var game in PlayniteApi.Database.Games)
+            {
+                if (game != null && string.Equals(game.Id.ToString(), gameId,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    target = game;
+                    break;
+                }
+            }
+
+            if (target == null)
+            {
+                VaultLog.Warn("卡片墙归档：游戏已不在库里（" + gameId + "）");
+                PlayniteApi.Dialogs.ShowMessage(
+                    "这个游戏已经不在 Playnite 库里了（可能刚被删掉）。\n刷新一下列表再试。",
+                    "Playnite Vault");
+                return false;
+            }
+
+            ArchiveGames(new List<Game> { target });
+            return true;
+        }
+
         private void TestConnection()
         {
             if (!service.Settings.IsConfigured)
@@ -1374,7 +1694,9 @@ namespace PlayniteVault
                             metadata,
                             options,
                             sink.Apply,
-                            progress.CancelToken);
+                            progress.CancelToken,
+                            game.Id.ToString(),
+                            game.GameId);
 
                         VaultLog.Info(string.Format("归档完成：{0}，{1}", game.Name, result.Describe()));
                     }
@@ -2107,25 +2429,39 @@ namespace PlayniteVault
         }
 
         /// <summary>
-        /// 侧边栏图标画成矢量，不依赖系统字体里有没有那个字形
-        /// （Segoe MDL2 的码位记错就会显示成一个方框）。
+        /// 侧边栏图标：**实心扁平**的矢量路径，跟 Playnite 自带那几个图标一个路数
+        /// （内置那批也是实心单色字形，所以描边式的线条图标挂在一起会显得「细、轻、不在一个图层上」）。
         ///
-        /// 返回 object 是因为 <c>SidebarItem.Icon</c> 就是 object：
-        /// Playnite 那边走 <c>SdkHelpers.ResolveUiItemIcon</c>，
-        /// 只有字符串才被当成主题资源键去查，其余 UIElement 原样透传渲染。
+        /// 形状是一个「带卡扣的收纳箱」：箱盖一条、箱体一块、正中挖一个卡扣孔。
+        /// 孔是靠 <c>PathGeometry</c> 默认的 **EvenOdd** 填充规则挖出来的 ——
+        /// 同一个路径里再画一圈，重叠区域就翻成透明，不需要真的做布尔运算。
+        ///
+        /// 同时给 <c>Fill</c> 和 <c>Stroke</c>：Fill 是主体，Stroke 取同一个画刷、
+        /// 只做 0.6px 的「加粗」——矢量在 16~22px 这种小尺寸下，纯 Fill 的边缘会有锯齿，
+        /// 补一层同色描边正好把边缘糊平。两处都用主题画刷，浅色主题里不会变成白块。
+        ///
+        /// 返回 object 是因为 <c>SidebarItem.Icon</c> 就是 object：Playnite 原样透传 UIElement。
         /// </summary>
         private static object BuildSidebarIcon()
         {
+            var brush = VaultPanelView.ThemedBrush("TextBrush", System.Windows.Media.Brushes.Gray);
+
+            // 24×24 画布：箱盖 4.5~8、箱体 9~20、卡扣孔 12~14.5
+            var geometry = System.Windows.Media.Geometry.Parse(
+                "M 2.5,4.5 H 21.5 V 8 H 2.5 Z "
+                + "M 3.5,9 H 20.5 V 20 H 3.5 Z "
+                + "M 9.5,12 H 14.5 V 14.5 H 9.5 Z");
+
             return new System.Windows.Shapes.Path
             {
-                Data = System.Windows.Media.Geometry.Parse(
-                    "M 2.5,4.5 L 11.5,4.5 L 11.5,15 L 2.5,15 Z "
-                    + "M 2.5,8.2 L 11.5,8.2 M 5.4,4.5 L 5.4,1.6 L 8.6,1.6 L 8.6,4.5"),
-                StrokeThickness = 1.3,
+                Data = geometry,
+                Fill = brush,
+                Stroke = brush,
+                StrokeThickness = 0.6,
+                StrokeLineJoin = System.Windows.Media.PenLineJoin.Round,
                 Stretch = System.Windows.Media.Stretch.Uniform,
-                Width = 16,
-                Height = 16,
-                Stroke = VaultPanelView.ThemedBrush("TextBrush", System.Windows.Media.Brushes.Gray)
+                Width = 22,
+                Height = 22
             };
         }
 

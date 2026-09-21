@@ -8,6 +8,7 @@ using System.Text;
 using System.Threading;
 using PlayniteVault.Models;
 using PlayniteVault.Services;
+using PlayniteVault.UI;
 
 namespace VaultSelfTest
 {
@@ -92,6 +93,7 @@ namespace VaultSelfTest
                 RunThemeSyncTests(root);
                 RunSaveTests(root);
                 RunSidebarPanelTests();
+                RunUiV180Tests();
             }
             catch (Exception ex)
             {
@@ -1526,7 +1528,7 @@ namespace VaultSelfTest
             });
             Check(ctor != null, "VaultPanelView 的构造签名 (plugin, service, settingsVm, themesRoot) 没变");
 
-            // --- 4. 图标：能造出来、路径能解析、笔画不是空的 ---
+            // --- 4. 图标：能造出来、路径能解析、而且必须是**实心**的 ---
             // 注意：Path 是 FrameworkElement，只能在 STA 线程上 new ——
             // 自检主线程是 MTA，直接 Invoke 会抛「调用线程必须为 STA」。
             // 这本身也是一条有用的信息：Playnite 是在 UI 线程上调 GetSidebarItems 的。
@@ -1540,6 +1542,8 @@ namespace VaultSelfTest
                 var isVector = false;
                 var hasData = false;
                 var hasStroke = false;
+                var hasFill = false;
+                var isSolid = false;
                 string iconType = null;
 
                 var staError = RunSta(() =>
@@ -1551,6 +1555,14 @@ namespace VaultSelfTest
                     {
                         hasData = shape.Data != null && !shape.Data.IsEmpty();
                         hasStroke = shape.Stroke != null;
+                        hasFill = shape.Fill != null;
+
+                        // v1.8 起图标改成实心扁平风（跟 Playnite 自带那几个一致）。
+                        // 判据是「填充面积占包围盒的比例」——描边式图标这个值接近 0，
+                        // 实心块面则明显偏高。用面积而不是「Fill 是不是 null」，
+                        // 是因为 Fill 和 Stroke 只要都设上就能骗过 null 检查，
+                        // 但骗不过面积。
+                        isSolid = IsMostlySolid(shape);
                     }
                 });
 
@@ -1568,17 +1580,20 @@ namespace VaultSelfTest
 
                 if (isVector)
                 {
-                    // 只对矢量那条分支断言：返回 null 时上面那条已经报过了
-                    var ok = hasData && hasStroke;
+                    var ok = hasData && hasStroke && hasFill;
                     if (ok)
                     {
-                        Check(true, "图标几何数据非空，且描边有色（坐标写错 Geometry.Parse 会直接抛）");
+                        Check(true, "图标几何数据非空，且填充与描边都有色（坐标写错 Geometry.Parse 会直接抛）");
                     }
                     else
                     {
-                        Check(false, "图标几何数据非空，且描边有色",
-                            hasData ? "描边是空的（深色主题里等于看不见）" : "几何数据为空");
+                        Check(false, "图标几何数据非空，且填充与描边都有色",
+                            hasData ? "缺 Fill 或 Stroke（深色主题里等于看不见）" : "几何数据为空");
                     }
+
+                    Check(isSolid,
+                        "图标是实心扁平风（填充面积占包围盒 > 25%），不是细线条描边",
+                        isSolid ? null : "填充面积太小，看着还是线条图标");
                 }
             }
 
@@ -1717,6 +1732,584 @@ namespace VaultSelfTest
             thread.Start();
             thread.Join();
             return error;
+        }
+
+        /// <summary>
+        /// v1.8 界面那一批的回归：配色令牌、连通性分档、图表的退化输入。
+        ///
+        /// 这三样有个共同点 —— 出错的时候都是**静默**的：
+        /// 配色算错只是难看、分档分错只是颜色不对、图表遇到 0 数据只是白板。
+        /// 不会抛异常，所以只能靠断言盯着。
+        /// </summary>
+        private static void RunUiV180Tests()
+        {
+            Group("v1.8 界面 · 配色令牌");
+
+            // --- 1. 三档解析 ---
+            Check(VaultPalette.ParseMode(VaultSettings.UiThemeLight) == VaultUiThemeMode.Light,
+                "UiTheme=light 解析成 Light");
+            Check(VaultPalette.ParseMode(VaultSettings.UiThemeDark) == VaultUiThemeMode.Dark,
+                "UiTheme=dark 解析成 Dark");
+            Check(VaultPalette.ParseMode(VaultSettings.UiThemeAuto) == VaultUiThemeMode.Auto,
+                "UiTheme=auto 解析成 Auto");
+
+            // 手改 settings.json 写错值必须落回 auto，而不是抛异常或变成未定义档
+            Check(VaultPalette.ParseMode("LIGHT ") == VaultUiThemeMode.Light,
+                "大小写与空格会被归一化（手改配置不至于失效）");
+            Check(VaultPalette.ParseMode("purple") == VaultUiThemeMode.Auto,
+                "认不出来的值落回 auto，而不是崩掉");
+            Check(VaultPalette.ParseMode(null) == VaultUiThemeMode.Auto,
+                "null 落回 auto");
+            Check(VaultSettings.NormalizeUiTheme("  Dark") == VaultSettings.UiThemeDark,
+                "NormalizeUiTheme 自己去空格并转小写");
+
+            // --- 2. 两套色阶：明暗标记必须对得上，且每个令牌都要有值 ---
+            VaultPalette light = null;
+            VaultPalette dark = null;
+            var paletteError = RunSta(() =>
+            {
+                light = VaultPalette.Resolve(VaultUiThemeMode.Light);
+                dark = VaultPalette.Resolve(VaultUiThemeMode.Dark);
+            });
+            Check(paletteError == null, "两套色阶都能构造出来",
+                paletteError == null ? null : paletteError.Message);
+
+            if (light != null && dark != null)
+            {
+                Check(!light.IsDark && dark.IsDark, "Light 档 IsDark=false，Dark 档 IsDark=true");
+
+                // 令牌漏一个就是一处「看不见的字」，逐个点名比 foreach 更好排查
+                var tokens = new Dictionary<string, Func<VaultPalette, object>>
+                {
+                    { "Bg", x => x.Bg }, { "Surface", x => x.Surface }, { "SurfaceAlt", x => x.SurfaceAlt },
+                    { "Border", x => x.Border }, { "BorderStrong", x => x.BorderStrong },
+                    { "Text", x => x.Text }, { "TextMuted", x => x.TextMuted },
+                    { "Accent", x => x.Accent }, { "AccentInk", x => x.AccentInk },
+                    { "Success", x => x.Success }, { "Warning", x => x.Warning },
+                    { "Danger", x => x.Danger }, { "Info", x => x.Info }
+                };
+
+                var missing = new List<string>();
+                foreach (var token in tokens)
+                {
+                    if (token.Value(light) == null) missing.Add("light." + token.Key);
+                    if (token.Value(dark) == null) missing.Add("dark." + token.Key);
+                }
+                Check(missing.Count == 0, "两套色阶的 13 个令牌一个都不缺",
+                    missing.Count == 0 ? null : string.Join("、", missing));
+
+                // 正文和底色必须真的分开，否则就是「黑字压黑底」那种破相
+                Check(ContrastRatio(dark.Text, dark.Bg) >= 4.5,
+                    "深色档：正文与底色的对比度 ≥ 4.5（WCAG AA）",
+                    "实际 " + ContrastRatio(dark.Text, dark.Bg).ToString("0.0"));
+                Check(ContrastRatio(light.Text, light.Bg) >= 4.5,
+                    "浅色档：正文与底色的对比度 ≥ 4.5（WCAG AA）",
+                    "实际 " + ContrastRatio(light.Text, light.Bg).ToString("0.0"));
+
+                // 压在强调色上的字也必须看得清（按钮上的文字）
+                Check(ContrastRatio(dark.AccentInk, dark.Accent) >= 4.5,
+                    "深色档：强调色上的文字对比度 ≥ 4.5",
+                    "实际 " + ContrastRatio(dark.AccentInk, dark.Accent).ToString("0.0"));
+                Check(ContrastRatio(light.AccentInk, light.Accent) >= 4.5,
+                    "浅色档：强调色上的文字对比度 ≥ 4.5",
+                    "实际 " + ContrastRatio(light.AccentInk, light.Accent).ToString("0.0"));
+
+                // --- 3. 图表配色序列取模不越界 ---
+                Check(dark.Series != null && dark.Series.Length >= 5, "图表序列至少 5 色");
+                Check(ReferenceEquals(dark.SeriesAt(0), dark.SeriesAt(dark.Series.Length)),
+                    "SeriesAt 越过长度会绕回第 0 个（不会越界）");
+                Check(ReferenceEquals(dark.SeriesAt(-1), dark.Series[0]),
+                    "SeriesAt 收到负数也返回第 0 个（负下标不允许进数组）");
+
+                // --- 4. Alpha：越界的透明度必须被夹住 ---
+                var black = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Colors.Black);
+                var half = (System.Windows.Media.SolidColorBrush)VaultPalette.Alpha(black, 0.5);
+                Check(half.Color.A == 128, "Alpha(0.5) 得 128", "实际 " + half.Color.A);
+                var over = (System.Windows.Media.SolidColorBrush)VaultPalette.Alpha(black, 5);
+                Check(over.Color.A == 255, "Alpha(5) 被夹到 255（而不是溢出回绕）", "实际 " + over.Color.A);
+                var under = (System.Windows.Media.SolidColorBrush)VaultPalette.Alpha(black, -3);
+                Check(under.Color.A == 0, "Alpha(-3) 被夹到 0", "实际 " + under.Color.A);
+            }
+
+            // --- 5. 连通性分档：黄（暂时不通）与红（配置/凭据问题）不能混 ---
+            Group("v1.8 界面 · 连通性分档");
+
+            var classify = typeof(PlayniteVault.VaultPlugin).GetMethod("ClassifyHealthFailure",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            Check(classify != null, "ClassifyHealthFailure 还在（黄/红的分档规则就这一处）");
+
+            if (classify != null)
+            {
+                Func<Exception, VaultHealthState> classifyOf = ex =>
+                    (VaultHealthState)classify.Invoke(null, new object[] { ex });
+
+                Check(classifyOf(new System.Net.WebException("超时", System.Net.WebExceptionStatus.Timeout)) == VaultHealthState.Timeout,
+                    "WebException(Timeout) → 黄");
+                Check(classifyOf(new System.Net.WebException("连接被拒", System.Net.WebExceptionStatus.ConnectFailure)) == VaultHealthState.Timeout,
+                    "WebException(ConnectFailure) → 黄（NAS 没开机属于这一类）");
+                Check(classifyOf(new System.Net.WebException("解析不了", System.Net.WebExceptionStatus.NameResolutionFailure)) == VaultHealthState.Failed,
+                    "WebException(NameResolutionFailure) → 红（地址写错了，不是「暂时不通」）");
+                Check(classifyOf(new System.Net.WebException("证书", System.Net.WebExceptionStatus.TrustFailure)) == VaultHealthState.Failed,
+                    "WebException(TrustFailure) → 红（自签证书要用户去处理，等不会有结果）");
+                Check(classifyOf(new TimeoutException("慢")) == VaultHealthState.Timeout,
+                    "TimeoutException → 黄");
+                Check(classifyOf(new OperationCanceledException()) == VaultHealthState.Timeout,
+                    "OperationCanceledException（被取消）→ 黄");
+                Check(classifyOf(new AggregateException(new System.Net.WebException(
+                        "包一层", System.Net.WebExceptionStatus.Timeout))) == VaultHealthState.Timeout,
+                    "AggregateException 会被拆到最内层再判");
+                Check(classifyOf(new InvalidOperationException("别的错")) == VaultHealthState.Failed,
+                    "非网络异常 → 红（兜底宁可报红，也别假装只是慢）");
+
+                // 401 这类「服务端答复了」必须判红 —— 这是用户最需要区分的一档
+                var refused = MakeWebExceptionWithStatus(401);
+                if (refused != null)
+                {
+                    Check(classifyOf(refused) == VaultHealthState.Failed,
+                        "HTTP 401（服务端明确拒绝）→ 红，不会被当成超时");
+                }
+            }
+
+            // --- 6. 图表遇到退化输入不能抛 ---
+            Group("v1.8 界面 · 图表退化输入");
+
+            var chartError = RunSta(() =>
+            {
+                var p = VaultPalette.Resolve(VaultUiThemeMode.Dark);
+
+                // 空列表
+                VaultCharts.BarList(p, new List<BarItem>(), "空的");
+                VaultCharts.BarList(p, null, "空的");
+                VaultCharts.Legend(p, new List<BarItem>());
+                VaultCharts.Legend(p, null);
+
+                // 全 0：环形和堆叠条都要走「没有数据」那条分支，而不是除零
+                var zeros = new List<BarItem> { new BarItem("a", 0, "0"), new BarItem("b", 0, "0") };
+                VaultCharts.StackedBar(p, zeros, 14);
+                VaultCharts.Donut(p, zeros, 120, "0 B", "合计");
+                VaultCharts.BarList(p, zeros, "空的");
+
+                // 单段占满 360°：ArcSegment 画不出整圆，必须走 Ellipse 那条特例
+                VaultCharts.Donut(p, new List<BarItem> { new BarItem("only", 10, "10") }, 120, "10", "只有一个");
+
+                // 极小值：占比接近 0 但仍要留一丝可见宽度
+                VaultCharts.BarList(p, new List<BarItem>
+                {
+                    new BarItem("巨大", 1e12, "1 TB"),
+                    new BarItem("极小", 1, "1 B")
+                }, "空的");
+
+                // 负数（理论上传不进来，但预算算错时会出现）
+                VaultCharts.StackedBar(p, new List<BarItem> { new BarItem("负", -5, "-5") }, 14);
+                VaultCharts.BarList(p, new List<BarItem> { new BarItem("负", -5, "-5") }, "空的");
+            });
+
+            Check(chartError == null, "空列表 / 全 0 / 满圈 / 极小值 / 负数，图表都不抛异常",
+                chartError == null ? null : chartError.Message);
+
+            RunUiV180RepoTests();
+        }
+
+        /// <summary>
+        /// v1.8 第三组：卡片墙的对账规则、「传没传」徽章的对比度、以及
+        /// 「删除只有一个入口」的调用点断言。
+        ///
+        /// <para>这一组盯的都是**判错一次就会让用户白等几十分钟**的地方：
+        /// 对账判错 → 显示「未上传」→ 用户重传一遍；删除入口漏一个 → 口令闸门形同虚设。</para>
+        /// </summary>
+        private static void RunUiV180RepoTests()
+        {
+            Group("v1.8 界面 · 仓库对账（卡片墙）");
+
+            // ---- 1. 三级命中键的顺序 ----
+            var byGuid = new AppEntry
+            {
+                Id = "slug-by-guid", Name = "按 GUID 命中的条目",
+                PlayniteGameId = "G-1", PlayniteLibraryId = "L-1"
+            };
+            var byLib = new AppEntry
+            {
+                Id = "slug-by-lib", Name = "按库内 ID 命中的条目",
+                PlayniteLibraryId = "L-2"
+            };
+            var bySlugOld = new AppEntry { Id = "slug-old", Name = "老条目（两把钥匙都没有）" };
+            var bySlugModern = new AppEntry
+            {
+                Id = "slug-modern", Name = "有钥匙但目录名对上的条目",
+                PlayniteGameId = "G-3"
+            };
+
+            var byGameId = LocalAppMatcher.BucketByGameId(new[] { byGuid, byLib, bySlugOld, bySlugModern });
+            var byLibraryId = LocalAppMatcher.BucketByLibraryId(new[] { byGuid, byLib, bySlugOld, bySlugModern });
+            var bySlug = LocalAppMatcher.BucketBySlug(new[] { byGuid, byLib, bySlugOld, bySlugModern });
+
+            string note;
+
+            // 三把钥匙都能对上时，必须先走 GUID —— 「优先级」这件事只有造出这种局面才测得出来
+            var hit = LocalAppMatcher.Match("G-1", "L-2", "slug-by-lib", byGameId, byLibraryId, bySlug, out note);
+            Check(ReferenceEquals(hit, byGuid) && note == LocalAppMatcher.NoteByGameId,
+                "三把钥匙都命中时走 GUID，并且如实写明依据",
+                note == LocalAppMatcher.NoteByGameId ? null : "实际依据：" + note);
+
+            hit = LocalAppMatcher.Match("G-不存在", "L-2", "slug-old", byGameId, byLibraryId, bySlug, out note);
+            Check(ReferenceEquals(hit, byLib) && note == LocalAppMatcher.NoteByLibraryId,
+                "GUID 对不上时退到库内 ID",
+                note == LocalAppMatcher.NoteByLibraryId ? null : "实际依据：" + note);
+
+            hit = LocalAppMatcher.Match(null, null, "slug-old", byGameId, byLibraryId, bySlug, out note);
+            Check(ReferenceEquals(hit, bySlugOld) && note == LocalAppMatcher.NoteBySlugOld,
+                "两把钥匙都没有 → 按目录名推的 slug 兜底，并标明这是老条目",
+                note == LocalAppMatcher.NoteBySlugOld ? null : "实际依据：" + note);
+
+            hit = LocalAppMatcher.Match(null, null, "slug-modern", byGameId, byLibraryId, bySlug, out note);
+            Check(ReferenceEquals(hit, bySlugModern) && note == LocalAppMatcher.NoteBySlug,
+                "按 slug 命中但有钥匙 → 说明「目录名与归档时一致」，不冒充老条目",
+                note == LocalAppMatcher.NoteBySlug ? null : "实际依据：" + note);
+
+            hit = LocalAppMatcher.Match("G-无", "L-无", "slug-无", byGameId, byLibraryId, bySlug, out note);
+            Check(hit == null && note == LocalAppMatcher.NoteMiss,
+                "三把钥匙全对不上 → 判定为「没传过」",
+                note == LocalAppMatcher.NoteMiss ? null : "实际依据：" + note);
+
+            // 空键是最危险的：索引里若有一条「没有库内 ID」的条目被放进 "" 桶，
+            // 那所有同样没库内 ID 的游戏都会被认成它 —— 这是会让人误删的错。
+            var emptyKeys = LocalAppMatcher.BucketByLibraryId(new[] { bySlugOld, bySlugModern });
+            Check(emptyKeys.Count == 0, "没有库内 ID 的条目不会在桶里占一个空键",
+                "实际桶里有 " + emptyKeys.Count + " 条");
+            hit = LocalAppMatcher.Match("G-无", string.Empty, "slug-无", byGameId, emptyKeys, bySlug, out note);
+            Check(hit == null, "库内 ID 是空串时不命中任何条目（空串不参与比对）");
+
+            // ---- 2. 孤儿条目：仓库里有、库里没有 ----
+            var cards = new List<LocalAppCard>
+            {
+                new LocalAppCard { Name = "库里有的（传过）", InRepository = true, RepoAppId = "slug-by-guid" },
+                new LocalAppCard { Name = "库里有的（没传）", InRepository = false, RepoAppId = null }
+            };
+
+            var orphans = LocalAppMatcher.Orphans(
+                new[] { byGuid, byLib, bySlugOld }, cards);
+            Check(orphans.Count == 2 && orphans[0].Id == "slug-by-lib" && orphans[1].Id == "slug-old",
+                "孤儿 = 索引里有、且没有任何卡片认领的条目（顺序照索引原样）",
+                "实际 " + orphans.Count + " 条");
+
+            Check(LocalAppMatcher.Orphans(new[] { byGuid }, cards).Count == 0,
+                "被卡片认领过的条目不算孤儿");
+            Check(LocalAppMatcher.Orphans(new[] { byGuid }, null).Count == 1,
+                "一张卡片都没有时，索引里全部条目都算孤儿（不能凭空吞掉）");
+            Check(LocalAppMatcher.Orphans(null, cards).Count == 0,
+                "索引为空时不产生孤儿（也不抛异常）");
+
+            // ---- 3. 徽章对比度：实心色块上的字必须看得清 ----
+            Group("v1.8 界面 · 状态徽章对比度");
+
+            var contrastError = RunSta(() =>
+            {
+                foreach (var dark in new[] { false, true })
+                {
+                    var pal = VaultPalette.Resolve(dark ? VaultUiThemeMode.Dark : VaultUiThemeMode.Light);
+                    var label = dark ? "深色档" : "浅色档";
+                    var statuses = new List<KeyValuePair<string, System.Windows.Media.Brush>>
+                    {
+                        new KeyValuePair<string, System.Windows.Media.Brush>("Success", pal.Success),
+                        new KeyValuePair<string, System.Windows.Media.Brush>("Warning", pal.Warning),
+                        new KeyValuePair<string, System.Windows.Media.Brush>("Danger", pal.Danger),
+                        new KeyValuePair<string, System.Windows.Media.Brush>("Info", pal.Info),
+                        new KeyValuePair<string, System.Windows.Media.Brush>("Accent", pal.Accent)
+                    };
+
+                    foreach (var item in statuses)
+                    {
+                        var ink = pal.OnStatus(item.Value) as System.Windows.Media.SolidColorBrush;
+                        var bg = item.Value as System.Windows.Media.SolidColorBrush;
+                        var ratio = ink == null || bg == null
+                            ? 0
+                            : VaultPalette.Contrast(ink.Color, bg.Color);
+
+                        Check(ratio >= 4.5,
+                            label + "：" + item.Key + " 块上的文字对比度 ≥ 4.5（WCAG AA）",
+                            "实际 " + ratio.ToString("0.00"));
+                    }
+                }
+            });
+            Check(contrastError == null, "状态徽章配色计算不抛异常",
+                contrastError == null ? null : contrastError.Message);
+
+            // ---- 4. 删除入口唯一（IL 级） ----
+            Group("v1.8 界面 · 删除入口唯一");
+
+            var removeApp = typeof(VaultService).GetMethod("RemoveApp",
+                BindingFlags.Public | BindingFlags.Instance);
+            Check(removeApp != null, "VaultService.RemoveApp 还在（真正动手删的那个方法）");
+
+            var removeSites = CallSitesOf(removeApp);
+            Check(removeSites.Count == 1
+                  && removeSites[0] == "PlayniteVault.VaultPlugin.DeleteRepositoryApp",
+                "调用 VaultService.RemoveApp 的地方只有 VaultPlugin.DeleteRepositoryApp 一处"
+                + "（删是不可逆的，口令闸门就这一道）",
+                "实际 " + (removeSites.Count == 0
+                    ? "一处都没找到 —— 检测器可能坏了"
+                    : string.Join("、", removeSites)));
+
+            // 正对照 1：VerifyAdminPassword 有两个调用方（插件删除入口 + 管理窗口改口令），
+            // 证明检测器不是在扫一个空集合。
+            var verify = typeof(VaultService).GetMethod("VerifyAdminPassword",
+                BindingFlags.Public | BindingFlags.Instance);
+            var verifySites = CallSitesOf(verify);
+            Check(verifySites.Contains("PlayniteVault.VaultPlugin.DeleteRepositoryApp"),
+                "（正对照）检测器能找到插件里的 VerifyAdminPassword 调用点");
+
+            // 正对照 2：另一个类型里的调用点也扫得到 —— 说明真的遍历了整个程序集，
+            // 而不是只在 VaultPlugin 里找了一圈。
+            Check(verifySites.Contains("PlayniteVault.UI.VaultAdminWindow.OnChangePassword"),
+                "（正对照）检测器能找到别的类型里的调用点（确实扫了全程序集）",
+                "实际：" + string.Join("、", verifySites));
+
+            // 侧边栏那条内联删除必须真的接到闸门上 —— 否则「内联了但有后门」比不内联更糟
+            var deleteSites = CallSitesOf(typeof(PlayniteVault.VaultPlugin).GetMethod("DeleteRepositoryApp",
+                BindingFlags.Public | BindingFlags.Instance));
+            Check(deleteSites.Any(s => s.StartsWith("PlayniteVault.UI.VaultPanelView")),
+                "侧边栏页确实调用了 DeleteRepositoryApp（内联删除走的是同一道闸门）",
+                "实际：" + (deleteSites.Count == 0 ? "没有" : string.Join("、", deleteSites)));
+
+            var archiveSites = CallSitesOf(typeof(PlayniteVault.VaultPlugin).GetMethod("ArchiveGameById",
+                BindingFlags.Public | BindingFlags.Instance));
+            Check(archiveSites.Any(s => s.StartsWith("PlayniteVault.UI.VaultPanelView")),
+                "卡片上的「归档到 NAS」接到了插件入口 ArchiveGameById",
+                "实际：" + (archiveSites.Count == 0 ? "没有" : string.Join("、", archiveSites)));
+        }
+
+        /// <summary>
+        /// 扫出「谁调用了这个方法」—— 返回 "类型全名.方法名" 的列表。
+        ///
+        /// <para>判据是 IL 里 <c>call / callvirt / newobj</c> 后面跟着目标方法的 4 字节元数据令牌。
+        /// 连操作码一起匹配是为了压掉误命中：单看那 4 个字节，随便一段 IL 都可能凑巧相等，
+        /// 而「只有一个调用方」这种断言一旦误命中，就会变成一个查不出原因的假失败。</para>
+        /// </summary>
+        private static List<string> CallSitesOf(MethodBase target)
+        {
+            var sites = new List<string>();
+            if (target == null || target.DeclaringType == null)
+            {
+                return sites;
+            }
+
+            var token = BitConverter.GetBytes(target.MetadataToken);   // 小端
+            foreach (var type in AllTypes(target.DeclaringType.Assembly))
+            {
+                const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
+                                           | BindingFlags.Instance | BindingFlags.Static
+                                           | BindingFlags.DeclaredOnly;
+
+                var members = new List<MethodBase>();
+                try
+                {
+                    members.AddRange(type.GetMethods(flags));
+                    members.AddRange(type.GetConstructors(flags));
+                }
+                catch
+                {
+                    continue;   // 个别类型（泛型、动态）取成员会抛，跳过即可
+                }
+
+                foreach (var method in members)
+                {
+                    MethodBody body;
+                    try
+                    {
+                        body = method.GetMethodBody();
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (body != null && HasCallTo(body.GetILAsByteArray(), token))
+                    {
+                        sites.Add(type.FullName + "." + method.Name);
+                    }
+                }
+            }
+
+            return sites;
+        }
+
+        /// <summary>IL 里有没有一条指向该令牌的 call / callvirt / newobj。</summary>
+        private static bool HasCallTo(byte[] il, byte[] token)
+        {
+            if (il == null || token == null || token.Length != 4 || il.Length < 5)
+            {
+                return false;
+            }
+
+            for (var i = 0; i + 4 < il.Length; i++)
+            {
+                var op = il[i];
+                // 0x28 = call、0x6F = callvirt、0x73 = newobj（都是一字节操作码 + 4 字节令牌）
+                if (op != 0x28 && op != 0x6F && op != 0x73)
+                {
+                    continue;
+                }
+
+                if (il[i + 1] == token[0] && il[i + 2] == token[1]
+                    && il[i + 3] == token[2] && il[i + 4] == token[3])
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static IEnumerable<Type> AllTypes(Assembly assembly)
+        {
+            try
+            {
+                return assembly.GetTypes();
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                return ex.Types.Where(t => t != null);
+            }
+        }
+
+        /// <summary>造一个「带 HTTP 响应」的 WebException —— 这是判「服务端明确拒绝」的关键分支。</summary>
+        private static Exception MakeWebExceptionWithStatus(int statusCode)
+        {
+            // HttpWebResponse 没法直接 new，只能借一个真请求拿。
+            // 起一个最小的假服务，让它固定回这个状态码。
+            try
+            {
+                using (var server = new MiniHttpServer())
+                {
+                    server.Set("probe", new MockRoute { Status = statusCode, Body = new byte[0] });
+
+                    var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(
+                        server.BaseUrl + "probe");
+                    request.Timeout = 3000;
+
+                    try
+                    {
+                        using (var response = (System.Net.HttpWebResponse)request.GetResponse())
+                        {
+                            return null;   // 2xx 的话测不到我们要的分支
+                        }
+                    }
+                    catch (System.Net.WebException ex)
+                    {
+                        return ex;
+                    }
+                }
+            }
+            catch
+            {
+                // 端口拿不到这类环境问题：调用方会跳过这条断言
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 相对亮度对比度（WCAG）。用来断言「文字压在自己的底上看得清」——
+        /// 配色这东西肉眼看着还行、实际算出来 2.1 的情况太常见了。
+        /// </summary>
+        private static double ContrastRatio(System.Windows.Media.Brush a, System.Windows.Media.Brush b)
+        {
+            var la = RelativeLuminance(a);
+            var lb = RelativeLuminance(b);
+            var hi = Math.Max(la, lb);
+            var lo = Math.Min(la, lb);
+            return (hi + 0.05) / (lo + 0.05);
+        }
+
+        private static double RelativeLuminance(System.Windows.Media.Brush brush)
+        {
+            var solid = brush as System.Windows.Media.SolidColorBrush;
+            if (solid == null)
+            {
+                return 0;
+            }
+
+            var c = solid.Color;
+            return 0.2126 * Channel(c.R) + 0.7152 * Channel(c.G) + 0.0722 * Channel(c.B);
+        }
+
+        private static double Channel(byte value)
+        {
+            var v = value / 255.0;
+            return v <= 0.03928 ? v / 12.92 : Math.Pow((v + 0.055) / 1.055, 2.4);
+        }
+
+        /// <summary>
+        /// 判断一个图标形状是不是「实心块面」。
+        ///
+        /// 判据：最大那个子路径围出的面积 ÷ 整个几何的包围盒面积 &gt; 25%。
+        /// 线条图标的笔画围不出多少面积，实心块面则轻松过半。
+        /// 之所以要算面积而不是只看 <c>Fill != null</c>：Fill 和 Stroke 都设上就能骗过 null 检查，
+        /// 但骗不过面积 —— 一个只有描边的矩形照样能通过前者。
+        /// </summary>
+        private static bool IsMostlySolid(System.Windows.Shapes.Path shape)
+        {
+            if (shape == null || shape.Fill == null || shape.Data == null)
+            {
+                return false;
+            }
+
+            var bounds = shape.Data.Bounds;
+            var boxArea = bounds.Width * bounds.Height;
+            if (boxArea <= 0)
+            {
+                return false;
+            }
+
+            var flattened = shape.Data.GetFlattenedPathGeometry();
+            var largest = 0d;
+
+            foreach (var figure in flattened.Figures)
+            {
+                var points = new List<System.Windows.Point> { figure.StartPoint };
+                foreach (var segment in figure.Segments)
+                {
+                    var poly = segment as System.Windows.Media.PolyLineSegment;
+                    if (poly != null)
+                    {
+                        points.AddRange(poly.Points);
+                        continue;
+                    }
+
+                    var line = segment as System.Windows.Media.LineSegment;
+                    if (line != null)
+                    {
+                        points.Add(line.Point);
+                    }
+                    // 其余段类型（贝塞尔等）本图标用不到，忽略即可
+                }
+
+                var area = Math.Abs(Shoelace(points));
+                if (area > largest)
+                {
+                    largest = area;
+                }
+            }
+
+            return largest / boxArea > 0.25;
+        }
+
+        /// <summary>多边形有向面积（鞋带公式）。</summary>
+        private static double Shoelace(IList<System.Windows.Point> points)
+        {
+            if (points == null || points.Count < 3)
+            {
+                return 0;
+            }
+
+            var sum = 0d;
+            for (var i = 0; i < points.Count; i++)
+            {
+                var a = points[i];
+                var b = points[(i + 1) % points.Count];
+                sum += a.X * b.Y - b.X * a.Y;
+            }
+
+            return sum / 2d;
         }
 
         private static void RunDataMigrationTests(string root)

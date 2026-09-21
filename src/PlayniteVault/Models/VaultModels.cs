@@ -66,6 +66,33 @@ namespace PlayniteVault.Models
 
         /// <summary>随包元数据（名称/简介/开发商/类型/标签/评分/图片等）。</summary>
         public AppMetadata Metadata { get; set; }
+
+        /// <summary>
+        /// 【v1.8】归档时那条 Playnite 库记录的 GUID（<c>Game.Id</c>）。
+        ///
+        /// <para>为什么需要它：仓库里的 <see cref="Id"/> 是从**安装目录名**压出来的 slug
+        /// （见 <c>VaultService.MakeAppId</c>），它只保证「同一台机器上同一次归档稳定」，
+        /// 并不能用来回答「这条库里记录，仓库里到底有没有」——目录改名、手工改名、
+        /// 或者显示名和目录名不一致，都会让推导出来的 slug 对不上。
+        /// 而 <c>Game.Id</c> 是 Playnite 自己给的、跨机器不变量，才是可靠的钥匙。</para>
+        ///
+        /// <para>老条目没有这个字段（空字符串）→ 读取端必须退回按 slug 比对。</para>
+        /// </summary>
+        public string PlayniteGameId { get; set; }
+
+        /// <summary>
+        /// 【v1.8】归档时那条记录的 <c>Game.GameId</c> —— **库内标识**
+        /// （Steam 游戏就是 appid，别的库插件给什么就是什么）。
+        ///
+        /// <para>为什么第二把钥匙取的是它而不是「数据库自增 id」：查过 SDK ——
+        /// <c>Playnite.SDK.Models.Game</c> 上**根本没有 DatabaseId 这个成员**
+        /// （<c>IGameDatabase</c> 也没有按 int 取游戏的入口），所以拿不到。
+        /// <c>Game.GameId</c> 是能拿到的第二稳定键，而且它在「游戏删掉再重新导入」
+        /// 这一档上比 <see cref="PlayniteGameId"/>（库记录 GUID，重导入会重新分配）更稳。</para>
+        ///
+        /// <para>老条目没有这个字段（空字符串）→ 读取端退回按 slug 比对。</para>
+        /// </summary>
+        public string PlayniteLibraryId { get; set; }
     }
 
     /// <summary>
@@ -111,6 +138,12 @@ namespace PlayniteVault.Models
         public List<FileEntry> Files { get; set; } = new List<FileEntry>();
 
         public AppMetadata Metadata { get; set; }
+
+        /// <summary>【v1.8】归档来源那条 Playnite 记录的 GUID，见 <see cref="AppEntry.PlayniteGameId"/>。</summary>
+        public string PlayniteGameId { get; set; }
+
+        /// <summary>【v1.8】归档来源那条记录的 <c>Game.GameId</c>（库内标识），见 <see cref="AppEntry.PlayniteLibraryId"/>。</summary>
+        public string PlayniteLibraryId { get; set; }
 
         /// <summary>按字段推断实际布局。读取端一律用这个，不要看 Schema 数值。</summary>
         public VaultLayout Layout
@@ -288,6 +321,130 @@ namespace PlayniteVault.Models
                 cursor += piece.Size;
             }
             return cursor == Size;
+        }
+    }
+
+    /// <summary>
+    /// 仓库连通性的四档状态。侧边栏右上角那个小圆点就是它的可视化。
+    ///
+    /// 之所以要区分 <see cref="Timeout"/> 和 <see cref="Failed"/>：
+    /// 「NAS 关机 / 网线掉了」和「密码错了」是两件完全不同的事 ——
+    /// 前者等一会儿就好，后者必须去改设置。一个红点把这两种情况糊在一起，
+    /// 用户只会反复重试同一个改不动的设置。
+    /// </summary>
+    public enum VaultHealthState
+    {
+        /// <summary>绿：探测通了。</summary>
+        Ok = 0,
+
+        /// <summary>黄：连不上，但是超时/不可达这一类「可能是暂时的」。</summary>
+        Timeout = 1,
+
+        /// <summary>红：连上了但被拒（401/403），或者地址、证书这类配置问题。</summary>
+        Failed = 2,
+
+        /// <summary>灰：还没配置 WebDAV 地址，谈不上连不连得上。</summary>
+        NotConfigured = 3,
+
+        /// <summary>正在探测。</summary>
+        Checking = 4
+    }
+
+    /// <summary>一次连通性探测的完整结果：状态 + 能直接给用户看的说明。</summary>
+    public class RepositoryHealth
+    {
+        public VaultHealthState State { get; set; } = VaultHealthState.Checking;
+
+        /// <summary>一句话总结，直接显示在提示浮窗的标题位置。</summary>
+        public string Summary { get; set; } = string.Empty;
+
+        /// <summary>详细说明（多行），放浮窗正文。</summary>
+        public string Detail { get; set; } = string.Empty;
+
+        /// <summary>探测完成的时间（本地时间）。</summary>
+        public DateTime CheckedAt { get; set; } = DateTime.Now;
+
+        /// <summary>探测用的仓库地址，便于用户在浮窗里核对。</summary>
+        public string Url { get; set; } = string.Empty;
+
+        public static RepositoryHealth NotConfigured(string url)
+        {
+            return new RepositoryHealth
+            {
+                State = VaultHealthState.NotConfigured,
+                Summary = "还没配置仓库地址",
+                Detail = "去「设置」里填上 WebDAV 地址和账号，这里就会开始探测。",
+                Url = url
+            };
+        }
+    }
+
+    /// <summary>
+    /// 「仓库与归档」页卡片墙上的一张卡：本地 Playnite 里的一条应用，
+    /// 外加「它在仓库里有没有」这个判定结果。
+    /// </summary>
+    public class LocalAppCard
+    {
+        /// <summary>Playnite 库记录 GUID（<c>Game.Id</c>）。卡片的主键。</summary>
+        public string GameId { get; set; }
+
+        /// <summary><c>Game.GameId</c> —— 库内标识（Steam 就是 appid）；手动添加的游戏可能是空串。</summary>
+        public string LibraryId { get; set; }
+
+        public string Name { get; set; }
+
+        /// <summary>本机安装目录；空表示没装（只在库里）。</summary>
+        public string InstallDir { get; set; }
+
+        /// <summary>本机确实装了（安装目录存在）。</summary>
+        public bool IsInstalled { get; set; }
+
+        /// <summary>仓库里已经有一条对应的归档。</summary>
+        public bool InRepository { get; set; }
+
+        /// <summary>命中的仓库条目 Id（用于显示与跳转）。</summary>
+        public string RepoAppId { get; set; }
+
+        /// <summary>仓库里那份的体积。</summary>
+        public long RepoBytes { get; set; }
+
+        /// <summary>封面图的绝对路径；解析不出来就是空，卡片会退化成一个占位块。</summary>
+        public string CoverPath { get; set; }
+
+        /// <summary>
+        /// 判定依据，直接显示在卡片提示里。
+        /// 用户问「凭什么说它传过了」时，能一眼看到是拿哪个键对上的。
+        /// </summary>
+        public string MatchNote { get; set; }
+    }
+
+    /// <summary>
+    /// 「删掉仓库里一个应用」的结果。
+    ///
+    /// <para>为什么单独要一个类型而不是返回 bool：删除失败的原因对用户来说是**三种完全不同的下一步** ——
+    /// 口令打错（重输）、仓库压根没设口令（先去设置）、网络/服务端出错（去查连接）。
+    /// 一个 bool 会把它们糊成一句「删除失败」，那用户就只能瞎试。</para>
+    /// </summary>
+    public class RepositoryDeleteResult
+    {
+        /// <summary>口令验证通过且删除完成。</summary>
+        public bool Ok { get; set; }
+
+        /// <summary>口令不对。</summary>
+        public bool PasswordWrong { get; set; }
+
+        /// <summary>仓库还没设置过管理口令。</summary>
+        public bool PasswordNotSet { get; set; }
+
+        /// <summary>远端被清理掉的文件数。</summary>
+        public int RemovedFiles { get; set; }
+
+        /// <summary>出错说明（网络/服务端）。</summary>
+        public string Error { get; set; }
+
+        public static RepositoryDeleteResult Fail(string error)
+        {
+            return new RepositoryDeleteResult { Error = error };
         }
     }
 

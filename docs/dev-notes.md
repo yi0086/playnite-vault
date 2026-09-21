@@ -236,7 +236,7 @@ docs/dev-notes.md   工程取舍、踩坑（给改代码的人看）。
 
 | 工具 | 规模 | 说明 |
 |---|---|---|
-| `tools/VaultSelfTest/` | C# 239 项 | `TcpListener` 起本地假 GitHub/Gitee，**断言全实跑**，不联网、不碰真实仓库 |
+| `tools/VaultSelfTest/` | C# 299 项 | `TcpListener` 起本地假 GitHub/Gitee，**断言全实跑**，不联网、不碰真实仓库 |
 | `tools/python-selftest/` | Python 109 项 | `python tools/python-selftest/run_all.py`；**设 `VAULT_TK_PYTHON` 指向带 tkinter 的解释器**，否则 GUI 与「真实 WM_CLOSE」两段会被跳过 |
 | `tools/fetch-playnite-themes.py --selftest` | Python 25 项 | 离线；专盯「认主题 / 定目录名 / 解包防穿越」那套判断 |
 
@@ -267,10 +267,43 @@ zip 路径穿越都是它或同类检查抓出来的。**改动对应模块后�
 - 配色：正文色优先取主题的 `TextBrush`（对比度最稳），明暗按窗口背景亮度判断；
   取不到就用内置调色板兜底。**任何取不到主题资源的地方都必须有非 null 的兜底**，
   否则会出现「深色主题下黑字看不见」。
-- **口令闸门只能有一道**：仓库管理里有不可逆删除，`VaultAdminWindow` 必须经由
-  `VaultPlugin.OpenRepositoryManager()`（里面验管理口令）打开。
-  侧边栏页直接 `new VaultAdminWindow` 就等于开后门 —— 自检 §11 有一条从 IL 里
-  搜 `newobj` 令牌的断言盯着它，并且带**正对照**（同一个检测器能在插件里找到那句 new）。
+- **v1.8 起配色走令牌**（`UI/VaultPalette.cs`），页面里不再出现字面颜色值：
+  中性色承担版面、`Accent` 只标选中与主操作、`Success/Warning/Danger/Info` 只给状态。
+  明暗三档 `auto/light/dark` 存在 `VaultSettings.UiTheme`，**auto 判错时用户必须能手动覆盖**
+  （判据是主窗口底色，主题把底色做成半透明或贴图就会判反）。
+  自检里有 WCAG 对比度断言（正文/底色、强调色上的文字都要 ≥ 4.5），
+  配色算错是静默的，只能靠断言盯。
+- **v1.8 起顶栏被整个去掉**。原因不是审美：原来贴在右上角的「已连接 / 刷新」在窗口控制区
+  （最小化/最大化/关闭）上方，两者位置重合，点刷新会顺手关掉 Playnite。
+  现在只留一个不占版面、无底无框的状态点（`BuildHealthDot`），版本号挪到左栏产品名后面。
+- 连通性状态必须**分档**：绿=通、黄=超时/不可达（NAS 没开机这类，等一会儿可能就好）、
+  红=服务端明确拒绝或配置写错（401/403/域名解析/证书）、灰=还没配置。
+  分档规则只有一处 `VaultPlugin.ClassifyHealthFailure`，自检逐档断言。
+  把它糊成一个「红点」会让用户反复重试一个改不动的设置。
+- **口令闸门只能有一道**：仓库管理里有不可逆删除。v1.8 起删除入口从「独占窗口」变成
+  「侧边栏卡片 + 孤儿条目 + 管理窗口」三处，但**验口令 + 删**被钉在同一个方法里：
+  `VaultPlugin.DeleteRepositoryApp`。别的任何地方都不许直接调 `VaultService.RemoveApp`
+  —— 自检有一条调用点断言：“RemoveApp 的调用方只能是 DeleteRepositoryApp”，
+  并且带两个正对照（`VerifyAdminPassword` 确实有两个调用方，其一个在另一个类型里），
+  免得“没找到调用方”和“检测器坏了”分不清。
+  检测器看的是 IL：“call/callvirt/newobj 后面跟着目标的 4 字节元数据令牌”，
+  连操作码一起匹配，压掉单看令牌字节的误命中。
+  另：`VaultAdminWindow` 必须经由 `VaultPlugin.OpenRepositoryManager()` 打开 ——
+  侧边栏页直接 `new VaultAdminWindow` 也是开后门，自检从 IL 里搜 `newobj` 令牌盯着它。
+- **卡片墙的对账规则抽在 `Services/LocalAppMatcher.cs`**（纯函数，不依赖 Playnite 运行时，
+  自检能逐个键断言）。命中顺序：`Game.Id` GUID → `Game.GameId` 库内标识 →
+  `MakeAppId` 推的 slug。两个坑：
+  1. **没库内 ID 的条目千万不要在桶里占一个空键** —— 否则所有同样没库内 ID 的游戏
+     都会被认成它，而这一页上“认错”的后果是用户把别人的归档当成自己的。
+     所以建桶时空键直接跳过（自检有专门一条）。
+  2. “老条目”的判据是**两把钥匙都没存**（v1.8 之前归档的），不是“没有 GUID” ——
+     一个只存了库内 ID 的条目不是老条目，提示语不能张冠李戴。
+- **封面加载三个必须**：`CacheOption=OnLoad`（默认的延迟加载会握着文件句柄，
+  而游戏正在跑的时候那个文件是活的）；`DecodePixelWidth` 缩到卡片宽度
+  （一屏两百张按原图解码要吃掉几百 MB）；解完 `Freeze()` 才能跨线程交给 UI。
+- `VaultPanelView` 的构造签名 `(plugin, service, settingsVm, themesRoot)` 也是被自检钉住的契约
+  （要加参数得同步改自检）。换配色需要**重建整棵视觉树**（颜色是建控件时烘进去的），
+  所以 `VaultSettingsViewModel.SettingsSaved` 会触发 `RebuildForTheme()`。
 
 ## 13. 云存档（v1.7.0 起）
 
@@ -345,3 +378,55 @@ zip 路径穿越都是它或同类检查抓出来的。**改动对应模块后�
 - **`.NET` 单文件 exe 的 `PlayniteDir` 默认是 `$(ProgramFiles)\Playnite`**，本机 Playnite
   在 `D:\Game\Playnite` → 三个 csproj 编译都要显式给 `-p:PlayniteDir="D:\Game\Playnite"`
   或设同名环境变量，否则 `VaultPack` 会 CS0246。
+
+## 15. Playnite SDK 的界面能力边界（v1.8 实测，做主题截图 / 云存档界面之前先读）
+
+这些结论是拿 `Playnite.SDK.dll` 的 **XML 文档 + 元数据**逐个问出来的（本机 10.41）。
+**别再凭印象写** —— 下面每一条都直接决定「某个功能能不能做」。
+
+**结论先说：Playnite 只为插件开了「整页 / 菜单 / 顶栏 / 侧边栏」这几个口子，
+没有给「往游戏详情面板里插按钮」或「往编辑游戏对话框加一栏」开任何口。**
+
+- **读设置可以，写设置不行。** `IPlayniteAPI.ApplicationSettings` 的类型是
+  `IPlayniteSettingsAPI`，它把 `DesktopTheme` / `FullscreenTheme` /
+  `GridItemWidthRatio` / `GridItemHeightRatio` / `SidebarPosition` **全部暴露成只有 getter**。
+  → 插件**无法**通过官方 API 切换主题，也**无法**读写 Playnite 自己的布局设置。
+- **运行时应用主题只有一条路（非官方）**：`Playnite.dll` 里
+  `Playnite.ThemeManager.ApplyTheme(Application app, ThemeManifest theme, ApplicationMode mode)`
+  是 **public static**，还有 `SetCurrentTheme` / `DefaultDesktopThemeId` / `GetThemeRootDir`。
+  要用只能反射调用（编译期不引 Playnite.dll 也能调）。
+  风险：这是内部 API，Playnite 升级可能改签名 —— **必须 try/catch 兜住并降级**。
+- **没有截图 API**。SDK 里搜不到 Screenshot 相关的任何成员。
+  要截图只能自己对主窗口做 Win32 `PrintWindow` / `BitBlt`；
+  拿窗口句柄用 `IDialogsFactory.GetCurrentAppWindow()` + `WindowInteropHelper`。
+- **插件能挂 UI 的地方就这几个**：
+  `GetSidebarItems()`（整页/按钮）、`GetMainMenuItems()`、`GetGameMenuItems()`、
+  `GetTopPanelItems()`、`GetPlayActions()`、`GetInstallActions()`、`GetSettingsView()`、
+  `GetGameViewControl(GetGameViewControlArgs{Mode, Name})`。
+- **`GetGameViewControl` 不是「随便插」**：它由**主题**按名字来要（主题里得先有一个
+  请求插件控件的占位元素），`Playnite/Themes/Desktop/Default` 里**没有**这种占位
+  （只有 `Views/TopPanel.xaml` 里的 `PART_PanelMainPluginItems` 给顶栏用）。
+  → 在默认主题/多数第三方主题下，"往「启动游戏」和「编辑游戏详情」之间加一个云朵按钮"
+  **落不了地**；只有主题作者主动留了位置才行。
+- **游戏详情面板 / 编辑游戏对话框都不可注入**：`Plugin` 基类里没有任何方法能往
+  编辑游戏的对话框加一栏（那个对话框是 `Playnite.DesktopApp` 的内部窗口）。
+  → 「在编辑游戏详情的『通用』项后加一项『云存档』」**做不到**。
+- **但存档路径这件事有现成的原生 UI**：主题里有
+  `CustomControls/GameSavePathSelectionBox.xaml`，说明 Playnite 自己的编辑游戏对话框里
+  **已经有一处编辑 `Game.SavePaths` 的界面**。`SavePath` 的
+  `GameSaveType / Path / Title / AutoAdaptive` 都是可写属性，`Name` 只读。
+  → 想「用 Playnite 的窗口管存档路径」，正路是**让插件去读写 `Game.SavePaths`**，
+  借 Playnite 那套原生编辑器，而不是自己再画一个。
+- 顺带两条与界面无关但同源的事实：
+  `Game.SavePaths` 的文档注释被 Playnite 写成了 "list of game related web links"（复制粘贴错误），
+  以类型 `ObservableCollection<SavePath>` 为准；
+  `SidebarItem.Icon` 是 `object`、`IconPadding` 是 `Thickness`，
+  而 `Playnite.SDK.SidebarItem` 里的枚举拼写是 **`SiderbarItemType`**（少个 i，官方拼错的）。
+- **`Game` 上没有 `DatabaseId`**（6.13 实测；`IGameDatabase` 也没有按 int 取游戏的入口：
+  只有 `GetFilteredGames` / `GetGameMatchesFilter` / `ImportGame`）。
+  所以「用数据库自增 id 当第二把钥匙」这件事**做不到**。
+  `Game` 上能用来认游戏的键只有两个：`Id`（Guid，库记录身份）与
+  `GameId`（string，库内标识：Steam 就是 appid；手动添加的游戏可能为空串）。
+  另有一个只读的 `DatabaseReference`（指向 `IGameDatabase`），不是 id。
+  → 想多一层对账就存 `Id` + `GameId`，别再去找 `DatabaseId` 了
+  （Vault 的 `AppEntry.PlayniteGameId` / `PlayniteLibraryId` 就是这两个）。

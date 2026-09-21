@@ -527,8 +527,17 @@ namespace PlayniteVault.Services
         // ---------- 归档 ----------
 
         /// <summary>扫描本地目录生成清单（按路径排序，保证分片划分稳定）。</summary>
+        /// <param name="playniteGameId">
+        /// 【v1.8】来源那条 Playnite 库记录的 GUID。命令行打包（VaultPack）手里没有 Playnite
+        /// 数据库，所以它是可选的 —— 只有插件侧的归档才填得上。
+        /// </param>
+        /// <param name="playniteLibraryId">
+        /// 【v1.8】来源那条记录的 <c>Game.GameId</c>（库内标识：Steam 就是 appid）。
+        /// 同样只有插件侧填得上。
+        /// </param>
         public static AppManifest BuildManifest(string appId, string appName, string localDir,
-            string launchExe, string version, AppMetadata metadata)
+            string launchExe, string version, AppMetadata metadata,
+            string playniteGameId = null, string playniteLibraryId = null)
         {
             var manifest = new AppManifest
             {
@@ -537,7 +546,9 @@ namespace PlayniteVault.Services
                 Version = version,
                 UpdatedAt = DateTime.UtcNow,
                 LaunchExe = launchExe,
-                Metadata = metadata
+                Metadata = metadata,
+                PlayniteGameId = playniteGameId,
+                PlayniteLibraryId = playniteLibraryId
             };
 
             if (metadata != null)
@@ -583,7 +594,8 @@ namespace PlayniteVault.Services
         /// </summary>
         public SyncResult ArchiveApp(string appId, string appName, string localDir, string launchExe,
             string version, AppMetadata metadata, SyncOptions options,
-            Action<SyncProgress> onProgress, CancellationToken cancelToken)
+            Action<SyncProgress> onProgress, CancellationToken cancelToken,
+            string playniteGameId = null, string playniteLibraryId = null)
         {
             var opt = options ?? BuildSyncOptions();
             var client = CreateClient(TimeoutsFrom(opt));
@@ -591,7 +603,8 @@ namespace PlayniteVault.Services
             var watch = Stopwatch.StartNew();
             var reporter = new ThrottledReporter(onProgress);
 
-            var manifest = BuildManifest(appId, appName, localDir, launchExe, version, metadata);
+            var manifest = BuildManifest(appId, appName, localDir, launchExe, version, metadata,
+                playniteGameId, playniteLibraryId);
 
             AppManifest knownRemote = null;
             try
@@ -871,7 +884,12 @@ namespace PlayniteVault.Services
                 PartCount = 0,
                 ChunkCount = manifest.Chunks.Count,
                 Packed = manifest.Packed,
-                Metadata = metadata
+                Metadata = metadata,
+
+                // 卡片墙要用它来判「这条库里记录仓库里到底有没有」，
+                // 而卡片墙只读 index.json —— 所以这两个键必须进索引，不能只进 manifest。
+                PlayniteGameId = playniteGameId,
+                PlayniteLibraryId = playniteLibraryId
             });
 
             // 旧格式升级上来之后把旧目录清掉，并把过期区块回收掉，避免仓库里留垃圾

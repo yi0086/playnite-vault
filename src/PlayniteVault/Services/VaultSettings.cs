@@ -179,6 +179,46 @@ namespace PlayniteVault.Services
         /// <summary>游戏运行时录一份目录指纹，退出后做会话差分（给「还是不知道存档在哪」用）。</summary>
         public bool SaveSessionSniff { get; set; } = true;
 
+        // ---------- 界面（v1.8.0） ----------
+
+        /// <summary>
+        /// 侧边栏页的明暗模式：auto / light / dark，见 <see cref="UiThemeLight"/> 等常量。
+        ///
+        /// 为什么要留手动档：自动档是靠读 Playnite 的窗口背景色**猜**明暗的。
+        /// 主题一旦把窗口底色做成半透明、贴图、或者在控件级另画背景，
+        /// 猜出来的结果就可能和实际观感正好相反（于是出现「深底深字」这种一眼破相）。
+        /// 猜错的时候用户必须能自己掰回来 —— 这就是这三档存在的唯一理由。
+        /// </summary>
+        public string UiTheme { get; set; } = UiThemeAuto;
+
+        public const string UiThemeAuto = "auto";
+        public const string UiThemeLight = "light";
+        public const string UiThemeDark = "dark";
+
+        /// <summary>
+        /// 把 UiTheme 归一化成三档之一。
+        /// settings.json 是给人手改的，写错值（大小写、空格、拼错）都不该让界面炸掉。
+        /// </summary>
+        public static string NormalizeUiTheme(string raw)
+        {
+            var value = (raw ?? string.Empty).Trim().ToLowerInvariant();
+            return value == UiThemeLight || value == UiThemeDark ? value : UiThemeAuto;
+        }
+
+        /// <summary>界面上显示的名字，按档位取。</summary>
+        public static string DescribeUiTheme(string raw)
+        {
+            switch (NormalizeUiTheme(raw))
+            {
+                case UiThemeLight:
+                    return "浅色";
+                case UiThemeDark:
+                    return "深色";
+                default:
+                    return "跟随 Playnite";
+            }
+        }
+
         public VaultSettings Clone()
         {
             return new VaultSettings
@@ -215,7 +255,8 @@ namespace PlayniteVault.Services
                 SaveDefaultBranch = this.SaveDefaultBranch,
                 SaveBackupBeforeRestore = this.SaveBackupBeforeRestore,
                 SaveKeepLocalBackups = this.SaveKeepLocalBackups,
-                SaveSessionSniff = this.SaveSessionSniff
+                SaveSessionSniff = this.SaveSessionSniff,
+                UiTheme = this.UiTheme
             };
         }
 

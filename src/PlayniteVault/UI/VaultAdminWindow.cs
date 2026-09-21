@@ -254,69 +254,62 @@ namespace PlayniteVault.UI
                 return;
             }
 
-            // 二次校验口令：窗口可能开了很久，口令在别处被换掉也不该放行
+            // 二次校验口令：窗口可能开了很久，口令在别处被换掉也不该放行。
+            //
+            // v1.8 起这个窗口**不再自己做校验和删除**，而是把口令连同 appId 一起交给
+            // VaultPlugin.DeleteRepositoryApp —— 侧边栏那张内联列表用的是同一个方法。
+            // 入口从一处变成两处之后，闸门要是各写一份，迟早会漂移；
+            // 而这里删掉的东西不可逆。自检里有一条断言盯着「RemoveApp 的调用方只有插件那一处」。
             var password = PasswordPrompt.Ask(this, "输入管理口令", "删除「" + app.Name + "」需要管理口令：", false);
             if (password == null)
             {
                 return;
             }
 
-            SetStatus("正在校验口令...", false, Brushes.Gray);
+            SetStatus("正在校验口令并删除…", false, Brushes.Gray);
             refreshButton.IsEnabled = false;
+            changePasswordButton.IsEnabled = false;
 
             Task.Run(() =>
             {
-                bool isSet;
-                bool ok;
+                RepositoryDeleteResult outcome;
                 try
                 {
-                    ok = service.VerifyAdminPassword(password, out isSet);
-                }
-                catch (Exception ex)
-                {
-                    Dispatcher.Invoke(() =>
-                    {
-                        refreshButton.IsEnabled = true;
-                        SetStatus("校验口令失败：" + ex.Message, false, Brushes.IndianRed);
-                    });
-                    return;
-                }
-
-                if (!ok)
-                {
-                    Dispatcher.Invoke(() =>
-                    {
-                        refreshButton.IsEnabled = true;
-                        SetStatus(
-                            isSet ? "口令不正确，删除已取消。" : "仓库还没有设置管理口令，请先点「修改管理口令」设置。",
-                            false,
-                            Brushes.IndianRed);
-                    });
-                    return;
-                }
-
-                var removed = 0;
-                try
-                {
-                    removed = service.RemoveApp(app.Id);
+                    outcome = VaultPlugin.Instance.DeleteRepositoryApp(app.Id, password);
                 }
                 catch (Exception ex)
                 {
                     VaultLog.Error("删除仓库应用失败：" + app.Id, ex);
-                    Dispatcher.Invoke(() =>
-                    {
-                        refreshButton.IsEnabled = true;
-                        SetStatus("删除失败：" + ex.Message, false, Brushes.IndianRed);
-                    });
-                    return;
+                    outcome = RepositoryDeleteResult.Fail(ex.Message);
                 }
 
                 Dispatcher.Invoke(() =>
                 {
                     refreshButton.IsEnabled = true;
-                    SetStatus(string.Format("已删除「{0}」，清理了 {1} 个远端文件。", app.Name, removed),
-                        false, Brushes.SeaGreen);
-                    Load();
+                    changePasswordButton.IsEnabled = true;
+
+                    if (outcome.Ok)
+                    {
+                        SetStatus(string.Format("已删除「{0}」，清理了 {1} 个远端文件。",
+                            app.Name, outcome.RemovedFiles), false, Brushes.SeaGreen);
+                        Load();
+                        return;
+                    }
+
+                    if (outcome.PasswordWrong)
+                    {
+                        SetStatus("口令不正确，删除已取消。", false, Brushes.IndianRed);
+                        return;
+                    }
+
+                    if (outcome.PasswordNotSet)
+                    {
+                        SetStatus("仓库还没有设置管理口令，请先点「修改管理口令」设置。", false, Brushes.IndianRed);
+                        return;
+                    }
+
+                    SetStatus(string.IsNullOrEmpty(outcome.Error) ? "删除失败。" : outcome.Error,
+                        false, Brushes.IndianRed);
                 });
             });
         }
