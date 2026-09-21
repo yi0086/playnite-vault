@@ -3,13 +3,24 @@
 """把 ../release/v<版本>/ 里的产物发布成 GitHub + Gitee 的 Release。
 
 用法：
-    python tools/publish-release.py 1.6.0 --verify-download
-    python tools/publish-release.py 1.6.0 --dry-run
-    python tools/publish-release.py 1.6.0 --notes-file notes.md --only github
-    python tools/publish-release.py 1.6.0 --force          # 同名资产删掉重传
+    python tools/publish-release.py 1.8.0 --kind feature,ui --verify-download
+    python tools/publish-release.py 1.8.0 --dry-run
+    python tools/publish-release.py 1.8.0 --notes-file notes.md --only github
+    python tools/publish-release.py 1.8.0 --tag-message "一句话摘要"
+    python tools/publish-release.py 1.8.0 --force          # 同名资产删掉重传 + 重建 tag
 
 约定（与仓库历史一致）：
   * 产物目录：仓库外的 ``../release/v<版本>/``，只取**顶层**文件，跳过 ``stage/``。
+  * **tag 由本脚本先建**（``ensure_annotated_tag``）：GitHub 的 release API 只给
+    ``tag_name`` 时它会替你建**轻量 tag**，而 Gitee 建的是**附注 tag** —— 两边会不一致。
+    所以先在本地建好附注 tag 再推上去，API 看到同名 tag 就直接复用。``--tag-message``
+    给一句摘要（正式 tag 的说明就一句话，别把整篇发布说明塞进去）；``--force`` 会重建
+    tag（挪到 HEAD / 修正 tagger 与说明）；``--skip-tag`` 则完全不碰 git。
+  * **发布正文只写三样**：本次要用户留意的注意事项（没有就整段不写）、要点、以及指向
+    ``CHANGELOG.md`` 的引导。**别重复 README 里已有的项目介绍 / 适用边界 / 许可**。
+    「更新类型」用 ``--kind`` 给（feature/ui/fix/perf/docs/refactor/breaking）。
+  * **下载区由脚本拼**（``release_body_for``）：按平台生成直链、默认折叠；正文里写的
+    GitHub 链接会自动改写成目标平台的域名，所以正文里只写 GitHub 那份就够。
   * 令牌：``%USERPROFILE%\\.playnite-vault\\github-token.txt`` / ``gitee-token.txt``。
     git push 走 SSH，但 Release / 资产上传只认 token。
   * Gitee 建 release 时带 ``attach_files`` 已失效（返回 201 但资产不挂），
@@ -503,6 +514,169 @@ def verify_downloads(tag: str, assets: list[str], which: str,
     return problems
 
 
+# ---------------------------------------------------------------- tag
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def git_out(*args: str) -> tuple[int, str]:
+    """在仓库根跑一条 git 命令，返回 (退出码, stdout+stderr)。"""
+    proc = subprocess.run(["git", "-C", REPO_ROOT, *args],
+                          capture_output=True, text=True)
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def tag_kind(tag: str) -> str | None:
+    """`git cat-file -t` 的结果：'tag' = 附注 tag，'commit' = 轻量 tag，None = 不存在。"""
+    rc, out = git_out("cat-file", "-t", f"refs/tags/{tag}")
+    return out.strip() if rc == 0 else None
+
+
+def ensure_annotated_tag(tag: str, version: str, only: str, force: bool,
+                         message: str | None = None) -> None:
+    """把 `tag` 弄成**附注 tag** 并推到本次要发布的平台。
+
+    为什么非自己建不可：GitHub 的 release API 只给一个 `tag_name` 时，它替你建的是
+    **轻量 tag**（一个直接指向 commit 的 ref，`ls-remote` 里只有一行）；Gitee 的 API
+    建的是**附注 tag**（一个 tag 对象，带 tagger / 说明，`ls-remote` 里有 `^{}` 那行）。
+    同一个脚本跑两边，tag 类型就岔开了 —— v1.7.0 正是如此（GitHub 轻量、Gitee 附注）。
+    所以先在本地把附注 tag 建好再推上去；等 API 建 release 时看到同名 tag 已存在，
+    它会直接复用，两边就一致了。
+
+    `--force` 时**无条件重建**：既用于「把 tag 挪到新提交」，也用于修正 tagger / 说明
+    （Gitee 自动建的 tag 里 tagger 是它的机器人，说明还会被塞成整篇发布说明）。
+
+    本地 `user.name` / `user.email` 就是 tagger，所以仓库的提交身份得先配对。
+    """
+    kind = tag_kind(tag)
+    _, head = git_out("rev-parse", "HEAD")
+    msg = (message or "").strip() or f"Playnite Vault {version}"
+
+    if kind == "tag" and not force:
+        _, target = git_out("rev-parse", f"refs/tags/{tag}^{{}}")
+        if target != head:
+            log(f"  ! 附注 tag {tag} 指向 {target[:10]}，而 HEAD 是 {head[:10]} —— tag 不动。"
+                f"要把它挪到 HEAD、或重建以修正 tagger/说明，请加 --force")
+        else:
+            log(f"  · 附注 tag {tag} 已在本地，指向 HEAD {head[:10]}")
+    else:
+        if kind == "commit":
+            log(f"  · 本地 {tag} 是轻量 tag，改建成附注 tag")
+        elif kind == "tag":
+            log(f"  · 按 --force 重建附注 tag {tag}（顺带把 tagger/说明改成本仓库的）")
+        if kind:
+            rc, out = git_out("tag", "-d", tag)
+            if rc != 0:
+                raise SystemExit(f"删掉旧 tag {tag} 失败：{out}")
+        rc, out = git_out("tag", "-a", tag, "-m", msg, head)
+        if rc != 0:
+            raise SystemExit(f"建附注 tag 失败：{out}")
+        log(f"  · 已建附注 tag {tag} → {head[:10]}")
+        log(f"    说明：{msg}")
+
+    remotes = {"github": ["github"], "gitee": ["gitee"],
+               "both": ["github", "gitee"]}[only]
+    for remote in remotes:
+        rc, out = git_out("push", "--force", remote, f"refs/tags/{tag}")
+        if rc != 0:
+            raise SystemExit(f"推 tag 到 {remote} 失败：{out}")
+        log(f"  · 已推 {tag} → {remote}")
+
+    # 回验三件事：两边都能解引用到同一个 commit（轻量 tag 没有 ^{} 这行，会露馅）、
+    # 两边是**同一个 tag 对象**、tagger 是本仓库的提交身份。
+    _, target = git_out("rev-parse", f"refs/tags/{tag}^{{}}")
+    # %(taggeremail) 自带尖括号，别再加一层
+    _, tagger = git_out("for-each-ref", "--format=%(taggername) %(taggeremail)",
+                        f"refs/tags/{tag}")
+    log(f"  · tagger：{tagger}")
+
+    objects = set()
+    for remote in remotes:
+        rc, out = git_out("ls-remote", "--tags", remote, f"refs/tags/{tag}*")
+        if rc != 0:
+            raise SystemExit(f"回验 tag 失败（{remote}）：{out}")
+        refs = {}
+        for line in out.splitlines():
+            if "\t" in line:
+                sha, ref = line.split("\t", 1)
+                refs[ref.strip()] = sha.strip()
+        deref = refs.get(f"refs/tags/{tag}^{{}}")
+        if deref != target:
+            raise SystemExit(
+                f"{remote} 的 {tag} 不是附注 tag（或指向不对）：\n{out or '(空)'}")
+        objects.add(refs.get(f"refs/tags/{tag}"))
+        log(f"  · 回验 {remote}：附注 tag → {deref[:10]}")
+
+    if len(objects) != 1:
+        raise SystemExit(f"两个平台的 tag 不是同一个对象：{sorted(o[:10] for o in objects)}")
+
+
+# ---------------------------------------------------------------- release 正文
+
+REPO_URLS = {"github": f"https://github.com/{OWNER}/{REPO}",
+             "gitee": f"https://gitee.com/{OWNER}/{REPO}"}
+
+KIND_LABEL = {"feature": "新功能", "ui": "界面", "fix": "修 bug", "perf": "性能",
+              "docs": "文档", "refactor": "重构", "breaking": "需要用户动手"}
+
+# 资产名 → 「该下哪个」。这段**由脚本写**：手写必然写成另一个平台的链接。
+ASSET_HINT = (
+    ("PlayniteVault-",
+     "Playnite 插件包 —— 解压后把文件夹整个放进 Playnite 安装目录下的 `Extensions` 里，"
+     "完全退出 Playnite 再打开。**内含《使用说明.txt》**"),
+    ("VaultUnpacker-",
+     "独立解包器 —— 单文件、免安装、不需要 Python，双击即用；也负责把插件装进 Playnite"),
+    ("使用说明",
+     "纯文本说明，和插件包里那份是同一份"),
+)
+
+
+def asset_hint(name: str) -> str:
+    for prefix, text in ASSET_HINT:
+        if name.startswith(prefix):
+            return text
+    return ""
+
+
+def release_body_for(platform: str, version: str, body: str,
+                     assets: list[str], kind: str | None) -> str:
+    """把作者写的正文改成**这个平台**的版本。
+
+    有两件事必须由脚本做，不能靠手写：
+
+    1. **平台链接**。正文里写的 `https://github.com/...`（比如指向 `CHANGELOG.md`）
+       在 Gitee 上点开就是另一个站点，得换成同路径的 Gitee 地址。
+    2. **下载区**。资产名和下载直链都是现成的，手写迟早写成另一个平台的；
+       而两边的直链格式其实一样（`<repo>/releases/download/<tag>/<文件名>`），
+       按平台拼就行。默认**折叠**（`<details>`），不占版面。
+
+    作者只需要写「注意事项 / 要点 / 引导」，说清「怎么用」的部分交给脚本。
+    正文写法约定见 `docs/dev-notes.md` 第 6 节。
+    """
+    tag = f"v{version}"
+    base = REPO_URLS[platform]
+    out = body
+    for other, url in REPO_URLS.items():
+        if other != platform:
+            out = out.replace(url, base)
+
+    if kind:
+        labels = [KIND_LABEL.get(k.strip(), k.strip())
+                  for k in kind.split(",") if k.strip()]
+        if labels:
+            out = out.rstrip() + "\n\n**更新类型**：" + " · ".join(labels) + "\n"
+
+    lines = ["## 下载", "", "<details>", "<summary>该下哪个？（点开）</summary>", ""]
+    for path in assets:
+        name = os.path.basename(path)
+        hint = asset_hint(name)
+        link = f"{base}/releases/download/{tag}/{name}"
+        lines.append(f"- **[{name}]({link})** —— {hint}" if hint
+                     else f"- **[{name}]({link})**")
+    lines += ["", "</details>"]
+    return out.rstrip() + "\n\n" + "\n".join(lines) + "\n"
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv=None) -> int:
@@ -517,6 +691,12 @@ def main(argv=None) -> int:
     ap.add_argument("--force", action="store_true", help="同名资产覆盖重传")
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不联网")
     ap.add_argument("--skip-verify", action="store_true", help="跳过上传后回验")
+    ap.add_argument("--skip-tag", action="store_true",
+                    help="不碰 git tag（默认会先建/校正附注 tag 并推到发布平台）")
+    ap.add_argument("--tag-message", default=None,
+                    help="附注 tag 的说明（一句话摘要）。不填就用「Playnite Vault <版本>」")
+    ap.add_argument("--kind", default=None,
+                    help="更新类型，逗号分隔：feature,ui,fix,perf,docs,refactor,breaking")
     ap.add_argument("--verify-download", action="store_true",
                     help="额外把资产从两个平台真下回来比 sha256（Gitee 不回传大小，只有这个算数）")
     args = ap.parse_args(argv)
@@ -544,20 +724,30 @@ def main(argv=None) -> int:
         if os.environ.pop(key, None):
             log(f"（已清除环境变量 {key}，改用内置代理兜底）")
 
+    log("\n== tag ==")
+    if args.skip_tag:
+        log("  · 按 --skip-tag 跳过（tag 保持原样）")
+    else:
+        ensure_annotated_tag(tag, version, args.only, args.force, args.tag_message)
+
     problems: list[str] = []
     gh_token = gi_token = None
 
     if args.only in ("github", "both"):
         log("\n== GitHub ==")
         gh_token = read_token("github", None)
-        github_publish(gh_token, tag, title, body, assets, args.draft, args.force)
+        github_publish(gh_token, tag, title,
+                       release_body_for("github", version, body, assets, args.kind),
+                       assets, args.draft, args.force)
         if not args.skip_verify:
             problems += verify_github(gh_token, tag, assets)
 
     if args.only in ("gitee", "both"):
         log("\n== Gitee ==")
         gi_token = read_token("gitee", None)
-        gitee_publish(gi_token, tag, title, body, assets, args.draft, args.force)
+        gitee_publish(gi_token, tag, title,
+                      release_body_for("gitee", version, body, assets, args.kind),
+                      assets, args.draft, args.force)
         if not args.skip_verify:
             problems += verify_gitee(gi_token, tag, assets)
 

@@ -99,6 +99,50 @@ Release 只认 token（SSH 推不了 release）。
 - 版本已发布后**不要为了小修原地换字节**；若确实刚发几分钟、`download_count` 还是 0，
   可以 `--force` 重发并把 tag 挪到新提交，保证 tag 源码与二进制一致。
 
+### 6.1 文档分工（v1.8 起改的，别再写回去）
+
+```
+README.md      只写**当前版本**的功能与用法。历史一律不放这儿。
+CHANGELOG.md   每一版改了什么（类型标记 + 要点），最新在前。
+release/v<x>/RELEASE_NOTES.md   只写「本次注意事项 + 要点 + 引导」，别赘述 README 已有的东西。
+docs/dev-notes.md   工程取舍、踩坑（给改代码的人看）。
+```
+
+`RELEASE_NOTES.md` 的骨架（`--notes-file` 指向它）：
+
+```markdown
+# Playnite Vault 1.8.0
+
+<本次要用户留意的注意事项；没有就整段不写>
+
+## 要点
+
+- ...
+
+细节见 [CHANGELOG](https://github.com/yi0086/playnite-vault/blob/main/CHANGELOG.md)。
+```
+
+- **不要**在发布正文里重复项目介绍 / 适用边界 / 许可 / 目录结构 ——
+  那些 README 里有，重复一遍就是两处要同步。
+- **不写下载区**。资产名与下载直链由 `publish-release.py` 按平台拼好
+  （`release_body_for`，默认 `<details>` 折叠），手写必写成另一个平台的链接。
+- 「更新类型」用 `--kind feature,ui,fix,...`（脚本渲染成中文行）。
+- 正文里指向 `CHANGELOG.md` 的链接**只写 GitHub 那份**，脚本会把域名改写成目标平台。
+
+### 6.2 tag：一律用附注 tag，且由脚本建
+
+- **轻量 tag** 就是一个指向 commit 的 ref（`ls-remote` 里只有一行）；
+  **附注 tag** 是个真实对象，带 tagger、日期、说明（`ls-remote` 里多一行 `^{}`）。
+  `git describe` / 带说明的 Release 都靠附注 tag；本项目从 v1.3.0 起一直是附注的。
+- **v1.7.0 的 GitHub 侧曾经是轻量的** —— 因为 `POST /releases` 只给 `tag_name` 时，
+  GitHub 替你建轻量 tag，**而 Gitee 建的是附注 tag**：同一个脚本，两边类型不一样。
+  已由 `ensure_annotated_tag()` 修正（发 release 前先本地建好附注 tag 并推上去，
+  API 看到同名 tag 就直接复用）。
+- `--tag-message` 给一句摘要。**别把整篇发布说明当 tag 说明** —— Gitee 自动建的 tag
+  就是那样，结果 tag 对象里塞了几千字。
+- 发布完回验三件事：两边 tag 对象 sha **一致**、`^{}` 解引用到同一个 commit、
+  tagger 是本仓库的提交身份（本地 `user.name`/`user.email` 决定 tagger）。
+
 ## 7. 解包器注入插件（v1.6.0 起）
 
 `tools/vault_unpacker/inject.py` + GUI 独立窗口「安装插件到 Playnite…」+ CLI `--inject-plugin`。
